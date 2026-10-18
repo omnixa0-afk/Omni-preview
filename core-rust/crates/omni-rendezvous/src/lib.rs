@@ -250,9 +250,9 @@ impl Topic {
             return None;
         }
         let mut bytes = [0u8; 32];
-        for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-            let hi = (chunk[0] as char).to_digit(16)?;
-            let lo = (chunk[1] as char).to_digit(16)?;
+        for (i, [hi, lo]) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let hi = (*hi as char).to_digit(16)?;
+            let lo = (*lo as char).to_digit(16)?;
             bytes[i] = (hi * 16 + lo) as u8;
         }
         Some(Topic(bytes))

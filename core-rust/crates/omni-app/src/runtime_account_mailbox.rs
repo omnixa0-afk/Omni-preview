@@ -104,7 +104,7 @@ fn build_account_mailbox_note(storage: &Storage, now_unix_ms: i64) -> Option<Vec
         .into_iter()
         .filter(|revocation| revocation.revoked_at_unix_ms >= now_unix_ms - ACCOUNT_MAILBOX_KEEP_MS)
         .collect();
-    revocations.sort_by(|a, b| b.revoked_at_unix_ms.cmp(&a.revoked_at_unix_ms));
+    revocations.sort_by_key(|revocation| std::cmp::Reverse(revocation.revoked_at_unix_ms));
     let mut note = AccountMailboxNoteV1 {
         device_id: device.device_id.0.clone(),
         written_at_unix_ms: now_unix_ms,

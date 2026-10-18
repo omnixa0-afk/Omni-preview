@@ -167,8 +167,10 @@ impl ScreenControlBatch {
             return None;
         }
         let events = body[at..]
-            .chunks_exact(EVENT_LEN)
-            .map(ScreenInputEvent::decode)
+            .as_chunks::<EVENT_LEN>()
+            .0
+            .iter()
+            .map(|event| ScreenInputEvent::decode(event.as_slice()))
             .collect::<Option<Vec<_>>>()?;
         Some(Self { counter, pointer, first_seq, events })
     }

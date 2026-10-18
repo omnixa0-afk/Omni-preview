@@ -67,6 +67,9 @@ impl Debug for BulkStream {
 /// Frame = arbitrary bytes payload up to `mtu`. Routing layer
 /// упаковывает announce'ы, path requests, virtual link data в frame'ы
 /// и отдаёт Interface'у для transmission.
+// `#[async_trait]` puts its own `#[must_use]` on every boxed future it returns, which clippy calls
+// a double must-use; the attribute is the macro's, not ours.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Interface: Debug + Send + Sync {
     /// Stable identifier для этого interface'а.

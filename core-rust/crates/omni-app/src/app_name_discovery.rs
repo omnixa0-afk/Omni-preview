@@ -306,7 +306,7 @@ pub(crate) fn search_by_name_via(
         }
     }
     devices.retain(|(_, beacon, _)| !beacon.is_withdrawal());
-    devices.sort_by(|a, b| b.1.seq.cmp(&a.1.seq));
+    devices.sort_by_key(|device| std::cmp::Reverse(device.1.seq));
     let mut people: Vec<FoundByNameV1> = Vec::new();
     for (_, beacon, account_id) in devices {
         let omni_id = format!("omni:{}", hex::encode(beacon.omni_id));

@@ -381,10 +381,7 @@ impl Storage {
         if blob.len() % 32 != 0 {
             return Ok(None);
         }
-        let blocks = blob
-            .chunks_exact(32)
-            .map(|hash| <[u8; 32]>::try_from(hash).expect("chunks_exact(32)"))
-            .collect();
+        let blocks = blob.as_chunks::<32>().0.to_vec();
         Ok(omni_crypto::ContentTreeLayer::from_blocks(size.max(0) as u64, blocks)
             .filter(|layer| hex::encode(layer.id) == id_hex))
     }
@@ -1049,10 +1046,7 @@ impl Storage {
         if blob.len() % 32 != 0 || blocks * omni_crypto::CONTENT_TREE_BLOCK_BYTES > size {
             return Ok(Vec::new());
         }
-        Ok(blob
-            .chunks_exact(32)
-            .map(|hash| <[u8; 32]>::try_from(hash).expect("chunks_exact(32)"))
-            .collect())
+        Ok(blob.as_chunks::<32>().0.to_vec())
     }
 
     /// Keeps the blocks read whole so far on every row still `Preparing` from this very file.

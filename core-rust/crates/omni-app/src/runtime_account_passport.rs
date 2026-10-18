@@ -435,13 +435,12 @@ fn maintain_passport_holders(storage: &Storage, own_account_id: &AccountId, now_
             }
         }
     }
-    let mut count = storage.list_passport_holders()?.len();
-    for candidate in free {
+    let held = storage.list_passport_holders()?.len();
+    for (count, candidate) in (held..).zip(free) {
         if count >= PASSPORT_HOLDERS_WANTED {
             break;
         }
         storage.choose_passport_holder(candidate, now_unix_ms)?;
-        count += 1;
     }
     storage.list_passport_holders()
 }

@@ -4,6 +4,7 @@ name: windows-smoke
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -18,7 +19,7 @@ jobs:
         with:
           dotnet-version: 10.0.201
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: x86_64-pc-windows-msvc
           components: clippy

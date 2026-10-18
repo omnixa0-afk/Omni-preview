@@ -208,7 +208,9 @@ fn load_skipped_message_keys(session: &SessionRecord) -> OmniResult<Vec<SkippedM
         )));
     }
     Ok(bytes
-        .chunks_exact(SKIPPED_MESSAGE_KEY_LEN)
+        .as_chunks::<SKIPPED_MESSAGE_KEY_LEN>()
+        .0
+        .iter()
         .map(|entry| {
             let mut ratchet_public = [0u8; 32];
             ratchet_public.copy_from_slice(&entry[..32]);

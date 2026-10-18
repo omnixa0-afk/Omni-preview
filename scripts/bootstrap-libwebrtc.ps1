@@ -51,13 +51,14 @@ New-Item -ItemType Directory -Force -Path $webrtcRoot | Out-Null
 Push-Location $webrtcRoot
 try {
     if (!(Test-Path (Join-Path $webrtcRoot ".gclient"))) {
-        & fetch --nohooks webrtc
+        # Sources only, without git history: the history is many gigabytes nobody builds from.
+        & fetch --nohooks --no-history webrtc
         if ($LASTEXITCODE -ne 0) {
             throw "fetch webrtc failed with exit code $LASTEXITCODE"
         }
     }
     # Pinned: src and every DEPS entry at the revision above, not whatever main is today.
-    & gclient sync --nohooks --revision "src@$Revision"
+    & gclient sync --nohooks --no-history --revision "src@$Revision"
     if ($LASTEXITCODE -ne 0) {
         throw "gclient sync failed with exit code $LASTEXITCODE"
     }

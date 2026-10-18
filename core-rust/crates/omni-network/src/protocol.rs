@@ -270,7 +270,9 @@ pub fn pack_ipv4_peers(peers: &[std::net::SocketAddrV4]) -> Vec<u8> {
 /// What [`pack_ipv4_peers`] packed; a trailing partial entry is dropped.
 pub fn unpack_ipv4_peers(bytes: &[u8]) -> Vec<std::net::SocketAddrV4> {
     bytes
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|chunk| {
             std::net::SocketAddrV4::new(
                 std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),

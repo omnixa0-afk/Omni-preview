@@ -201,7 +201,7 @@ fn couriers_for_topic(
         .filter(|(_, p)| op != Op::Publish || !p.read_only)
         .filter_map(|(i, p)| p.pool_url.as_deref().map(|url| (i, omni_rendezvous::pool_rank(topic, url))))
         .collect();
-    pool.sort_by(|a, b| a.1.cmp(&b.1));
+    pool.sort_by_key(|entry| entry.1);
     let mut chosen: Vec<usize> = pool
         .iter()
         .map(|(i, _)| *i)
@@ -993,9 +993,9 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let hi = (chunk[0] as char).to_digit(16)?;
-        let lo = (chunk[1] as char).to_digit(16)?;
+    for [hi, lo] in bytes.as_chunks::<2>().0 {
+        let hi = (*hi as char).to_digit(16)?;
+        let lo = (*lo as char).to_digit(16)?;
         out.push((hi * 16 + lo) as u8);
     }
     Some(out)

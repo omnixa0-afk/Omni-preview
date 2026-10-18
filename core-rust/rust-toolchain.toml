@@ -1,5 +1,8 @@
+# One compiler for every build of the core: local, CI and the release workflow. Moving it is a
+# deliberate change: new clippy lints arrive with each release (CI runs clippy with -D warnings).
+# The workflows install the same version (dtolnay/rust-toolchain@<version>) - bump them together.
 [toolchain]
-channel = "stable"
-profile = "minimal"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

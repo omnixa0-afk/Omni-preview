@@ -396,7 +396,7 @@ impl OmniApp {
                 out.push(summary);
             }
         }
-        out.sort_by(|a, b| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms));
+        out.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity_unix_ms));
         Ok(out)
     }
 

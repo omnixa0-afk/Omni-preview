@@ -1112,8 +1112,8 @@ fn send_own_group_media(
 
     // Advance the media counter under the registry lock so concurrent senders
     // don't reuse a nonce.
-    let mut seq = bump_media_seq(db_path, group_id, payloads.len() as u64);
-    for payload in payloads {
+    let first_seq = bump_media_seq(db_path, group_id, payloads.len() as u64);
+    for (seq, payload) in (first_seq..).zip(payloads) {
         let sealed = omni_crypto::seal_group_call_media(&my.media_key, 0x4F4D4E41, seq, payload)?;
         // We are the origin, so relay_tag == our sender_tag (we are our own last hop).
         // media_meta (C1 active-speaker gating): placeholder 0 (audio, activity 0 = unknown) until
@@ -1132,7 +1132,6 @@ fn send_own_group_media(
             let sent = mesh.send_media(omni_mesh_runtime::MeshNodeAddress::from_bytes(*node), &wire);
             note_send(db_path, node, sent);
         }
-        seq += 1;
     }
     Ok(())
 }

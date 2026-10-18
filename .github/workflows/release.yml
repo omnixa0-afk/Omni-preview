@@ -34,7 +34,7 @@ jobs:
         with:
           dotnet-version: 10.0.201
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -45,25 +45,33 @@ jobs:
 
       - uses: ilammy/setup-nasm@v1
 
-      - name: Free disk space
+      # libwebrtc and the release target take tens of GB: build on whichever drive has the most room
+      # (the system drive of a hosted runner is the tight one).
+      - name: Pick the build drive
         shell: pwsh
-        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[int]($_.Free/1GB)}}
+        run: |
+          # Letters only: pwsh also lists Temp:, an alias of a folder on the system drive.
+          $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -match '^[A-Z]$' -and $_.Free -gt 0 }
+          $drives | Format-Table Name, @{n='FreeGB';e={[int]($_.Free/1GB)}}
+          $best = $drives | Sort-Object Free -Descending | Select-Object -First 1
+          "OMNI_BUILD_ROOT=$($best.Name):\omni-build" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host "building on $($best.Name): ($([int]($best.Free/1GB)) GB free)"
 
       - name: libwebrtc sources (pinned revision)
         shell: pwsh
-        run: .\scripts\bootstrap-libwebrtc.ps1 -DependencyRoot C:\deps -Sync -RunHooks
+        run: .\scripts\bootstrap-libwebrtc.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps" -Sync -RunHooks
 
       - name: libwebrtc build
         shell: pwsh
-        run: .\scripts\build-libwebrtc.ps1 -DependencyRoot C:\deps
+        run: .\scripts\build-libwebrtc.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps"
 
       - name: Native media module
         shell: pwsh
-        run: .\scripts\build-omni-webrtc-media.ps1 -Configuration Release -UseLibWebRtc -NoTest -WebRtcSrc C:\deps\webrtc\src
+        run: .\scripts\build-omni-webrtc-media.ps1 -Configuration Release -UseLibWebRtc -NoTest -WebRtcSrc "$env:OMNI_BUILD_ROOT\deps\webrtc\src"
 
       - name: Release exe
         shell: pwsh
-        run: .\scripts\release.ps1 -TargetDir C:\omni-release-target
+        run: .\scripts\release.ps1 -TargetDir "$env:OMNI_BUILD_ROOT\release-target"
 
       - uses: actions/attest-build-provenance@v2
         with:
