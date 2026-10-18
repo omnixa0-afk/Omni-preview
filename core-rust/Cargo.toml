@@ -1,0 +1,69 @@
+[workspace]
+members = [
+    "crates/omni-types",
+    "crates/omni-identity",
+    "crates/omni-crypto",
+    "crates/omni-messaging",
+    "crates/omni-protocol",
+    "crates/omni-storage",
+    "crates/omni-app",
+    "crates/omni-ffi",
+    "crates/omni-transport",
+    "crates/omni-network",
+    "crates/omni-net-primitives",
+    "crates/omni-mesh-runtime",
+    "crates/omni-daemon",
+    "crates/omni-rendezvous",
+    "crates/omni-rendezvous-providers",
+    "crates/omni-rendezvous-helper",
+    "crates/omni-dht-helper",
+    "crates/omni-node",
+    "crates/omni-group-mls",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+
+# Style lints the codebase deliberately does not follow: long FFI/orchestration signatures, nested
+# generic registry types, one-shot result enums and wrapped doc lists. Everything else is -D warnings in CI.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+large_enum_variant = "allow"
+doc_lazy_continuation = "allow"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+hkdf = "0.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp"] }
+parking_lot = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# SQLCipher: the database file is encrypted at rest (docs/decisions/db-at-rest-encryption.md). The vendored
+# OpenSSL builds from source and needs Perl + NASM on PATH (scripts/build-tools-env.ps1).
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# Third-party crates optimized in dev and test builds too (our own crates stay opt-level 0, so an
+# edit rebuilds as fast as before). Unoptimized, the image decoders and the password KDF dominated the
+# gate: one storage test took 41 s, the profile-password test 21 s (measured 2026-10-13).
+[profile.dev.package."*"]
+opt-level = 2
+
+# Line-table debug info in release. Costs nothing at runtime -- it lands in a side PDB, not the exe --
+# and without it a CPU profile of a release build is all '***unknown***'.
+# Whole-program LTO with one codegen unit: smaller binaries and faster code for a slower release
+# build. panic stays `unwind`: every FFI export relies on catch_unwind.
+[profile.release]
+debug = 1
+lto = "fat"
+codegen-units = 1

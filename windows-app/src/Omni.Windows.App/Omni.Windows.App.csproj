@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <OutputType>WinExe</OutputType>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!-- Pin .NET self-containment so build/publish can never silently emit a framework-dependent
+         apphost (which on a clean PC shows a misleading "install .NET" prompt). The lean/Folder
+         publish profiles override this with an explicit SelfContained=false. -->
+    <SelfContained>true</SelfContained>
+    <Nullable>enable</Nullable>
+    <LangVersion>14.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Omni.Windows.App</RootNamespace>
+    <!-- Provide our own entry point (Program.cs) instead of the XAML-generated Main, so we can
+         self-heal a renamed exe. WinUI 3 unpackaged resolves Window/Page XAML via MRT keyed to the
+         executable's base name — a renamed exe (e.g. a browser "Foo (1).exe" copy) can't find
+         MainWindow.xaml and dies with XamlParseException. See docs/bugs/renamed-exe-xamlparse.md. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <UseRidGraph>true</UseRidGraph>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- The exe's own icon (Explorer, taskbar, Alt+Tab): Assets\Omni.ico, generated with the PNG set
+         by docs/design/logo/make_logo.py - -assets. -->
+    <ApplicationIcon>Assets\Omni.ico</ApplicationIcon>
+    <PublishProfile>win-x64.pubxml</PublishProfile>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <OmniRepoRoot>$(MSBuildProjectDirectory)\..\..\..\</OmniRepoRoot>
+    <OmniRustTarget>x86_64-pc-windows-msvc</OmniRustTarget>
+    <OmniCoreManifest>$(OmniRepoRoot)core-rust\Cargo.toml</OmniCoreManifest>
+    <OmniCoreConfiguration Condition="'$(Configuration)' == 'Release'">release</OmniCoreConfiguration>
+    <OmniCoreConfiguration Condition="'$(Configuration)' != 'Release'">debug</OmniCoreConfiguration>
+    <OmniCoreReleaseSwitch Condition="'$(Configuration)' == 'Release'">--release</OmniCoreReleaseSwitch>
+    <OmniCoreReleaseSwitch Condition="'$(Configuration)' != 'Release'"></OmniCoreReleaseSwitch>
+    <!-- Cargo's target directory. scripts/release.ps1 gives the release build its own, outside the
+         source tree, so it never shares artifacts with development builds. -->
+    <OmniCoreTargetDir Condition="'$(OmniCoreTargetDir)' == ''">$(OmniRepoRoot)core-rust\target</OmniCoreTargetDir>
+    <OmniCoreTargetDir>$([System.IO.Path]::GetFullPath('$(OmniCoreTargetDir)').TrimEnd('\'))</OmniCoreTargetDir>
+    <OmniCoreDll>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni_ffi.dll</OmniCoreDll>
+    <OmniRendezvousHelperExe>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni-rendezvous-helper.exe</OmniRendezvousHelperExe>
+    <OmniDhtHelperExe>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni-dht-helper.exe</OmniDhtHelperExe>
+    <OmniWebRtcMediaDll>$(OmniRepoRoot)native\omni-webrtc-media\build\Release-libwebrtc\omni_webrtc_media.dll</OmniWebRtcMediaDll>
+    <OmniWebRtcMediaDll Condition="!Exists('$(OmniWebRtcMediaDll)')">$(OmniRepoRoot)native\omni-webrtc-media\build\Release\Release\omni_webrtc_media.dll</OmniWebRtcMediaDll>
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Dev tooling (forced trace file, embedded command pipe, UI test channel, core fault injection) exists
+         only outside Release. A test stand that needs it in a release build passes -p:OmniDevTools=true. -->
+    <OmniDevTools Condition="'$(OmniDevTools)' == '' and '$(Configuration)' != 'Release'">true</OmniDevTools>
+    <DefineConstants Condition="'$(OmniDevTools)' == 'true'">$(DefineConstants);OMNI_DEV_TOOLS</DefineConstants>
+    <OmniCoreCargoFeatures Condition="'$(OmniDevTools)' == 'true' and '$(Configuration)' == 'Release'">--features omni-ffi/dev-tools</OmniCoreCargoFeatures>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\SplashScreen.scale-200.png" />
+    <Content Include="Assets\LockScreenLogo.scale-200.png" />
+    <Content Include="Assets\Square150x150Logo.scale-200.png" />
+    <Content Include="Assets\Square44x44Logo.scale-200.png" />
+    <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
+    <Content Include="Assets\StoreLogo.png" />
+    <Content Include="Assets\Wide310x150Logo.scale-200.png" />
+    <!-- The notification-area icon (Core/TrayIcon.cs): inside the assembly, so the single-file exe
+         needs nothing next to it. -->
+    <EmbeddedResource Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png"
+                      LogicalName="Omni.Windows.App.TrayIcon.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260317003" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7705" />
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ContentWithTargetPath Include="$(OmniCoreDll)">
+      <TargetPath>omni_ffi.dll</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </ContentWithTargetPath>
+    <ContentWithTargetPath Include="$(OmniWebRtcMediaDll)" Condition="Exists('$(OmniWebRtcMediaDll)')">
+      <TargetPath>omni_webrtc_media.dll</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </ContentWithTargetPath>
+    <ContentWithTargetPath Include="$(OmniRendezvousHelperExe)" Condition="Exists('$(OmniRendezvousHelperExe)')">
+      <TargetPath>omni-rendezvous-helper.exe</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </ContentWithTargetPath>
+    <ContentWithTargetPath Include="$(OmniDhtHelperExe)" Condition="Exists('$(OmniDhtHelperExe)')">
+      <TargetPath>omni-dht-helper.exe</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </ContentWithTargetPath>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(DisableMsixProjectCapabilityAddedByProject)' != 'true' and '$(EnableMsixTooling)' == 'true'">
+    <ProjectCapability Include="Msix" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)' != 'true' and '$(EnableMsixTooling)' == 'true'">
+    <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
+  </PropertyGroup>
+
+  <!-- The self-contained Windows App SDK runtime carries the Windows ML runtime (onnxruntime + DirectML,
+       ~38 MB unpacked on every install). Omni calls none of the Windows ML APIs, so those two never ship. -->
+  <Target Name="OmniDropUnusedMlRuntime" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(Filename)%(Extension)' == 'onnxruntime.dll' or '%(Filename)%(Extension)' == 'DirectML.dll'" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="BuildOmniRustCore" BeforeTargets="PrepareForBuild">
+    <Message Importance="high" Text="Building omni-ffi + omni-rendezvous-helper + omni-dht-helper for $(OmniRustTarget) ($(Configuration))..." />
+    <!-- Reproducible Release binaries: panic locations and debug info name sources by neutral prefixes
+         (~ for the cargo home, omni for the repo, target), not by where the tree happens to live. Debug
+         builds keep real paths so the debugger finds sources. The array is merged with
+         core-rust/.cargo/config.toml. -->
+    <PropertyGroup>
+      <!-- Perl + NASM for the vendored OpenSSL under SQLCipher; see scripts/build-tools-env.ps1. -->
+      <OmniCoreBuildEnvironment Condition="'$(OmniBuildToolsPath)' != ''">PATH=$([MSBuild]::Escape('$(OmniBuildToolsPath);$(PATH)'))</OmniCoreBuildEnvironment>
+      <OmniRemapRepo>$([System.IO.Path]::GetFullPath('$(OmniRepoRoot)').TrimEnd('\'))</OmniRemapRepo>
+      <OmniCoreRemapSwitch Condition="'$(Configuration)' == 'Release'">--config &quot;target.$(OmniRustTarget).rustflags=['--remap-path-prefix=$(USERPROFILE)=~', '--remap-path-prefix=$(OmniRemapRepo)=omni', '--remap-path-prefix=$(OmniCoreTargetDir)=target']&quot;</OmniCoreRemapSwitch>
+    </PropertyGroup>
+    <Exec Command="cargo build --manifest-path &quot;$(OmniCoreManifest)&quot; -p omni-ffi -p omni-rendezvous-helper -p omni-dht-helper --target $(OmniRustTarget) --target-dir &quot;$(OmniCoreTargetDir)&quot; $(OmniCoreReleaseSwitch) $(OmniCoreCargoFeatures) $(OmniCoreRemapSwitch)" WorkingDirectory="$(OmniRepoRoot)core-rust" EnvironmentVariables="$(OmniCoreBuildEnvironment)" />
+  </Target>
+
+  <!-- Single-file publish: keep the helper EXEs OUT of the bundle. They are the same courier code
+       that is already linked into omni_ffi.dll, which a one-file build reaches by re-execing itself
+       with the run-helper flag (see Core/HelperMode.cs) — bundling the .exes too would just carry
+       ~2.7 MB of a second copy that nothing can ever start (Windows cannot run a process from inside
+       the bundle).
+       The multi-file build is untouched: there they are published as siblings and spawned directly. -->
+  <Target Name="OmniDropHelperExesFromSingleFilePublish"
+          AfterTargets="ComputeResolvedFilesToPublishList"
+          Condition="'$(PublishSingleFile)' == 'true'">
+    <ItemGroup>
+      <ResolvedFileToPublish
+        Remove="@(ResolvedFileToPublish)"
+        Condition="'%(ResolvedFileToPublish.Filename)' == 'omni-rendezvous-helper' or '%(ResolvedFileToPublish.Filename)' == 'omni-dht-helper'" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Never ship someone's profile. `dotnet publish` does not clean its output directory, and the app
+       is PORTABLE: run it once from PublishDir and it leaves a database, its journals, the discovery
+       sidecars and — the dangerous one — `omni.db.transport-identity.key` sitting right next to the
+       exe. Publishing again keeps them, so the "single file" release becomes an exe plus a working
+       identity.
+
+       That is not cosmetic. `RustBridge.AppDirectories.cs` MIGRATES a loose pre-OmniData layout into
+       OmniData on first launch, so copying that folder to two machines would hand both of them the
+       SAME transport identity — and a two-peer test would be one peer talking to itself.
+       Caught 2026-08-11 on a real standalone publish: nine such files, dated two months earlier.
+
+       Deliberately a narrow, named list rather than wiping the directory. -->
+  <Target Name="OmniStripProfileArtifactsFromPublishDir" BeforeTargets="Publish">
+    <ItemGroup>
+      <OmniStaleProfileArtifact Include="$(PublishDir)omni.db*" />
+      <OmniStaleProfileArtifact Include="$(PublishDir)discovery-*.json" />
+      <!-- Needs the Exists() guard: a literal (non-wildcard) Include produces an item whether or not
+           the file is there, so without it this target announces a removal on every single publish
+           and the warning stops meaning anything. The two entries above are globs and self-filter. -->
+      <OmniStaleProfileArtifact Include="$(PublishDir)node-mode.json"
+                                Condition="Exists('$(PublishDir)node-mode.json')" />
+    </ItemGroup>
+    <Message Importance="high"
+             Condition="'@(OmniStaleProfileArtifact)' != ''"
+             Text="Removing profile artifacts left in $(PublishDir) by a previous RUN (never ship these): @(OmniStaleProfileArtifact->'%(Filename)%(Extension)', ', ')" />
+    <Delete Files="@(OmniStaleProfileArtifact)" />
+    <RemoveDir Directories="$(PublishDir)OmniData;$(PublishDir)logs" Condition="Exists('$(PublishDir)OmniData') or Exists('$(PublishDir)logs')" />
+  </Target>
+
+  <Target Name="EnsureOmniCoreAvailable" BeforeTargets="Build" Condition="!Exists('$(OmniCoreDll)')">
+    <Error Text="Rust DLL not found at $(OmniCoreDll) after cargo build." />
+  </Target>
+
+  <Target Name="CopyOmniCoreDll" AfterTargets="Build" Condition="Exists('$(OmniCoreDll)')">
+    <Copy SourceFiles="$(OmniCoreDll)" DestinationFiles="$(OutDir)omni_ffi.dll" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyOmniRendezvousHelper" AfterTargets="Build" Condition="Exists('$(OmniRendezvousHelperExe)')">
+    <Copy SourceFiles="$(OmniRendezvousHelperExe)" DestinationFiles="$(OutDir)omni-rendezvous-helper.exe" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyOmniDhtHelper" AfterTargets="Build" Condition="Exists('$(OmniDhtHelperExe)')">
+    <Copy SourceFiles="$(OmniDhtHelperExe)" DestinationFiles="$(OutDir)omni-dht-helper.exe" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

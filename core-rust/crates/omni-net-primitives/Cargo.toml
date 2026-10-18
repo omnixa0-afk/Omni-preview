@@ -1,0 +1,33 @@
+[package]
+name = "omni-net-primitives"
+version = "0.1.0"
+edition.workspace = true
+
+# Shared, identity-agnostic networking primitives. Extracted из
+# omni-transport/quic_carrier.rs (2026-05-28) чтобы omni-transport И
+# omni-network могли reuse'ить один QUIC stack без дублирования.
+# См. docs/bugs/mesh-vs-existing-duplication-audit.md (Strategy B).
+#
+# Что здесь: raw QUIC config/socket/verifier helpers + multicast socket.
+# Чего здесь НЕТ: app-specific handshake (instance_id hello живёт в
+# omni-transport, NodeAddress challenge живёт в omni-network).
+
+[dependencies]
+quinn = { version = "0.11.9", default-features = true }
+# Direct, because the congestion-controller trait's `on_ack` names `RttEstimator` and quinn's
+# curated re-export list leaves it out -- implementing `congestion::Controller` outside quinn is
+# impossible without naming it. Same crate quinn already pulls in, so no second version enters.
+quinn-proto = "0.11.14"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# `features = ["all"]` exposes the platform-specific setters (e.g. `set_reuse_port`, used under
+# `#[cfg(unix)]` in multicast.rs) — required to build on Linux (the relay VPS). Harmless on Windows.
+socket2 = { version = "0.5", features = ["all"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+rcgen = "0.14"
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+  x:Class="Omni.Windows.App.Features.Groups.GroupInviteCard"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- An invitation, opened from its chat-list row in place of the conversation: what the group is,
+       who invites, what joining means — and the two answers. While the Welcome is on its way the
+       buttons give way to a "joining" line; the shell switches to the group once we are in. -->
+  <Grid Padding="16">
+    <Button
+      x:Name="BackButton"
+      MinWidth="0"
+      Padding="8,4"
+      HorizontalAlignment="Left"
+      VerticalAlignment="Top"
+      AutomationProperties.Name="Назад к списку"
+      Click="OnBackClicked"
+      Visibility="Collapsed">
+      <FontIcon FontSize="14" Glyph="&#xE72B;" />
+    </Button>
+    <StackPanel MaxWidth="420" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="14">
+      <Border Width="96" Height="96" HorizontalAlignment="Center" Background="{ThemeResource AccentFillColorSecondaryBrush}" CornerRadius="48">
+        <TextBlock x:Name="InitialsText" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="32" FontWeight="SemiBold" />
+      </Border>
+      <TextBlock x:Name="NameText" HorizontalAlignment="Center" FontSize="22" FontWeight="SemiBold" TextAlignment="Center" TextWrapping="Wrap" />
+      <TextBlock x:Name="InviterText" HorizontalAlignment="Center" Opacity="0.8" TextAlignment="Center" TextWrapping="Wrap" />
+      <TextBlock x:Name="NoteText" HorizontalAlignment="Center" FontSize="12" Opacity="0.65" TextAlignment="Center" TextWrapping="Wrap" />
+      <StackPanel x:Name="AnswerButtons" HorizontalAlignment="Center" Orientation="Horizontal" Spacing="10">
+        <Button x:Name="JoinButton" MinWidth="140" Click="OnJoinClicked" Content="Вступить" Style="{StaticResource AccentButtonStyle}" />
+        <Button x:Name="DeclineButton" MinWidth="140" Click="OnDeclineClicked" Content="Отклонить" />
+      </StackPanel>
+      <StackPanel x:Name="JoiningPanel" HorizontalAlignment="Center" Orientation="Horizontal" Spacing="10" Visibility="Collapsed">
+        <ProgressRing Width="18" Height="18" IsActive="True" />
+        <TextBlock x:Name="JoiningText" VerticalAlignment="Center" TextWrapping="Wrap" />
+      </StackPanel>
+      <TextBlock x:Name="ErrorText" HorizontalAlignment="Center" Foreground="{ThemeResource SystemFillColorCriticalBrush}" TextAlignment="Center" TextWrapping="Wrap" Visibility="Collapsed" />
+    </StackPanel>
+  </Grid>
+</UserControl>

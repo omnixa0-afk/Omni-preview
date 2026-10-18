@@ -1,0 +1,15 @@
+[package]
+name = "omni-transport"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+omni-net-primitives = { path = "../omni-net-primitives" }
+omni-protocol = { path = "../omni-protocol" }
+omni-types = { path = "../omni-types" }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

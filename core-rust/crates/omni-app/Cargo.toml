@@ -1,0 +1,40 @@
+[package]
+name = "omni-app"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+# Test-stand knobs (fault injection) in a release build; debug builds always have them.
+dev-tools = []
+
+[dependencies]
+# MLS state at rest: deterministic AEAD (the OpenMLS SQLite provider looks rows up by encoded key).
+aes-gcm-siv = "0.11"
+base64.workspace = true
+# The group-attachment pull preamble on a mesh bulk stream (app_group_attachments.rs).
+tokio = { version = "1", features = ["io-util", "rt"] }
+ed25519-dalek.workspace = true
+# The account passport is packed before it is sealed (runtime_account_passport.rs).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+omni-group-mls = { path = "../omni-group-mls" }
+rusqlite.workspace = true
+parking_lot.workspace = true
+hex.workspace = true
+omni-crypto = { path = "../omni-crypto" }
+omni-identity = { path = "../omni-identity" }
+omni-mesh-runtime = { path = "../omni-mesh-runtime" }
+omni-messaging = { path = "../omni-messaging" }
+omni-protocol = { path = "../omni-protocol" }
+omni-rendezvous = { path = "../omni-rendezvous" }
+omni-storage = { path = "../omni-storage" }
+omni-transport = { path = "../omni-transport" }
+omni-types = { path = "../omni-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+
+[lints]
+workspace = true

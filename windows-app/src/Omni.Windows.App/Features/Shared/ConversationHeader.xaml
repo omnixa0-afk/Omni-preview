@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One header for every conversation, a 1:1 chat and a group alike: back (narrow layout), the
+     avatar and the name with one line under it (a tap on them opens the chat's page), and the
+     host's icon buttons at the right. One template, so the two cannot drift by a pixel (owner,
+     2026-10-11: «один шаблон в разных местах»). -->
+<UserControl
+  x:Class="Omni.Windows.App.Features.Shared.ConversationHeader"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:shared="using:Omni.Windows.App.Features.Shared"
+  IsTabStop="False">
+  <!-- A slim bar (owner, 2026-10-12: the header was «массивная строчка»): 3 + the 40 px buttons + 4,
+       so its bottom line runs along the top of the chat list's search box (y 48). The avatar is as
+       tall as the buttons, and the side margins 12, not 16 (owner, 2026-10-12: «аватарку
+       можно и побольше, опять пустые большие поля»). -->
+  <Grid Margin="12,3,12,4" ColumnSpacing="10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="Auto" />
+      <ColumnDefinition Width="Auto" />
+      <ColumnDefinition Width="*" />
+      <ColumnDefinition Width="Auto" />
+    </Grid.ColumnDefinitions>
+    <Button
+      x:Name="BackPart"
+      VerticalAlignment="Center"
+      AutomationProperties.Name="Назад к чатам"
+      Click="OnBackClicked"
+      Style="{StaticResource GhostIconButtonStyle}"
+      Visibility="Collapsed">
+      <FontIcon FontSize="16" Glyph="&#xE76B;" />
+    </Button>
+    <!-- The avatar on its own: a picture opens on the whole window, as a photo does (AvatarView,
+         owner 2026-10-12); without one it is the way to the chat's page, like the name. -->
+    <shared:AvatarView
+      x:Name="AvatarPart"
+      Grid.Column="1"
+      VerticalAlignment="Center"
+      PictureTitle="{x:Bind TitlePart.Text, Mode=OneWay}"
+      Size="40" />
+    <Button
+      x:Name="IdentityPart"
+      Grid.Column="2"
+      MinWidth="0"
+      MinHeight="0"
+      Margin="-6,-4,0,-4"
+      Padding="6,4"
+      HorizontalAlignment="Stretch"
+      HorizontalContentAlignment="Stretch"
+      Background="Transparent"
+      BorderThickness="0"
+      Click="OnIdentityClicked">
+      <StackPanel VerticalAlignment="Center" Spacing="0">
+        <TextBlock x:Name="TitlePart" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+        <TextBlock x:Name="SubtitlePart" FontSize="12" Opacity="0.76" TextTrimming="CharacterEllipsis" />
+        <TextBlock x:Name="DetailPart" FontSize="11.5" Opacity="0.6" TextTrimming="CharacterEllipsis" Visibility="Collapsed" />
+      </StackPanel>
+    </Button>
+    <ContentPresenter x:Name="ActionsPart" Grid.Column="3" VerticalAlignment="Center" />
+  </Grid>
+</UserControl>

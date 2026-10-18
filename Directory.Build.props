@@ -1,0 +1,12 @@
+<Project>
+  <!-- Machine-specific settings (e.g. OmniBuildToolsPath), never committed. -->
+  <Import Project="Directory.Build.local.props" Condition="Exists('$(MSBuildThisFileDirectory)Directory.Build.local.props')" />
+  <PropertyGroup>
+    <NuGetAudit>false</NuGetAudit>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <!-- Reproducible Release assemblies: source and PDB paths are recorded relative to the repo. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PathMap>$(MSBuildThisFileDirectory)=omni\</PathMap>
+  </PropertyGroup>
+</Project>

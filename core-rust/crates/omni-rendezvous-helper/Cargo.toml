@@ -1,0 +1,23 @@
+[package]
+name = "omni-rendezvous-helper"
+version = "0.1.0"
+edition.workspace = true
+
+# The SEPARATE, untrusted-by-design rendezvous helper PROCESS (privilege separation): it does all
+# the dirty third-party network I/O (rendezvous providers + STUN) so the key-holding core never
+# touches hostile internet input directly, and so each provider connection can be independently
+# sandboxed + proxied (regional blocks). It holds NO keys: the core hands it an opaque topic + an
+# opaque sealed blob (publish) and gets opaque blobs back (fetch) — the security is the AEAD beacon
+# (omni-rendezvous). Drives over a tiny local line IPC (TCP for now; named pipe / per-component
+# proxy = later). См. docs/decisions/serverless-bootstrap-rendezvous.md §Architecture.
+
+[[bin]]
+name = "omni-rendezvous-helper"
+path = "src/main.rs"
+
+[dependencies]
+omni-rendezvous = { path = "../omni-rendezvous" }
+omni-rendezvous-providers = { path = "../omni-rendezvous-providers" }
+
+[lints]
+workspace = true

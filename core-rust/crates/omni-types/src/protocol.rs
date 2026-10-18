@@ -1,0 +1,9 @@
+pub const OMNI_PROTOCOL_VERSION_V1: u16 = 1;
+pub const OMNI_PROTOCOL_VERSION_V2: u16 = 2;
+pub const OMNI_LOGICAL_EVENT_VERSION_V1: u16 = 1;
+pub const SIGNALING_BOOTSTRAP_VERSION_V1: u16 = 1;
+pub const SIGNALING_ROUTE_CANDIDATE_VERSION_V1: u16 = 1;
+pub const ROUTE_HINTS_SYNC_VERSION_V1: u16 = 1;
+pub const RELAY_SET_UPDATE_VERSION_V1: u16 = 1;
+pub const DIALOG_KEY_INSTANCE_PREFIX: &str = "dialog:instance:";
+pub const DIALOG_KEY_ACCOUNT_PREFIX: &str = "dialog:account:";

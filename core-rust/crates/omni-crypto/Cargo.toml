@@ -1,0 +1,21 @@
+[package]
+name = "omni-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+omni-identity = { path = "../omni-identity" }
+omni-types = { path = "../omni-types" }
+rand_core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+
+[lints]
+workspace = true

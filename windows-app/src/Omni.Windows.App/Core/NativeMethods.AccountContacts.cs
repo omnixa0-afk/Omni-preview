@@ -1,0 +1,80 @@
+namespace Omni.Windows.App.Core;
+
+internal static partial class NativeMethods
+{
+    private static void LoadAccountContactExports()
+    {
+        LoadExport(ref omniIdentityGetCurrentAccountExportManifest, nameof(omni_identity_get_current_account_export_manifest));
+        LoadExport(ref omniIdentityExportCurrentDatabaseBackup, nameof(omni_identity_export_current_database_backup));
+        LoadExport(ref omniIdentityExportCurrentDatabaseBackupBundle, nameof(omni_identity_export_current_database_backup_bundle));
+        LoadExport(ref omniIdentityInspectAccountBackupManifest, nameof(omni_identity_inspect_account_backup_manifest));
+        LoadExport(ref omniIdentityCreateAccount, nameof(omni_identity_create_account));
+        LoadExport(ref omniIdentityRestoreAccountFromExportManifest, nameof(omni_identity_restore_account_from_export_manifest));
+        LoadExport(ref omniIdentityRestoreAccountFromInput, nameof(omni_identity_restore_account_from_input));
+        LoadExport(ref omniIdentityInspectRecoveryInput, nameof(omni_identity_inspect_recovery_input));
+        LoadExport(ref omniIdentityGetLocalAccount, nameof(omni_identity_get_local_account));
+        LoadExport(ref omniIdentityUpdateLocalPublicProfile, nameof(omni_identity_update_local_public_profile));
+        LoadExport(ref omniIdentityGetLocalDevice, nameof(omni_identity_get_local_device));
+        LoadExport(ref omniIdentityGetLocalPrekeyBundle, nameof(omni_identity_get_local_prekey_bundle));
+        LoadExport(ref omniIdentityStoreRemotePrekeyBundle, nameof(omni_identity_store_remote_prekey_bundle));
+        LoadExport(ref omniIdentityListLocalProfiles, nameof(omni_identity_list_local_profiles));
+        LoadExport(ref omniIdentityGetLocalProfileSummary, nameof(omni_identity_get_local_profile_summary));
+        LoadExport(ref omniIdentityGetActiveProfile, nameof(omni_identity_get_active_profile));
+        LoadExport(ref omniIdentitySelectActiveProfile, nameof(omni_identity_select_active_profile));
+        LoadExport(ref omniIdentityClearActiveProfile, nameof(omni_identity_clear_active_profile));
+        LoadExport(ref omniIdentityReopenLocalProfile, nameof(omni_identity_reopen_local_profile));
+        LoadExport(ref omniIdentityGetCurrentProfileGateSummary, nameof(omni_identity_get_current_profile_gate_summary));
+        LoadExport(ref omniIdentityGetCurrentProfileLifecycleSummary, nameof(omni_identity_get_current_profile_lifecycle_summary));
+        LoadExport(ref omniIdentityGetLifecycleFastSnapshot, nameof(omni_identity_get_lifecycle_fast_snapshot));
+        LoadExport(ref omniIdentityPrepareSignOutCurrentProfile, nameof(omni_identity_prepare_sign_out_current_profile));
+        LoadExport(ref omniIdentityConfirmSignOutCurrentProfile, nameof(omni_identity_confirm_sign_out_current_profile));
+        LoadExport(ref omniIdentityConfirmSignOutProfile, nameof(omni_identity_confirm_sign_out_profile));
+        LoadExport(ref omniIdentitySignOutProfile, nameof(omni_identity_sign_out_profile));
+        LoadExport(ref omniIdentityUnlockCurrentProfileWithPassword, nameof(omni_identity_unlock_current_profile_with_password));
+        LoadExport(ref omniIdentityRevealCurrentProfileRecoveryPhraseWithPassword, nameof(omni_identity_reveal_current_profile_recovery_phrase_with_password));
+        LoadExport(ref omniIdentityUnlockCurrentProfileWithMnemonic, nameof(omni_identity_unlock_current_profile_with_mnemonic));
+        LoadExport(ref omniIdentityUnlockProfileWithPassword, nameof(omni_identity_unlock_profile_with_password));
+        LoadExport(ref omniIdentityUnlockProfileWithMnemonic, nameof(omni_identity_unlock_profile_with_mnemonic));
+        LoadExport(ref omniIdentitySetLocalProfilePassword, nameof(omni_identity_set_local_profile_password));
+        LoadExport(ref omniIdentityChangeLocalProfilePassword, nameof(omni_identity_change_local_profile_password));
+        LoadExport(ref omniIdentityRemoveLocalProfilePassword, nameof(omni_identity_remove_local_profile_password));
+        LoadExport(ref omniIdentityGetPasswordProtectionSummary, nameof(omni_identity_get_password_protection_summary));
+        LoadExport(ref omniIdentityGetLocalProfileFootprintSummary, nameof(omni_identity_get_local_profile_footprint_summary));
+        LoadExport(ref omniIdentityPreviewSignOutProfile, nameof(omni_identity_preview_sign_out_profile));
+        LoadExport(ref omniIdentityPreviewDeleteLocalProfile, nameof(omni_identity_preview_delete_local_profile));
+        LoadExport(ref omniIdentityPrepareDeleteCurrentProfile, nameof(omni_identity_prepare_delete_current_profile));
+        LoadExport(ref omniIdentityConfirmDeleteLocalProfile, nameof(omni_identity_confirm_delete_local_profile));
+        LoadExport(ref omniIdentityConfirmDeleteCurrentProfile, nameof(omni_identity_confirm_delete_current_profile));
+        LoadExport(ref omniIdentityPreviewRevokeCurrentDeviceAndWipe, nameof(omni_identity_preview_revoke_current_device_and_wipe));
+        LoadExport(ref omniIdentityDeleteLocalProfile, nameof(omni_identity_delete_local_profile));
+        LoadExport(ref omniContactsList, nameof(omni_contacts_list));
+        LoadExport(ref omniContactsGetRefreshSummary, nameof(omni_contacts_get_refresh_summary));
+        LoadExport(ref omniContactsGetScreenSnapshot, nameof(omni_contacts_get_screen_snapshot));
+        LoadExport(ref omniContactsAddByIdentifier, nameof(omni_contacts_add_by_identifier));
+        LoadExport(ref omniContactsRequestByIdentifier, nameof(omni_contacts_request_by_identifier));
+        LoadExport(ref omniContactsAddFromPayload, nameof(omni_contacts_add_from_payload));
+        LoadExport(ref omniContactsRename, nameof(omni_contacts_rename));
+        LoadExport(ref omniContactsBlock, nameof(omni_contacts_block));
+        LoadExport(ref omniContactsApprove, nameof(omni_contacts_approve));
+        LoadExport(ref omniContactsSetFriendRelayConsent, nameof(omni_contacts_set_friend_relay_consent));
+        LoadExport(ref omniContactsGetRemoteAccess, nameof(omni_contacts_get_remote_access));
+        LoadExport(ref omniContactsListRemoteAccess, nameof(omni_contacts_list_remote_access));
+        LoadExport(ref omniContactsSetRemoteAccessGranted, nameof(omni_contacts_set_remote_access_granted));
+        LoadExport(ref omniAccountDevicesList, nameof(omni_account_devices_list));
+        LoadExport(ref omniAccountDeviceRevoke, nameof(omni_account_device_revoke));
+        LoadExport(ref omniAccountDevicesAcknowledge, nameof(omni_account_devices_acknowledge));
+        LoadExport(ref omniAccountDevicesHideRevoked, nameof(omni_account_devices_hide_revoked));
+        LoadExport(ref omniAccountMoveWorkingKey, nameof(omni_account_move_working_key));
+        LoadExport(ref omniContactsDecline, nameof(omni_contacts_decline));
+        LoadExport(ref omniContactsForget, nameof(omni_contacts_forget));
+        LoadExport(ref omniContactsForgetAndResetPeer, nameof(omni_contacts_forget_and_reset_peer));
+        LoadExport(ref omniContactsGetCard, nameof(omni_contacts_get_card));
+        LoadExport(ref omniContactsGetCardRevision, nameof(omni_contacts_get_card_revision));
+        LoadExport(ref omniIdentityGetMyVerificationPayload, nameof(omni_identity_get_my_verification_payload));
+        LoadExport(ref omniContactsGetVerificationState, nameof(omni_contacts_get_verification_state));
+        LoadExport(ref omniContactsConfirmVerification, nameof(omni_contacts_confirm_verification));
+        LoadExport(ref omniContactsStartChat, nameof(omni_contacts_start_chat));
+        LoadExport(ref omniContactsQuickAddFromDialog, nameof(omni_contacts_quick_add_from_dialog));
+        LoadExport(ref omniContactsAttachDialogToContact, nameof(omni_contacts_attach_dialog_to_contact));
+    }
+}

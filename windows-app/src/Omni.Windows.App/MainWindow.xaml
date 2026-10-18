@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+  x:Class="Omni.Windows.App.MainWindow"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:onboarding="using:Omni.Windows.App.Features.Onboarding"
+  xmlns:chats="using:Omni.Windows.App.Features.Chats"
+  xmlns:contacts="using:Omni.Windows.App.Features.Contacts"
+  xmlns:settings="using:Omni.Windows.App.Features.Settings"
+  xmlns:diagnostics="using:Omni.Windows.App.Features.Diagnostics"
+  xmlns:calls="using:Omni.Windows.App.Features.Calls"
+  xmlns:shared="using:Omni.Windows.App.Features.Shared"
+  mc:Ignorable="d">
+  <Grid Background="{ThemeResource OmniBgAppBrush}">
+    <Grid
+      x:Name="BootRoot"
+      Padding="40">
+      <StackPanel
+        Width="460"
+        HorizontalAlignment="Center"
+        VerticalAlignment="Center"
+        Spacing="18">
+        <ProgressRing
+          Width="56"
+          Height="56"
+          HorizontalAlignment="Center"
+          IsActive="True" />
+        <TextBlock
+          HorizontalAlignment="Center"
+          FontSize="32"
+          FontWeight="SemiBold"
+          Text="Omni" />
+        <TextBlock
+          HorizontalAlignment="Center"
+          FontSize="16"
+          Opacity="0.76"
+          Text="Подготавливаем приложение" />
+        <TextBlock
+          x:Name="BootStatusTextBlock"
+          Text="Инициализируем локальное ядро и проверяем профиль..."
+          TextAlignment="Center"
+          TextWrapping="WrapWholeWords" />
+      </StackPanel>
+    </Grid>
+
+    <onboarding:OnboardingShellControl x:Name="OnboardingSectionHost" />
+
+    <Grid
+      x:Name="AuthenticatedRoot"
+      Visibility="Collapsed">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <StackPanel Grid.Row="0">
+        <!-- A call that goes on while its screen is folded away (or another chat is open): one
+             strip over everything — tap to go back, or mute / hang up right here. -->
+        <Grid
+          x:Name="ActiveCallBar"
+          Height="40"
+          Background="{ThemeResource OmniCallAcceptBrush}"
+          Visibility="Collapsed">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <Button
+            x:Name="ActiveCallBarReturnButton"
+            MinWidth="0"
+            MinHeight="0"
+            Padding="16,0"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Stretch"
+            HorizontalContentAlignment="Left"
+            AutomationProperties.Name="Вернуться к звонку"
+            Background="Transparent"
+            BorderThickness="0"
+            CornerRadius="0"
+            Foreground="White">
+            <StackPanel Orientation="Horizontal" Spacing="10">
+              <FontIcon VerticalAlignment="Center" FontSize="13" Glyph="&#xE717;" />
+              <TextBlock x:Name="ActiveCallBarTextBlock" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" />
+              <TextBlock VerticalAlignment="Center" FontSize="13" Opacity="0.85" Text="Вернуться к звонку" />
+            </StackPanel>
+          </Button>
+          <StackPanel
+            Grid.Column="1"
+            Margin="0,0,10,0"
+            VerticalAlignment="Center"
+            Orientation="Horizontal"
+            Spacing="6">
+            <Button
+              x:Name="ActiveCallBarMuteButton"
+              Width="30"
+              Height="30"
+              MinWidth="0"
+              MinHeight="0"
+              Padding="0"
+              AutomationProperties.Name="Выключить микрофон"
+              Background="#33FFFFFF"
+              BorderThickness="0"
+              CornerRadius="15"
+              Foreground="White">
+              <FontIcon x:Name="ActiveCallBarMuteIcon" FontSize="13" Glyph="&#xE720;" />
+            </Button>
+            <Button
+              x:Name="ActiveCallBarHangUpButton"
+              Width="30"
+              Height="30"
+              MinWidth="0"
+              MinHeight="0"
+              Padding="0"
+              AutomationProperties.Name="Завершить звонок"
+              Background="{ThemeResource OmniCallHangUpBrush}"
+              BorderThickness="0"
+              CornerRadius="15"
+              Foreground="White">
+              <FontIcon FontSize="13" Glyph="&#xE778;" />
+            </Button>
+          </StackPanel>
+        </Grid>
+        <Border
+          x:Name="IncomingCallBannerBorder"
+          Margin="16,12,16,0"
+          Padding="14,12"
+          Background="{ThemeResource OmniBgElevatedBrush}"
+          BorderBrush="{ThemeResource OmniAccentBrush}"
+          BorderThickness="1"
+          CornerRadius="14"
+          Visibility="Collapsed">
+          <Grid
+            ColumnSpacing="14"
+            RowSpacing="6">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Border
+              Width="40"
+              Height="40"
+              VerticalAlignment="Center"
+              Background="{ThemeResource OmniAccentBrush}"
+              CornerRadius="20">
+              <FontIcon
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                FontSize="16"
+                Foreground="{ThemeResource OmniBgAppBrush}"
+                Glyph="&#xE717;" />
+            </Border>
+            <StackPanel
+              Grid.Column="1"
+              VerticalAlignment="Center"
+              Spacing="4">
+              <TextBlock
+                x:Name="IncomingCallBannerTitleTextBlock"
+                FontSize="15"
+                FontWeight="SemiBold"
+                Text="Входящий звонок" />
+              <TextBlock
+                x:Name="IncomingCallBannerSubtitleTextBlock"
+                FontSize="12"
+                Opacity="0.84"
+                Text="Когда появится входящий звонок, здесь можно будет быстро ответить."
+                TextWrapping="WrapWholeWords" />
+            </StackPanel>
+            <StackPanel
+              Grid.Column="2"
+              Orientation="Horizontal"
+              VerticalAlignment="Center"
+              Spacing="10">
+              <Button
+                x:Name="AcceptIncomingCallButton"
+                Content="Принять"
+                Style="{StaticResource AccentPrimaryButtonStyle}" />
+              <Button
+                x:Name="AcceptIncomingCallMutedButton"
+                Content="Без микрофона"
+                ToolTipService.ToolTip="Ответить с выключенным микрофоном — включите, когда будете готовы" />
+              <Button
+                x:Name="DeclineIncomingCallButton"
+                Content="Отклонить" />
+            </StackPanel>
+          </Grid>
+        </Border>
+        </StackPanel>
+        <Grid
+          x:Name="AuthenticatedShellGrid"
+          Grid.Row="1">
+        <VisualStateManager.VisualStateGroups>
+          <VisualStateGroup>
+            <VisualState x:Name="AuthenticatedShellNarrow">
+              <VisualState.Setters>
+                <Setter Target="AuthenticatedContentHost.Padding" Value="0" />
+              </VisualState.Setters>
+            </VisualState>
+            <VisualState x:Name="AuthenticatedShellMedium">
+              <VisualState.StateTriggers>
+                <AdaptiveTrigger MinWindowWidth="900" />
+              </VisualState.StateTriggers>
+              <VisualState.Setters>
+                <Setter Target="AuthenticatedContentHost.Padding" Value="0" />
+              </VisualState.Setters>
+            </VisualState>
+            <VisualState x:Name="AuthenticatedShellWide">
+              <VisualState.StateTriggers>
+                <AdaptiveTrigger MinWindowWidth="1280" />
+              </VisualState.StateTriggers>
+              <VisualState.Setters>
+                <Setter Target="AuthenticatedContentHost.Padding" Value="0" />
+              </VisualState.Setters>
+            </VisualState>
+          </VisualStateGroup>
+        </VisualStateManager.VisualStateGroups>
+
+        <NavigationView
+          x:Name="AuthenticatedNavigationView"
+          CompactPaneLength="56"
+          IsBackButtonVisible="Collapsed"
+          IsSettingsVisible="False"
+          OpenPaneLength="228"
+          PaneDisplayMode="LeftCompact"
+          SelectionChanged="OnAuthenticatedNavigationSelectionChanged">
+          <!-- One pane surface whether the drawer is folded or open. Fluent paints the open
+               (overlay) drawer with its own lighter in-app acrylic and the folded rail with
+               another brush, so opening and folding it flipped the colour in one frame (owner,
+               2026-10-10: "светлый моментально сменяется тёмным"). Set here, on the control:
+               app-level overrides of Fluent's own keys don't take. -->
+          <NavigationView.Resources>
+            <ResourceDictionary>
+              <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Dark">
+                  <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="#0F1924" />
+                  <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="#0F1924" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                  <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="#FFFFFF" />
+                  <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="#FFFFFF" />
+                </ResourceDictionary>
+              </ResourceDictionary.ThemeDictionaries>
+            </ResourceDictionary>
+          </NavigationView.Resources>
+          <NavigationView.MenuItems>
+            <NavigationViewItem
+              x:Name="ChatsNavigationItem"
+              AutomationProperties.AutomationId="ChatsNavigationItem"
+              Content="Чаты"
+              Tag="Chats">
+              <NavigationViewItem.Icon>
+                <SymbolIcon Symbol="Message" />
+              </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem
+              x:Name="ContactsNavigationItem"
+              AutomationProperties.AutomationId="ContactsNavigationItem"
+              Content="Контакты"
+              Tag="Contacts">
+              <NavigationViewItem.Icon>
+                <SymbolIcon Symbol="People" />
+              </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem
+              x:Name="SettingsNavigationItem"
+              Content="Настройки"
+              Tag="Settings">
+              <NavigationViewItem.Icon>
+                <SymbolIcon Symbol="Setting" />
+              </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem
+              x:Name="DiagnosticsNavigationItem"
+              Content="Диагностика"
+              Tag="Diagnostics">
+              <NavigationViewItem.Icon>
+                <FontIcon Glyph="&#xE9D9;" />
+              </NavigationViewItem.Icon>
+            </NavigationViewItem>
+          </NavigationView.MenuItems>
+
+          <NavigationView.PaneFooter>
+            <Grid
+              x:Name="IdentityFooter"
+              Margin="4,2,4,6"
+              Padding="8,6"
+              Background="{ThemeResource OmniBgElevatedBrush}"
+              CornerRadius="10"
+              ColumnSpacing="10"
+              Tapped="OnIdentityFooterTapped"
+              AutomationProperties.Name="Профиль">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <shared:AvatarView x:Name="IdentityAvatar" Size="34" OpensPicture="False" />
+              <TextBlock
+                x:Name="IdentitySubtitleTextBlock"
+                Grid.Column="1"
+                VerticalAlignment="Center"
+                FontWeight="SemiBold"
+                Text="Профиль не загружен"
+                TextTrimming="CharacterEllipsis" />
+            </Grid>
+          </NavigationView.PaneFooter>
+
+          <Grid
+            x:Name="AuthenticatedContentHost"
+            Padding="0">
+            <chats:ChatsSectionControl x:Name="ChatsSectionHost" />
+            <contacts:ContactsSectionControl x:Name="ContactsSectionHost" />
+            <settings:SettingsSectionControl x:Name="SettingsSectionHost" />
+            <diagnostics:DiagnosticsSectionControl x:Name="DiagnosticsSectionHost" />
+            <!-- A group call rings over whatever section is open (MainWindow.Groups.cs). -->
+            <InfoBar
+              x:Name="GroupCallRingBar"
+              Margin="16,12"
+              MaxWidth="560"
+              HorizontalAlignment="Center"
+              VerticalAlignment="Top"
+              Canvas.ZIndex="10"
+              IsClosable="True"
+              IsOpen="False"
+              Severity="Informational">
+              <InfoBar.IconSource>
+                <FontIconSource Glyph="&#xE717;" />
+              </InfoBar.IconSource>
+              <InfoBar.Content>
+                <StackPanel Margin="0,0,0,12" Orientation="Horizontal" Spacing="8">
+                  <Button x:Name="GroupCallRingJoinButton" Content="Присоединиться" Style="{StaticResource AccentButtonStyle}" />
+                  <Button x:Name="GroupCallRingDeclineButton" Content="Отклонить" />
+                </StackPanel>
+              </InfoBar.Content>
+            </InfoBar>
+          </Grid>
+        </NavigationView>
+        </Grid>
+      </Grid>
+    </Grid>
+
+    <calls:CallOverlayControl x:Name="CallOverlayHost" />
+
+    <!-- Over everything, the call too: a photo or an avatar on the whole window. -->
+    <shared:ImageViewer x:Name="ImageViewerHost" />
+  </Grid>
+</Window>

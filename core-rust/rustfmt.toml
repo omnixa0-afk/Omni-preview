@@ -1,0 +1,10 @@
+# Formatting config for `cargo fmt` (run from core-rust/).
+#
+# Style is pinned here, but the tree was NOT reformatted wholesale: a repo-wide `cargo fmt`
+# drifts ~340 files and would bury git-blame. Migrate incrementally — run `cargo fmt -p <crate>`
+# on code you're already touching so the tree converges over time (newer code already conforms;
+# older hand-formatted files will reformat substantially, so keep those diffs to their own PR).
+# CI does NOT yet gate on `cargo fmt --check` for this reason; add that gate once the tree has
+# converged.
+edition = "2021"
+max_width = 100

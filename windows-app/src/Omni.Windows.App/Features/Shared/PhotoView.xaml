@@ -1,0 +1,13 @@
+<UserControl
+  x:Class="Omni.Windows.App.Features.Shared.PhotoView"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!-- A photo in the chat (docs/decisions/media-messages.md): the downloaded file when there is
+       one, the small preview from the offer until then. Decoded to the size it is shown at. -->
+  <Border
+    x:Name="FramePart"
+    Background="{ThemeResource OmniBgElevatedBrush}"
+    CornerRadius="10">
+    <Image x:Name="ImagePart" Stretch="UniformToFill" />
+  </Border>
+</UserControl>

@@ -1,0 +1,21 @@
+[package]
+name = "omni-daemon"
+version = "0.1.0"
+edition.workspace = true
+
+# Reusable daemon-serving core: the IPC transport abstraction (TCP + Windows named pipe),
+# the line + framed command protocols, and the events plane — generalized over a tiny
+# `AsOmniApp` trait so it serves either an owned `OmniApp` (the `omni-node` binary) or one
+# borrowed behind an FFI handle (the WinUI shell's embedded daemon). See
+# docs/decisions/daemon-ipc-phase2.md + docs/decisions/embedded-daemon-in-shell.md.
+
+[dependencies]
+omni-app = { path = "../omni-app" }
+omni-identity = { path = "../omni-identity" }
+# CarrierPolicy parsing for the `carrier-policy` verb (R1a). Pure-leaf crate, no cycle.
+omni-types = { path = "../omni-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

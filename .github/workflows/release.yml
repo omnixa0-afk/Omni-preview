@@ -1,0 +1,86 @@
+name: release
+
+# Builds Omni.exe from the tagged commit on a GitHub-hosted runner and publishes a signed build
+# provenance attestation for it, so anyone can check which commit and which workflow run produced
+# the exe:
+#
+#   gh attestation verify Omni.exe -R <owner>/<repo>
+#
+# Everything is built here from source: libwebrtc (pinned in scripts/bootstrap-libwebrtc.ps1), the
+# native media module, the Rust core and the WinUI shell. A tag v* ends in a DRAFT release with
+# Omni.exe and SHA256SUMS.txt; a maintainer reviews and publishes it. A manual run only uploads the
+# exe as a workflow artifact.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    # libwebrtc from scratch dominates: checkout ~10 GB, build 1-2 h on a hosted runner.
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.201
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # SQLCipher's vendored OpenSSL needs Perl (Strawberry: Git's Perl lacks modules) and NASM.
+      - name: Strawberry Perl first on PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Strawberry\perl\bin'
+
+      - uses: ilammy/setup-nasm@v1
+
+      - name: Free disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[int]($_.Free/1GB)}}
+
+      - name: libwebrtc sources (pinned revision)
+        shell: pwsh
+        run: .\scripts\bootstrap-libwebrtc.ps1 -DependencyRoot C:\deps -Sync -RunHooks
+
+      - name: libwebrtc build
+        shell: pwsh
+        run: .\scripts\build-libwebrtc.ps1 -DependencyRoot C:\deps
+
+      - name: Native media module
+        shell: pwsh
+        run: .\scripts\build-omni-webrtc-media.ps1 -Configuration Release -UseLibWebRtc -NoTest -WebRtcSrc C:\deps\webrtc\src
+
+      - name: Release exe
+        shell: pwsh
+        run: .\scripts\release.ps1 -TargetDir C:\omni-release-target
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/Omni.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Omni-${{ github.sha }}
+          path: |
+            dist/Omni.exe
+            dist/SHA256SUMS.txt
+
+      - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "Built by this repository's release workflow from $env:GITHUB_SHA.`n`nVerify the download:`n`n    gh attestation verify Omni.exe -R $env:GITHUB_REPOSITORY`n`nSHA-256 is in SHA256SUMS.txt."
+          gh release create $env:GITHUB_REF_NAME dist/Omni.exe dist/SHA256SUMS.txt --draft --prerelease --title $env:GITHUB_REF_NAME --notes $notes

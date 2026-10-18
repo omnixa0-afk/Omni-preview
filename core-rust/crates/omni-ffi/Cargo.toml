@@ -1,0 +1,34 @@
+[package]
+name = "omni-ffi"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+omni-app = { path = "../omni-app" }
+omni-daemon = { path = "../omni-daemon" }
+parking_lot.workspace = true
+omni-crypto = { path = "../omni-crypto" }
+# The courier helper bodies, linked in so `omni_run_helper` can run them IN this DLL — a single-file
+# host has no sibling helper .exe to spawn and re-execs itself instead (see ffi_exports_helpers.rs).
+# They stay separate processes; only the code they run is shared.
+omni-dht-helper = { path = "../omni-dht-helper" }
+omni-identity = { path = "../omni-identity" }
+omni-messaging = { path = "../omni-messaging" }
+# The `OMNI_TRACE_FILE` sink, written for the shell too (`omni_trace_write`) — one writer per file.
+omni-net-primitives = { path = "../omni-net-primitives" }
+omni-protocol = { path = "../omni-protocol" }
+omni-rendezvous-helper = { path = "../omni-rendezvous-helper" }
+omni-storage = { path = "../omni-storage" }
+omni-types = { path = "../omni-types" }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# Test-stand knobs (fault injection) in a release build; debug builds always have them.
+dev-tools = ["omni-app/dev-tools"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "omni-rendezvous"
+version = "0.1.0"
+edition.workspace = true
+
+# Serverless rendezvous core (cross-platform, no platform deps): the signed/encrypted presence
+# BEACON (AEAD under a per-pair-derived key, bound to a rotating blinded TOPIC, with TTL + nonce
+# anti-replay) and the `RendezvousChannel` trait that interchangeable providers (Nostr/BT-DHT/
+# ntfy/…) implement. This is the dependency-free, fully-testable security+architecture foundation
+# of the bootstrap design — it makes TM-009 (rendezvous poisoning) and TM-011 (bootstrap DoS via
+# blinded topics) into enforced code. The actual provider + helper-process integration sits on top.
+# См. docs/decisions/serverless-bootstrap-rendezvous.md + docs/decisions/community-volunteer-nodes.md.
+
+[dependencies]
+hkdf.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+rand_core.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The relay bundle rides a beacon as raw bytes; its `om3relay:` token is base64url of them (wire.rs).
+base64.workspace = true
+# Find by name: a name is compared NFKC-normalized (find-by-name.md).
+unicode-normalization = "0.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+  x:Class="Omni.Windows.App.Features.Calls.CallOverlayControl"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:shared="using:Omni.Windows.App.Features.Shared"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:calls="using:Omni.Windows.App.Features.Calls"
+  mc:Ignorable="d">
+
+  <!-- The call screen (1:1). One stage (themed, OmniCallStageBrush); the face (or the video) in the
+       middle, one status line, the round control bar at the bottom — the same bar as the group
+       call (CallButton). Over live video the name/timer and the bar fade out while the mouse rests
+       and come back on any move (CallOverlayControl.xaml.cs). -->
+  <Grid
+    x:Name="CallOverlayRoot"
+    Background="{ThemeResource OmniCallStageBrush}"
+    Visibility="Collapsed">
+    <!-- Remote video fills the whole surface; collapsed for audio-only calls. -->
+    <Grid x:Name="ChatCallVideoGrid">
+      <!-- GPU video path (#5 increment 3b): the native D3D11 renderer presents decoded frames
+           straight into this swapchain (no BGRA across FFI, no UI-thread WriteableBitmap blit).
+           Bottom z-order so the placeholder text / PiP render over it. Collapsed until the GPU
+           renderer attaches; RemoteCallVideoImage below stays the software fallback sink. -->
+      <SwapChainPanel
+        x:Name="RemoteCallVideoSwapChainPanel"
+        Visibility="Collapsed" />
+      <!-- Whole and undistorted, like the GPU path (FitViewport): a shared screen must not lose its
+           edges, and the remote-control pointer maps through the picture's own rectangle. -->
+      <Image
+        x:Name="RemoteCallVideoImage"
+        Stretch="Uniform" />
+      <TextBlock
+        x:Name="RemoteCallVideoPlaceholderTextBlock"
+        HorizontalAlignment="Center"
+        VerticalAlignment="Center"
+        FontSize="15"
+        Foreground="{ThemeResource OmniCallTextBrush}"
+        Opacity="0.6"
+        Text="Ожидание видео собеседника"
+        TextWrapping="WrapWholeWords" />
+      <!-- Remote screen control, viewer side: while controlling, this transparent surface takes the
+           pointer over the peer's screen (it covers the swapchain; the picture sits in it fitted
+           whole with bars, and MapToSharedScreen maps through the picture's own rectangle). -->
+      <Border
+        x:Name="RemoteScreenControlSurface"
+        Background="Transparent"
+        Visibility="Collapsed" />
+      <!-- Remote-control session, controller side: why input may not land right now (the owner's
+           computer is locked; the owner is using the mouse). Said, not guessed. -->
+      <Border
+        x:Name="RemoteControlNoticeBorder"
+        Margin="0,72,0,0"
+        Padding="14,8"
+        HorizontalAlignment="Center"
+        VerticalAlignment="Top"
+        Background="#CC1F1F24"
+        CornerRadius="16"
+        Visibility="Collapsed">
+        <TextBlock
+          x:Name="RemoteControlNoticeText"
+          Foreground="White"
+          FontSize="13"
+          TextWrapping="WrapWholeWords" />
+      </Border>
+      <!-- Local self-preview PiP. Hidden while our camera is off (see ApplyCallOverlayState) so
+           the corner shows nothing rather than our last frame frozen in the box. Draggable
+           (CallOverlayControl.xaml.cs). -->
+      <Border
+        x:Name="LocalCallVideoPip"
+        ToolTipService.ToolTip="Перетащите, чтобы передвинуть"
+        ManipulationMode="None"
+        Width="200"
+        Height="124"
+        Margin="0,0,24,140"
+        HorizontalAlignment="Right"
+        VerticalAlignment="Bottom"
+        Background="#202024"
+        BorderBrush="#33FFFFFF"
+        BorderThickness="1"
+        CornerRadius="14">
+        <Image
+          x:Name="LocalCallVideoImage"
+          Stretch="UniformToFill" />
+      </Border>
+    </Grid>
+
+    <!-- The face: shown while there is no remote picture (audio call, ringing, camera off). -->
+    <StackPanel
+      x:Name="CallIdentityPanel"
+      Margin="0,0,0,90"
+      HorizontalAlignment="Center"
+      VerticalAlignment="Center"
+      Spacing="18">
+      <shared:AvatarView x:Name="CallPeerAvatar" HorizontalAlignment="Center" PictureTitle="{x:Bind CallPeerNameTextBlock.Text, Mode=OneWay}" Size="128" />
+      <StackPanel HorizontalAlignment="Center" Spacing="6">
+        <TextBlock
+          x:Name="CallPeerNameTextBlock"
+          MaxWidth="560"
+          HorizontalAlignment="Center"
+          FontSize="28"
+          FontWeight="SemiBold"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          Text="Собеседник"
+          TextAlignment="Center"
+          TextTrimming="CharacterEllipsis" />
+        <!-- One line: what is going on, and for how long ("Ждём ответа · 0:04", "12:31"). -->
+        <TextBlock
+          x:Name="ChatCallStateTextBlock"
+          MaxWidth="560"
+          HorizontalAlignment="Center"
+          FontSize="16"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          Opacity="0.78"
+          Text="Звонок"
+          TextAlignment="Center"
+          TextWrapping="WrapWholeWords" />
+        <!-- Only when there is something the state line cannot say (remote-control sessions). -->
+        <TextBlock
+          x:Name="ChatCallDetailsTextBlock"
+          MaxWidth="420"
+          HorizontalAlignment="Center"
+          FontSize="13"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          Opacity="0.6"
+          Text=""
+          TextAlignment="Center"
+          TextWrapping="WrapWholeWords" />
+      </StackPanel>
+      <StackPanel HorizontalAlignment="Center" Orientation="Horizontal" Spacing="6" Opacity="0.55">
+        <FontIcon VerticalAlignment="Center" FontSize="11" Foreground="{ThemeResource OmniCallTextBrush}" Glyph="&#xE72E;" />
+        <TextBlock VerticalAlignment="Center" FontSize="12.5" Foreground="{ThemeResource OmniCallTextBrush}" Text="Сквозное шифрование" />
+        <TextBlock
+          x:Name="ChatCallNetworkSeparator"
+          VerticalAlignment="Center"
+          FontSize="12.5"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          Text="·" />
+        <TextBlock
+          x:Name="ChatCallNetworkTextBlock"
+          VerticalAlignment="Center"
+          FontSize="12.5"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          Text="" />
+      </StackPanel>
+    </StackPanel>
+
+    <!-- Chrome: top bar and control bar. Over video it fades while the mouse rests. -->
+    <Grid x:Name="CallChrome">
+      <Grid.OpacityTransition>
+        <ScalarTransition Duration="0:0:0.25" />
+      </Grid.OpacityTransition>
+      <!-- Scrims keep the text and buttons readable over a bright picture (video only). -->
+      <Border x:Name="CallTopScrim" Height="110" VerticalAlignment="Top" IsHitTestVisible="False" Visibility="Collapsed">
+        <Border.Background>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+            <GradientStop Offset="0" Color="{ThemeResource OmniCallScrimColor}" />
+            <GradientStop Offset="1" Color="{ThemeResource OmniCallScrimClearColor}" />
+          </LinearGradientBrush>
+        </Border.Background>
+      </Border>
+      <Border x:Name="CallBottomScrim" Height="200" VerticalAlignment="Bottom" IsHitTestVisible="False" Visibility="Collapsed">
+        <Border.Background>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+            <GradientStop Offset="0" Color="{ThemeResource OmniCallScrimClearColor}" />
+            <GradientStop Offset="1" Color="{ThemeResource OmniCallScrimColor}" />
+          </LinearGradientBrush>
+        </Border.Background>
+      </Border>
+
+      <!-- Top bar: back to the chat (the call goes on in a strip), and — over video, where the face
+           card is gone — who and how long. -->
+      <Grid Margin="16,14,20,0" VerticalAlignment="Top" ColumnSpacing="12">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <Button
+          x:Name="MinimizeCallButton"
+          Width="40"
+          Height="40"
+          MinWidth="0"
+          MinHeight="0"
+          Padding="0"
+          AutomationProperties.Name="Свернуть звонок"
+          Background="{ThemeResource OmniCallControlBrush}"
+          BorderThickness="0"
+          CornerRadius="20"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          ToolTipService.ToolTip="Свернуть — звонок продолжится, а чат будет под рукой">
+          <FontIcon FontSize="14" Glyph="&#xE70D;" />
+        </Button>
+        <StackPanel
+          x:Name="CallTopBarInfo"
+          Grid.Column="1"
+          VerticalAlignment="Center"
+          Spacing="1"
+          Visibility="Collapsed">
+          <TextBlock
+            x:Name="CallTopBarNameTextBlock"
+            FontSize="15"
+            FontWeight="SemiBold"
+            Foreground="{ThemeResource OmniCallTextBrush}"
+            TextTrimming="CharacterEllipsis" />
+          <TextBlock
+            x:Name="CallTopBarStatusTextBlock"
+            FontSize="12.5"
+           
+            Foreground="{ThemeResource OmniCallTextBrush}"
+            Opacity="0.75"
+            TextTrimming="CharacterEllipsis" />
+        </StackPanel>
+        <StackPanel
+          Grid.Column="2"
+          VerticalAlignment="Center"
+          Orientation="Horizontal"
+          Spacing="8">
+          <!-- Remote-control session: the window goes full screen so the peer's screen is 1:1-ish. -->
+          <Button
+            x:Name="ToggleCallFullScreenButton"
+            Padding="12,6"
+            AutomationProperties.Name="Во весь экран"
+            Background="#99000000"
+            CornerRadius="16"
+            Foreground="White"
+            Visibility="Collapsed">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+              <FontIcon x:Name="ToggleCallFullScreenIcon" FontSize="14" Glyph="&#xE740;" />
+              <TextBlock x:Name="ToggleCallFullScreenText" Text="Во весь экран" />
+            </StackPanel>
+          </Button>
+          <Button
+            x:Name="ToggleRemoteScreenControlButton"
+            Padding="12,6"
+            AutomationProperties.Name="Управлять экраном собеседника"
+            Background="#99000000"
+            CornerRadius="16"
+            Foreground="White"
+            Visibility="Collapsed">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+              <FontIcon FontSize="14" Glyph="&#xE7C9;" />
+              <TextBlock x:Name="ToggleRemoteScreenControlText" Text="Управлять" />
+            </StackPanel>
+          </Button>
+        </StackPanel>
+      </Grid>
+
+      <!-- Control bar. Buttons toggled per call state by ApplyCallOverlayState. -->
+      <StackPanel
+        x:Name="ChatCallActionPanel"
+        Margin="0,0,0,32"
+        HorizontalAlignment="Center"
+        VerticalAlignment="Bottom"
+        Orientation="Horizontal"
+        Spacing="14">
+        <calls:CallButton
+          x:Name="DeclineCurrentCallButton"
+          AutomationProperties.Name="Отклонить звонок"
+          Background="{ThemeResource OmniCallHangUpBrush}"
+          Foreground="White"
+          Caption="Отклонить">
+          <FontIcon FontSize="22" Glyph="&#xE778;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="AcceptCurrentCallButton"
+          AutomationProperties.Name="Принять звонок"
+          Background="{ThemeResource OmniCallAcceptBrush}"
+          Foreground="White"
+          Caption="Принять">
+          <FontIcon FontSize="22" Glyph="&#xE717;" />
+        </calls:CallButton>
+        <!-- Answer with the microphone already off: not a moment of the room goes out. -->
+        <calls:CallButton
+          x:Name="AcceptCurrentCallMutedButton"
+          AutomationProperties.Name="Принять без микрофона"
+          Background="{ThemeResource OmniCallAcceptBrush}"
+          Foreground="White"
+          ToolTipService.ToolTip="Принять без микрофона — включите его, когда будете готовы"
+          Caption="Молча">
+          <FontIcon FontSize="22" Glyph="&#xEC54;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="ToggleCurrentCallMuteButton"
+          IsWarning="True"
+          AutomationProperties.Name="Выключить микрофон"
+          Caption="Микрофон">
+          <FontIcon
+            x:Name="ToggleCurrentCallMuteIcon"
+            FontSize="22"
+            Glyph="&#xE720;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="ToggleCurrentCallCameraButton"
+          AutomationProperties.Name="Включить камеру"
+          Caption="Камера">
+          <FontIcon
+            x:Name="ToggleCurrentCallCameraIcon"
+            FontSize="21"
+            Glyph="&#xE714;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="ToggleCurrentCallScreenShareButton"
+          AutomationProperties.Name="Демонстрация экрана"
+          Caption="Экран">
+          <FontIcon
+            x:Name="ToggleCurrentCallScreenShareIcon"
+            FontSize="21"
+            Glyph="&#xE7F4;" />
+        </calls:CallButton>
+        <!-- Remote screen control (docs/decisions/remote-screen-control.md): shown only while a whole
+             monitor is shared; lets the peer control it. On while granted. -->
+        <calls:CallButton
+          x:Name="ToggleCurrentCallScreenControlButton"
+          AutomationProperties.Name="Разрешить управление экраном"
+          Caption="Управление"
+          Visibility="Collapsed">
+          <FontIcon FontSize="21" Glyph="&#xF271;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="HangUpCurrentCallButton"
+          AutomationProperties.Name="Завершить звонок"
+          Background="{ThemeResource OmniCallHangUpBrush}"
+          Foreground="White"
+          Caption="Завершить">
+          <FontIcon FontSize="22" Glyph="&#xE778;" />
+        </calls:CallButton>
+      </StackPanel>
+    </Grid>
+  </Grid>
+</UserControl>

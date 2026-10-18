@@ -1,0 +1,17 @@
+[package]
+name = "omni-identity"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+omni-types = { path = "../omni-types" }
+bip39 = "2"
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+hex.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

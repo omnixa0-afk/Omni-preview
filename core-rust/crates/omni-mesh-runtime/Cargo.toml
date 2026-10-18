@@ -1,0 +1,31 @@
+[package]
+name = "omni-mesh-runtime"
+version = "0.1.0"
+edition.workspace = true
+
+# Sync facade over the async omni-network mesh. Owns a tokio runtime + a
+# Network, exposes blocking start/dial/send with inbound callbacks — so the
+# otherwise-sync omni-app can drive the mesh the same way it drives
+# omni-transport. См. docs/decisions/mesh-transport-integration-seam.md.
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+# UPnP-IGD: ask the local router to forward the mesh QUIC UDP port → a node behind a
+# UPnP-capable router becomes directly dialable even on a symmetric NAT (no relay).
+# Same crate the legacy transport already uses; cross-platform (no Windows crate).
+igd-next = { version = "0.16.2", features = ["aio_tokio"] }
+omni-network = { path = "../omni-network" }
+# CarrierPolicy (R1a connection-quality ladder): the app's persisted carrier choice that
+# drives which carrier(s) start() binds. omni-types is a pure leaf crate (no dep cycle).
+omni-types = { path = "../omni-types" }
+parking_lot = { workspace = true }
+# Idle-loop jitter only (see `jittered`) — timing hygiene, not a secret.
+rand_core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+rand_core = { workspace = true }
+
+[lints]
+workspace = true

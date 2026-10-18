@@ -1,0 +1,37 @@
+[package]
+name = "omni-dht-helper"
+version = "0.1.0"
+edition.workspace = true
+
+# The SEPARATE, untrusted-by-design DHT helper PROCESS (privilege + proxy separation): it is the ONLY
+# thing that touches the BitTorrent Mainline DHT wire. It owns the `mainline` engine (UDP socket +
+# routing table + hostile-wire parsing) so that traffic can be tunnelled independently of the web
+# couriers (Mainline is UDP-only; ntfy/Nostr are TCP/HTTP — different proxy needs), its blast radius
+# is sandboxed, and a `mainline` crash can't take the courier down. It holds NO keys and never seals/
+# opens beacons: the core hands it the per-bucket secret-derived seed + an opaque sealed value and it
+# does a signed BEP44 mutable put/get — a dumb primitive; rendezvous policy (dual-slot/seq/echo) stays
+# in BtDhtChannel. Drives over a tiny local line IPC (TCP for now; named pipe / per-process proxy =
+# later). See docs/decisions/omni-dht-helper.md (R7 Phase 2) + bt-dht-rendezvous-courier.md (Phase 1).
+
+[[bin]]
+name = "omni-dht-helper"
+path = "src/main.rs"
+
+[dependencies]
+# Sync `node` client only — no async/tokio in an untrusted helper (see btdht.rs's sync-vs-async note).
+mainline = { version = "7", default-features = false, features = ["node"] }
+# The pkarr shape of our records (src/pkarr_shape.rs): base64url of the payload, and the per-slot
+# signing key derived from the seed.
+base64.workspace = true
+sha2.workspace = true
+# UPnP-IGD (SYNC API — `default-features = false` drops the tokio/async-std variants) so an ENTRY node
+# can map its own DHT UDP port on a home router → reachable on the real WAN without a manual port-forward
+# (the same `igd-next` the mesh transport uses; here for the DHT socket the helper owns). `OMNI_DHT_UPNP`.
+igd-next = { version = "0.16.2", default-features = false }
+# The pkarr relays (`rput`/`rget`, src/relay.rs): HTTPS gateways into the same Mainline, for a network
+# that drops DHT traffic and no friend to go through (docs/decisions/dht-over-pkarr-relays.md). The same
+# sync client the web couriers use.
+ureq = "2"
+
+[lints]
+workspace = true

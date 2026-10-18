@@ -1,0 +1,72 @@
+<UserControl
+  x:Class="Omni.Windows.App.Features.Shared.ImageViewer"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  Visibility="Collapsed">
+  <!-- A picture on the whole window, as in Telegram: a photo from the chat, an avatar. Ctrl+wheel
+       or a pinch zooms, the right-click menu copies or saves it, Esc or a click beside it closes. -->
+  <Grid x:Name="BackdropPart" Background="#E6000000" Tapped="OnBackdropTapped">
+    <ScrollViewer
+      x:Name="ZoomPart"
+      HorizontalScrollBarVisibility="Auto"
+      HorizontalScrollMode="Auto"
+      MaxZoomFactor="8"
+      MinZoomFactor="1"
+      VerticalScrollBarVisibility="Auto"
+      VerticalScrollMode="Auto"
+      SizeChanged="OnZoomSizeChanged"
+      ZoomMode="Enabled">
+      <!-- As big as the window at zoom 1; the picture sits in its middle, fitted. -->
+      <Grid x:Name="FitPart">
+        <Image
+          x:Name="ImagePart"
+          HorizontalAlignment="Center"
+          VerticalAlignment="Center"
+          Stretch="Uniform"
+          Tapped="OnImageTapped">
+          <!-- The picture's menu, as in Telegram; more actions join it here. -->
+          <Image.ContextFlyout>
+            <MenuFlyout>
+              <MenuFlyoutItem Click="OnCopyClicked" Text="Копировать">
+                <MenuFlyoutItem.Icon>
+                  <FontIcon Glyph="&#xE8C8;" />
+                </MenuFlyoutItem.Icon>
+              </MenuFlyoutItem>
+              <MenuFlyoutItem Click="OnSaveClicked" Text="Сохранить как…">
+                <MenuFlyoutItem.Icon>
+                  <FontIcon Glyph="&#xE896;" />
+                </MenuFlyoutItem.Icon>
+              </MenuFlyoutItem>
+            </MenuFlyout>
+          </Image.ContextFlyout>
+        </Image>
+      </Grid>
+    </ScrollViewer>
+    <TextBlock
+      x:Name="CaptionPart"
+      Margin="20,16,0,0"
+      HorizontalAlignment="Left"
+      VerticalAlignment="Top"
+      Foreground="White"
+      Opacity="0.85" />
+    <!-- Only a small cross up here; the actions are on the picture's right-click menu. -->
+    <Button
+      x:Name="CloseButtonPart"
+      Width="36"
+      Height="36"
+      Margin="0,10,10,0"
+      Padding="0"
+      HorizontalAlignment="Right"
+      VerticalAlignment="Top"
+      AutomationProperties.AutomationId="ImageViewerCloseButton"
+      AutomationProperties.Name="Закрыть"
+      Background="Transparent"
+      BorderThickness="0"
+      Click="OnCloseClicked"
+      CornerRadius="18"
+      Foreground="White"
+      ToolTipService.ToolTip="Закрыть (Esc)">
+      <FontIcon FontSize="14" Glyph="&#xE711;" />
+    </Button>
+  </Grid>
+</UserControl>

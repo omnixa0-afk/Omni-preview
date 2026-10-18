@@ -1,0 +1,31 @@
+[package]
+name = "omni-rendezvous-providers"
+version = "0.1.0"
+edition.workspace = true
+
+# Real `RendezvousChannel` providers that talk to FREE PUBLIC brokers (no owned infrastructure).
+# These do the untrusted network I/O and will run inside the sandboxed rendezvous helper process;
+# the security lives in the AEAD-sealed beacon (omni-rendezvous), so the provider just shuttles
+# opaque blobs under blinded topics. First provider: ntfy.sh (plain HTTP pub/sub — the lightest way
+# to prove the serverless-rendezvous seam live; Nostr / BT-DHT follow for full N-of-many).
+# См. docs/decisions/serverless-bootstrap-rendezvous.md.
+
+[dependencies]
+omni-rendezvous = { path = "../omni-rendezvous" }
+ureq = "2"
+serde_json = { workspace = true }
+# Nostr courier (NIP-01 over WebSocket) — a second, cross-PROTOCOL provider so one rate-limited or
+# blocked broker can't sink rendezvous (R7). Pure-Rust deps (Android-readiness; no C libsecp256k1):
+#   k256/schnorr = BIP340 sign of the throwaway Nostr event envelope (security stays in the AEAD
+#   beacon, not the Nostr identity); sha2 = the NIP-01 event id; getrandom = the ephemeral keypair.
+k256 = { version = "0.13", features = ["schnorr"] }
+sha2 = { workspace = true }
+getrandom = "0.2"
+# Sync WebSocket client for the Nostr relay (NIP-01 is WS-only). rustls (pure-Rust, portable) for wss://.
+tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+# NB: the BT-DHT courier (`btdht.rs`) is now an IPC CLIENT to the separate `omni-dht-helper` process
+# (R7 Phase 2) — the `mainline` engine lives THERE, not here, so this crate no longer links it. The
+# courier shuttles `put`/`get` lines over loopback. См. docs/decisions/omni-dht-helper.md.
+
+[lints]
+workspace = true

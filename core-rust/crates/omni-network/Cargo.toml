@@ -1,0 +1,39 @@
+[package]
+name = "omni-network"
+version = "0.1.0"
+edition.workspace = true
+
+# Spike crate (2026-05-26) — Reticulum-style self-organizing mesh overlay.
+# См. docs/architecture/networking-overlay.md и
+# docs/decisions/networking-mesh-overlay-adoption.md.
+#
+# Это spike: проверка архитектурных гипотез до commit'а полного Phase α.
+# Если spike зелёный — крейт перестаёт быть spike'ом и становится production.
+
+[dependencies]
+async-trait = "0.1"
+blake3 = "1"
+bytes = "1"
+ed25519-dalek = { workspace = true }
+# `FuturesUnordered` for the Happy Eyeballs race in `Network::dial` (RFC 8305): one task polls every
+# connect attempt, so dropping the losers abandons their handshakes instead of leaving them adopted.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+socket2 = "0.5"
+omni-net-primitives = { path = "../omni-net-primitives" }
+parking_lot = { workspace = true }
+quinn = { version = "0.11.9", default-features = true }
+rand_core = { workspace = true }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "time", "net"] }
+# Async TLS for the outer carrier of the TCP relay fallback (R2). Pinned to ring (no aws-lc-rs —
+# keeps the core pure-Rust / Android-friendly, see CONTRIBUTING.md). Uses the same rustls 0.23 as quinn.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "time", "net", "test-util"] }
+
+[lints]
+workspace = true

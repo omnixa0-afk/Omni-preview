@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One avatar for the whole app (chat list, contacts, headers, group and contact pages, members):
+     a circle of the person's or group's colour with a letter, or their photo, and the presence dot.
+     The size is one number; everything else follows it, so no two places draw it differently
+     (owner, 2026-10-11: «один шаблон в разных местах … менять дизайн синхронно»). -->
+<UserControl
+  x:Class="Omni.Windows.App.Features.Shared.AvatarView"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  IsTabStop="False">
+  <Grid x:Name="Root">
+    <Border x:Name="CirclePart" Background="{ThemeResource AccentFillColorSecondaryBrush}">
+      <Grid>
+        <Image x:Name="PhotoPart" Stretch="UniformToFill" Visibility="Collapsed" />
+        <TextBlock
+          x:Name="InitialsPart"
+          HorizontalAlignment="Center"
+          VerticalAlignment="Center"
+          FontWeight="SemiBold"
+          Foreground="White"
+          Text="?" />
+        <ProgressRing
+          x:Name="LoadingRingPart"
+          HorizontalAlignment="Center"
+          VerticalAlignment="Center"
+          IsActive="False"
+          Visibility="Collapsed" />
+      </Grid>
+    </Border>
+    <Border
+      x:Name="PresenceDotPart"
+      HorizontalAlignment="Right"
+      VerticalAlignment="Bottom"
+      Background="{ThemeResource OmniBgPanelBrush}"
+      Visibility="Collapsed">
+      <Ellipse x:Name="PresenceEllipsePart" HorizontalAlignment="Center" VerticalAlignment="Center" />
+    </Border>
+  </Grid>
+</UserControl>

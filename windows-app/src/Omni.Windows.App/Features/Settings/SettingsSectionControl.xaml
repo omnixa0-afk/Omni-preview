@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl x:Class="Omni.Windows.App.Features.Settings.SettingsSectionControl" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:shared="using:Omni.Windows.App.Features.Shared" xmlns:d="http://schemas.microsoft.com/expression/blend/2008" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="d">
+  <!-- Sections on the left, one section at a time on the right (owner, 2026-10-10). The right side was
+       remade 2026-10-13 (owner: «скомкать пластилин и слепить новую фигурку»): groups of flat rows —
+       name and one line on the left, the control on the right (Shared.SettingRow) — instead of walls of
+       text and full-width fields. «Связь» left «Приватность» (who finds me ≠ through what); «Общие»
+       took the theme and the background mode; the segment and DHT entry-point tools went to «Для
+       опытных». -->
+  <UserControl.Resources>
+    <Style TargetType="ComboBox" BasedOn="{StaticResource DefaultComboBoxStyle}">
+      <Setter Property="MinWidth" Value="260" />
+      <Setter Property="MaxWidth" Value="340" />
+    </Style>
+  </UserControl.Resources>
+  <Grid x:Name="SettingsSectionRoot" Visibility="Collapsed" Background="{ThemeResource OmniBgAppBrush}">
+    <!-- Narrow window: less padding; the section itself just reflows. -->
+    <VisualStateManager.VisualStateGroups>
+      <VisualStateGroup>
+        <VisualState x:Name="SettingsNarrow">
+          <VisualState.StateTriggers>
+            <AdaptiveTrigger MinWindowWidth="0" />
+          </VisualState.StateTriggers>
+          <VisualState.Setters>
+            <Setter Target="SettingsContentBorder.Padding" Value="20,16,20,32" />
+          </VisualState.Setters>
+        </VisualState>
+        <VisualState x:Name="SettingsWide">
+          <VisualState.StateTriggers>
+            <AdaptiveTrigger MinWindowWidth="900" />
+          </VisualState.StateTriggers>
+        </VisualState>
+      </VisualStateGroup>
+    </VisualStateManager.VisualStateGroups>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition x:Name="SettingsNavColumn" Width="275" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+    <!-- The left column is the same in every section: Shared.SectionRail sets its width (275, more when
+         the contact filters need it), 8 px panel padding, the same title row (owner, 2026-10-11/12). -->
+    <Border Padding="8,3,8,12" Background="{ThemeResource OmniBgPanelBrush}" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,0,1,0">
+      <StackPanel Spacing="12">
+        <Grid MinHeight="40">
+          <TextBlock VerticalAlignment="Center" Style="{StaticResource CardTitleTextStyle}" Text="Настройки" />
+        </Grid>
+        <ListView x:Name="SettingsNavList" SelectionMode="Single" AutomationProperties.AutomationId="SettingsNavList">
+          <ListViewItem Content="Профиль" Tag="profile" />
+          <ListViewItem Content="Устройства" Tag="devices" />
+          <ListViewItem Content="Приватность" Tag="privacy" />
+          <ListViewItem Content="Связь" Tag="network" />
+          <ListViewItem Content="Звонки" Tag="calls" />
+          <ListViewItem Content="Общие" Tag="general" />
+          <ListViewItem Content="Для опытных" Tag="advanced" />
+        </ListView>
+      </StackPanel>
+    </Border>
+    <ScrollViewer x:Name="SettingsContentScroll" Grid.Column="1" VerticalScrollBarVisibility="Auto" HorizontalScrollMode="Disabled">
+      <!-- One page width whatever the content: up to 884 with the padding, left; narrower with the window. -->
+      <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*" MaxWidth="884" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+      <Border x:Name="SettingsContentBorder" Padding="32,16,32,40">
+        <Grid>
+          <!-- ═══ Профиль ═══ -->
+          <StackPanel x:Name="SettingsSection_profile" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Профиль" />
+            <!-- Who the contacts see: the photo, the name, and one save. -->
+            <Grid Margin="0,20,0,0" ColumnSpacing="20">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <shared:AvatarView x:Name="SettingsProfileAvatar" VerticalAlignment="Top" PictureTitle="{x:Bind SettingsPublicDisplayNameTextBox.Text, Mode=OneWay}" Size="80" />
+              <StackPanel Grid.Column="1" Spacing="10">
+                <TextBox x:Name="SettingsPublicDisplayNameTextBox" MaxLength="64" MaxWidth="360" HorizontalAlignment="Left" Header="Имя, которое видят контакты" PlaceholderText="Например, Алексей" />
+                <StackPanel x:Name="SettingsProfileActionPanel" Orientation="Horizontal" Spacing="8">
+                  <Button x:Name="SettingsSavePublicProfileButton" Style="{StaticResource AccentPrimaryButtonStyle}" Content="Сохранить" />
+                  <Button x:Name="SettingsChooseAvatarButton" Content="Сменить фото…" />
+                  <Button x:Name="SettingsClearAvatarButton" Content="Убрать фото" />
+                </StackPanel>
+                <TextBlock x:Name="SettingsProfileEditorStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" Text="Публичный профиль ещё не настроен." />
+              </StackPanel>
+            </Grid>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Вход на этом компьютере" />
+            <!-- One form or the other, by whether a password is set (owner, 2026-10-11). -->
+            <shared:SettingRow Header="Пароль">
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="10">
+                  <TextBlock x:Name="SettingsPasswordSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                  <StackPanel x:Name="SettingsSetPasswordPanel" Orientation="Horizontal" Spacing="8">
+                    <PasswordBox x:Name="SettingsNewPasswordBox" Width="260" PlaceholderText="Новый пароль" />
+                    <Button x:Name="SettingsSetPasswordButton" Content="Установить" />
+                  </StackPanel>
+                  <StackPanel x:Name="SettingsChangePasswordPanel" Spacing="8" Visibility="Collapsed">
+                    <PasswordBox x:Name="SettingsCurrentPasswordBox" Width="260" HorizontalAlignment="Left" PlaceholderText="Текущий пароль" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                      <PasswordBox x:Name="SettingsChangePasswordBox" Width="260" PlaceholderText="Новый пароль" />
+                      <Button x:Name="SettingsChangePasswordButton" Content="Сменить" />
+                      <Button x:Name="SettingsRemovePasswordButton" Style="{StaticResource DangerButtonStyle}" Content="Убрать пароль" />
+                    </StackPanel>
+                  </StackPanel>
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Если устройство потеряется" />
+            <shared:SettingRow Header="Фраза восстановления" Description="Возвращает аккаунт на новом устройстве. Храните её отдельно от компьютера.">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button x:Name="SettingsRevealRecoveryButton" Content="Показать" />
+                <Button x:Name="SettingsSaveRecoveryButton" Content="В файл…" />
+              </StackPanel>
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsRecoverySummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" IsTextSelectionEnabled="True" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Резервная копия" Description="Переписка, файлы и контакты этого устройства в одном зашифрованном файле. Восстанавливается вместе с фразой. Делайте раз в месяц.">
+              <Button x:Name="SettingsExportAccountButton" Content="Сохранить копию…" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsExportStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Этот компьютер" />
+            <!-- What lives here, one quiet line: when the profile was made, how much it holds. -->
+            <StackPanel Orientation="Horizontal" Spacing="6">
+              <TextBlock x:Name="SettingsAccountSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              <TextBlock x:Name="SettingsProfileSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+            </StackPanel>
+            <shared:SettingRow Header="Выйти из профиля" Description="Профиль останется здесь; войти снова — с паролем, если он задан.">
+              <Button x:Name="SettingsSignOutButton" Content="Выйти" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Удалить профиль с компьютера" Description="Переписка на этом компьютере удалится. Аккаунт останется на других ваших устройствах.">
+              <Button x:Name="SettingsDeleteLocalProfileButton" Style="{StaticResource DangerButtonStyle}" Content="Удалить…" />
+            </shared:SettingRow>
+            <!-- What the profile actions above (and the password / recovery rows) answered. -->
+            <TextBlock x:Name="SettingsStatusTextBlock" Margin="0,12,0,0" TextWrapping="WrapWholeWords" />
+          </StackPanel>
+
+          <!-- ═══ Устройства ═══ -->
+          <StackPanel x:Name="SettingsSection_devices" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Устройства" />
+            <!-- One row per device — an icon, the name, its state, «Отозвать» at the right of its own row
+                 (owner, 2026-10-11). -->
+            <Border x:Name="SettingsDevicesCard" Margin="0,16,0,0">
+              <StackPanel Spacing="8">
+                <!-- A device the owner has not seen yet: the question and both answers at once. -->
+                <InfoBar x:Name="SettingsNewDeviceInfoBar" IsClosable="False" IsOpen="False" Severity="Warning" Title="Новое устройство в аккаунте">
+                  <InfoBar.ActionButton>
+                    <Button x:Name="SettingsAcknowledgeDevicesButton" Content="Да, это мои устройства" />
+                  </InfoBar.ActionButton>
+                </InfoBar>
+                <TextBlock x:Name="SettingsDevicesSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                <ItemsControl x:Name="SettingsDevicesList">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Grid Padding="0,10" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,0,0,1" ColumnSpacing="16">
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="24" />
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <FontIcon VerticalAlignment="Center" FontSize="18" Glyph="&#xE7F8;" Opacity="0.7" />
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                          <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" />
+                            <TextBlock FontSize="12" Foreground="{ThemeResource SystemFillColorCautionBrush}" Text="новое" Visibility="{Binding NewVisibility}" />
+                          </StackPanel>
+                          <TextBlock FontSize="12" Opacity="0.6" Text="{Binding StateText}" />
+                        </StackPanel>
+                        <Button Grid.Column="2" MinWidth="0" VerticalAlignment="Center" Click="OnRevokeDeviceRowClicked" Content="Отозвать" Style="{StaticResource DangerButtonStyle}" Tag="{Binding DeviceId}" Visibility="{Binding RevokeVisibility}" />
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <!-- Revoked devices, folded (owner, 2026-10-10): the history is kept but not in the way. -->
+                <Expander x:Name="SettingsRevokedDevicesExpander" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Visibility="Collapsed">
+                  <Expander.Header>
+                    <TextBlock x:Name="SettingsRevokedDevicesHeaderTextBlock" Text="Отозванные" />
+                  </Expander.Header>
+                  <StackPanel Spacing="8">
+                    <ItemsControl x:Name="SettingsRevokedDevicesList">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <Grid Margin="0,2" ColumnSpacing="12">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center">
+                              <TextBlock Text="{Binding Label}" TextWrapping="WrapWholeWords" />
+                              <TextBlock Style="{StaticResource CaptionTextStyle}" Text="{Binding WhenText}" />
+                            </StackPanel>
+                            <Button Grid.Column="1" Click="OnHideRevokedDeviceClicked" Content="Убрать из списка" Tag="{Binding DeviceId}" />
+                          </Grid>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <Button x:Name="SettingsHideAllRevokedDevicesButton" Content="Очистить историю отозванных" />
+                  </StackPanel>
+                </Expander>
+                <TextBlock x:Name="SettingsDevicesStatusTextBlock" TextWrapping="WrapWholeWords" />
+              </StackPanel>
+            </Border>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="На крайний случай" />
+            <shared:SettingRow Header="Ключ аккаунта украден" Description="Перенести аккаунт на новый ключ и оставить в нём только свои устройства.">
+              <Button x:Name="SettingsMoveAccountKeyButton" Style="{StaticResource DangerButtonStyle}" Content="Сменить ключ…" />
+            </shared:SettingRow>
+          </StackPanel>
+
+          <!-- ═══ Приватность ═══ -->
+          <StackPanel x:Name="SettingsSection_privacy" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Приватность" />
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Кто может вас найти" />
+            <shared:SettingRow Header="Ваш Omni-ID" Description="Публичный адрес: по нему вам присылают заявку, а принимаете её вы сами. Добавить кого-то по его ID — в «Контактах».">
+              <shared:SettingRow.Details>
+                <Grid ColumnSpacing="8">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                  <!-- Read-only and selectable, but drawn as text: a box looked like something to type in. -->
+                  <TextBox x:Name="SettingsMyOmniIdTextBox" Padding="0,5,0,5" VerticalAlignment="Center" Background="Transparent" BorderThickness="0" FontFamily="Consolas" IsReadOnly="True" IsSpellCheckEnabled="False" />
+                  <Button x:Name="SettingsCopyOmniIdButton" Grid.Column="1" Content="Копировать" />
+                </Grid>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Находить меня по Omni-ID" Description="Кто знает ваш ID, сможет прислать заявку. Выключено — только по приглашению.">
+              <ToggleSwitch x:Name="SettingsDiscoverabilityToggle" MinWidth="0" OffContent="Выкл" OnContent="Вкл" />
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="4">
+                  <TextBlock x:Name="SettingsDiscoverabilityStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                  <!-- Where the Omni-ID beacon goes and how often (built in MainWindow.PublishPlans.cs). -->
+                  <Expander x:Name="SettingsOmniIdPlanExpander" Margin="0,4,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Где объявлять">
+                    <Border x:Name="SettingsOmniIdPlanHost" />
+                  </Expander>
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <!-- Find by name (docs/decisions/find-by-name.md): off by default, and only together with the row
+                 above — a name leads to the Omni-ID, which must be findable for the request to reach you. -->
+            <shared:SettingRow x:Name="SettingsNameFindableRow" Header="Находить меня по имени" Description="По имени из профиля — целиком или по имени и фамилии отдельно. Однофамильцы найдутся тоже: вас узнают по фото. Заявку вы всё равно подтверждаете сами.">
+              <ToggleSwitch x:Name="SettingsNameFindableToggle" MinWidth="0" OffContent="Выкл" OnContent="Вкл" />
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="4">
+                  <TextBlock x:Name="SettingsNameFindableStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                  <Expander x:Name="SettingsNamePlanExpander" Margin="0,4,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Где объявлять">
+                    <Border x:Name="SettingsNamePlanHost" />
+                  </Expander>
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Соединение" />
+            <shared:SettingRow Header="Как соединяться с контактами">
+              <ComboBox x:Name="SettingsConnectionPrivacyComboBox" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsConnectionPrivacySummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Доступ к этому компьютеру" />
+            <Border x:Name="SettingsRemoteAccessCard">
+              <shared:SettingRow Header="Кто может управлять экраном">
+                <Button x:Name="SettingsRevokeAllRemoteAccessButton" Style="{StaticResource DangerButtonStyle}" Content="Отозвать у всех" />
+                <shared:SettingRow.Details>
+                  <StackPanel Spacing="4">
+                    <TextBlock x:Name="SettingsRemoteAccessSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                    <ItemsControl x:Name="SettingsRemoteAccessList">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="x:String">
+                          <TextBlock Margin="0,2" Text="{x:Bind}" TextWrapping="WrapWholeWords" />
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <TextBlock x:Name="SettingsRemoteAccessStatusTextBlock" TextWrapping="WrapWholeWords" />
+                  </StackPanel>
+                </shared:SettingRow.Details>
+              </shared:SettingRow>
+            </Border>
+          </StackPanel>
+
+          <!-- ═══ Связь ═══ -->
+          <StackPanel x:Name="SettingsSection_network" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Связь" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Margin="0,8,0,0" Text="Когда прямой связи нет, ваши устройства и контакты встречаются через «почтовые ящики» в интернете: оставляют там зашифрованную записку, где их искать. Прочесть её может только адресат; сам ящик видит ваш IP и время, когда вы на связи." />
+
+            <Border x:Name="SettingsRendezvousProvidersCard">
+              <StackPanel>
+                <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Почтовые ящики" />
+                <!-- Where the contacts' beacons go and how often: the step editor (MainWindow.PublishPlans.cs).
+                     Reading is always everywhere. -->
+                <shared:SettingRow Header="Куда оставлять записку" Description="Блоки в одной строке — одновременно, строка ниже — если выше не приняли. Искать других — всегда везде.">
+                  <shared:SettingRow.Details>
+                    <Expander x:Name="SettingsContactsPlanExpander" Margin="0,4,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Где объявлять">
+                    <Border x:Name="SettingsContactsPlanHost" />
+                  </Expander>
+                  </shared:SettingRow.Details>
+                </shared:SettingRow>
+                <!-- One row per courier, built in code (MainWindow.RendezvousProviders.cs). -->
+                <StackPanel x:Name="SettingsProvidersListPanel" />
+                <shared:SettingRow Header="Свой ящик" Description="Свой ntfy или реле Nostr — например, на своём сервере: видите только вы, лимитов нет.">
+                  <shared:SettingRow.Details>
+                    <Grid ColumnSpacing="8">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                      <TextBox x:Name="SettingsProviderUrlTextBox" PlaceholderText="https://ntfy.example  ·  wss://relay.example  ·  http://192.168.1.5:8080" />
+                      <Button x:Name="SettingsAddProviderButton" Grid.Column="1" Content="Добавить" />
+                    </Grid>
+                  </shared:SettingRow.Details>
+                </shared:SettingRow>
+                <TextBlock x:Name="SettingsProvidersStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" Margin="0,8,0,0" />
+              </StackPanel>
+            </Border>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Mainline (BitTorrent DHT)" />
+            <shared:SettingRow Header="Состояние">
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsDhtRendezvousStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Узлы сети и релеи" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Точки входа в сеть: базовая нода и добавленные вручную релеи. Любую можно удалить — по приглашению и в локальной сети связь работает и без них." />
+            <!-- One row per node, built in code (MainWindow.NetworkNodes.cs). -->
+            <StackPanel x:Name="SettingsRelaysListPanel" Margin="0,4,0,0" />
+            <shared:SettingRow Header="Добавить релей" Description="IP:порт, узел@IP:порт или набор om3relay:… Локальный адрес (192.168.…) связывает подсети отрезанного сегмента.">
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="8">
+                  <TextBox x:Name="SettingsRelayEndpointTextBox" PlaceholderText="203.0.113.7:443  ·  192.168.1.5:443  ·  om3relay:…" />
+                  <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <TextBox x:Name="SettingsRelayTcpEndpointTextBox" PlaceholderText="TCP-мост, если есть: IP:порт" />
+                    <TextBox x:Name="SettingsRelayLabelTextBox" Grid.Column="1" PlaceholderText="Название (необязательно)" />
+                    <Button x:Name="SettingsAddRelayButton" Grid.Column="2" Content="Добавить" />
+                  </Grid>
+                  <TextBlock x:Name="SettingsRelaysStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <!-- Public relay directory (docs/decisions/public-relay-directory.md): relays their owners
+                 opened to everyone, found on the couriers only when asked. Built in MainWindow.PublicRelays.cs. -->
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Публичные релеи" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Узлы, которые владельцы открыли для всех: через них можно связаться, когда напрямую не выходит. Переписку релей не прочтёт, но увидит, с какими узлами вы соединяетесь, — выбирайте давно работающие." />
+            <!-- «Сидеть через него» (stage 3): the relay this profile goes through, if any. -->
+            <InfoBar x:Name="SettingsPinnedRelayInfoBar" IsOpen="False" IsClosable="False" Margin="0,8,0,0" AutomationProperties.AutomationId="SettingsPinnedRelayInfoBar">
+              <InfoBar.ActionButton>
+                <Button x:Name="SettingsUnpinRelayButton" Content="Перестать" AutomationProperties.AutomationId="SettingsUnpinRelayButton" />
+              </InfoBar.ActionButton>
+              <InfoBar.Content>
+                <CheckBox x:Name="SettingsPinnedRelayHiddenCheckBox" Margin="0,0,0,8" Content="Если релей пропадёт — всё равно не открывать мой адрес (сообщения подождут, звонков не будет)" AutomationProperties.AutomationId="SettingsPinnedRelayHiddenCheckBox" />
+              </InfoBar.Content>
+            </InfoBar>
+            <shared:SettingRow Header="Найти релей" Description="Список берётся из почтовых ящиков только по нажатию.">
+              <Button x:Name="SettingsFindRelaysButton" Content="Найти" AutomationProperties.AutomationId="SettingsFindRelaysButton" />
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="8">
+                  <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <TextBox x:Name="SettingsRelayFilterTextBox" PlaceholderText="Имя или id релея" />
+                    <ComboBox x:Name="SettingsRelaySortComboBox" Grid.Column="1" MinWidth="160">
+                      <ComboBoxItem Content="По рейтингу" Tag="score" IsSelected="True" />
+                      <ComboBoxItem Content="По стажу" Tag="seniority" />
+                      <ComboBoxItem Content="По имени" Tag="name" />
+                      <ComboBoxItem Content="По id" Tag="id" />
+                    </ComboBox>
+                  </Grid>
+                  <TextBlock x:Name="SettingsFindRelaysStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                  <StackPanel x:Name="SettingsPublicRelaysListPanel" />
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Быть релеем для всех" Description="Ваш адрес попадёт в открытый список, и через этот компьютер пойдёт чужой трафик. Запись подписана ключом вашего устройства: контакты, знающие его, узнают вас в списке.">
+              <ToggleSwitch x:Name="SettingsPublicRelayToggle" MinWidth="0" OffContent="Выкл" OnContent="Вкл" />
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="6">
+                  <TextBox x:Name="SettingsPublicRelayNameTextBox" Width="360" HorizontalAlignment="Left" MaxLength="32" PlaceholderText="Название в списке (необязательно)" />
+                  <TextBlock x:Name="SettingsPublicRelayStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                  <Expander x:Name="SettingsRelayPlanExpander" Margin="0,4,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Где объявлять">
+                    <Border x:Name="SettingsRelayPlanHost" />
+                  </Expander>
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+          </StackPanel>
+
+          <!-- ═══ Звонки ═══ -->
+          <StackPanel x:Name="SettingsSection_calls" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Звонки" />
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Устройства" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="«Как в Windows» — устройство из параметров звука Windows. Если выбранное отключат, звонок возьмёт его." />
+            <shared:SettingRow Header="Микрофон">
+              <ComboBox x:Name="SettingsMicrophoneComboBox" AutomationProperties.AutomationId="SettingsMicrophoneComboBox" AutomationProperties.Name="Микрофон" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Динамики">
+              <ComboBox x:Name="SettingsSpeakerComboBox" AutomationProperties.AutomationId="SettingsSpeakerComboBox" AutomationProperties.Name="Динамики" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsAudioDevicesSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Камера" Description="Звонок начинается со звука — камера включается кнопкой во время разговора.">
+              <ComboBox x:Name="SettingsCameraComboBox" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsCameraSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Видео" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Обычно всё на «Авто». Разрешение выбирается на самой кнопке камеры или демонстрации экрана." />
+            <shared:SettingRow Header="Кадров в секунду">
+              <ComboBox x:Name="CallVideoFrameRateComboBox" AutomationProperties.AutomationId="CallVideoFrameRateComboBox" AutomationProperties.Name="FPS видео" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Кодек" Description="Omni сам выбирает лучший кодек в каждую сторону по видеокартам обеих сторон. Ограничьте, только если что-то не работает.">
+              <ComboBox x:Name="CallVideoCodecComboBox" AutomationProperties.AutomationId="CallVideoCodecComboBox" AutomationProperties.Name="Кодек видео" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Битрейт" Description="Потолок трафика видео в обе стороны. Скорость под ним Omni подбирает по сети сам. «Экономно» — для мобильного интернета.">
+              <ComboBox x:Name="CallVideoBitrateComboBox" AutomationProperties.AutomationId="CallVideoBitrateComboBox" AutomationProperties.Name="Битрейт видео" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Кодирование (отправка)" Description="Чем сжимать своё видео. «Авто» — видеокарта, если умеет.">
+              <ComboBox x:Name="CallVideoEncodeDeviceComboBox" AutomationProperties.AutomationId="CallVideoEncodeDeviceComboBox" AutomationProperties.Name="Устройство энкода видео" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Декодирование (приём)" Description="Чем разворачивать видео собеседника. «Авто» бережёт батарею.">
+              <ComboBox x:Name="CallVideoDecodeDeviceComboBox" AutomationProperties.AutomationId="CallVideoDecodeDeviceComboBox" AutomationProperties.Name="Устройство декода видео" />
+            </shared:SettingRow>
+          </StackPanel>
+
+          <!-- ═══ Общие ═══ -->
+          <StackPanel x:Name="SettingsSection_general" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Общие" />
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Оформление" />
+            <shared:SettingRow Header="Тема" Description="«Системная» следует за Windows.">
+              <ComboBox x:Name="SettingsThemeComboBox">
+                <ComboBoxItem Content="Системная (как в Windows)" Tag="system" />
+                <ComboBoxItem Content="Светлая" Tag="light" />
+                <ComboBoxItem Content="Тёмная" Tag="dark" />
+              </ComboBox>
+            </shared:SettingRow>
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Когда окно закрыто" />
+            <!-- Background mode (MainWindow.Background.cs): without it a closed window means no Omni, and
+                 nobody can connect. No autostart by design (maintainers' decision 2026-10-05). -->
+            <shared:SettingRow Header="Работать в фоне" Description="Omni остаётся у часов, и с вами можно связаться. Выйти совсем — правой кнопкой по значку → «Выход». После перезагрузки Omni нужно запустить самому.">
+              <ToggleSwitch x:Name="SettingsRunInBackgroundToggle" MinWidth="0" OffContent="Выкл" OnContent="Вкл" />
+            </shared:SettingRow>
+          </StackPanel>
+
+          <!-- ═══ Для опытных ═══ -->
+          <StackPanel x:Name="SettingsSection_advanced" Visibility="Collapsed">
+            <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Для опытных" />
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Нетипичные сети" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Нужны, только когда с сетью что-то не так: провайдер режет UDP, нужен фиксированный порт." />
+            <shared:SettingRow Header="Несущая соединения">
+              <ComboBox x:Name="SettingsCarrierPolicyComboBox" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsCarrierPolicySummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Порт TCP-двери" Description="0 — выбрать самому и пробросить через UPnP.">
+              <TextBox x:Name="SettingsDirectTcpPortTextBox" Width="120" InputScope="Number" PlaceholderText="0" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsDirectTcpPortSummaryTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Контроллер перегрузки" Description="Чем сеть решает, с какой скоростью слать. Ручной выбор — для сравнения на одной сборке; смена переустанавливает связи.">
+              <ComboBox x:Name="SettingsCongestionComboBox">
+                <ComboBoxItem Content="Автоматически (по стоимости канала)" Tag="auto" />
+                <ComboBoxItem Content="BBR" Tag="bbr" />
+                <ComboBoxItem Content="CUBIC" Tag="cubic" />
+              </ComboBox>
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsCongestionStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Отрезанный сегмент" />
+            <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Если внешний интернет отрезан, а локальная сеть жива: узлы в вашей подсети находятся сами; другие подсети — через локальный релей («Связь» → «Добавить релей»), а встреча новых собеседников — через свой ящик внутри сегмента (http:// и ws:// прямо по IP)." />
+            <TextBlock x:Name="SettingsSegmentLocalStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" Margin="0,6,0,0" />
+            <TextBlock x:Name="SettingsRendezvousSegmentStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" Margin="0,2,0,0" />
+            <shared:SettingRow Header="Адрес этого узла для других подсетей" Description="Друг добавит его как релей, и его подсеть свяжется через вас. Меняется при перезапуске.">
+              <Button x:Name="SettingsCopySelfSeedButton" Content="Копировать" />
+              <shared:SettingRow.Details>
+                <TextBlock x:Name="SettingsSelfSeedAddressTextBlock" Style="{StaticResource SettingCaptionTextStyle}" IsTextSelectionEnabled="True" />
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Точка входа в рой Mainline" Description="Другие в сегменте входят в рой через вас. Нужен белый IP или рабочий UPnP.">
+              <ToggleSwitch x:Name="SettingsDhtEntryNodeToggle" MinWidth="0" OffContent="Выкл" OnContent="Вкл" />
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="6">
+                  <TextBlock x:Name="SettingsDhtEntryNodeStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                  <StackPanel x:Name="SettingsDhtEntryNodeAddressPanel" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
+                    <TextBlock x:Name="SettingsDhtEntryNodeAddressTextBlock" VerticalAlignment="Center" IsTextSelectionEnabled="True" FontFamily="Consolas" Foreground="{ThemeResource OmniAccentBrush}" />
+                    <Button x:Name="SettingsCopyDhtEntryNodeButton" Content="Копировать" />
+                  </StackPanel>
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Узлы входа в рой" Description="Пусто — глобальные роутеры BitTorrent. В отрезанном сегменте впишите узлы внутри него (ip:порт); они расходятся по mesh сами.">
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="8">
+                  <StackPanel x:Name="SettingsDhtBootstrapListPanel" />
+                  <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <TextBox x:Name="SettingsDhtBootstrapAddressTextBox" PlaceholderText="ip:порт, например 10.20.30.40:6881" />
+                    <Button x:Name="SettingsAddDhtBootstrapButton" Grid.Column="1" Content="Добавить" />
+                  </Grid>
+                  <TextBlock x:Name="SettingsDhtBootstrapStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+            <shared:SettingRow Header="Поделиться узлами входа" Description="Токен om3dhtboot: — для тех, с кем у вас нет общих знакомых: сайт, форум, QR, из рук в руки.">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button x:Name="SettingsExportDhtBootstrapBundleButton" Content="Копировать токен" />
+                <Button x:Name="SettingsImportDhtBootstrapBundleButton" Content="Импортировать" />
+              </StackPanel>
+              <shared:SettingRow.Details>
+                <StackPanel Spacing="6">
+                  <TextBox x:Name="SettingsDhtBootstrapBundleTextBox" AcceptsReturn="False" PlaceholderText="Вставьте om3dhtboot:… и нажмите «Импортировать»" TextWrapping="Wrap" />
+                  <TextBlock x:Name="SettingsDhtBootstrapBundleStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                </StackPanel>
+              </shared:SettingRow.Details>
+            </shared:SettingRow>
+          </StackPanel>
+        </Grid>
+      </Border>
+      </Grid>
+    </ScrollViewer>
+  </Grid>
+</UserControl>

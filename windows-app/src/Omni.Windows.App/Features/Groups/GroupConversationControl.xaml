@@ -1,0 +1,751 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+  x:Class="Omni.Windows.App.Features.Groups.GroupConversationControl"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:local="using:Omni.Windows.App.Features.Groups"
+  xmlns:chats="using:Omni.Windows.App.Features.Chats"
+  xmlns:calls="using:Omni.Windows.App.Features.Calls"
+  xmlns:shared="using:Omni.Windows.App.Features.Shared"
+  mc:Ignorable="d">
+
+  <UserControl.Resources>
+    <chats:ChatBubbleBrushConverter x:Key="BubbleBrushConverter" />
+
+    <!-- One call tile, shared by the focused (big) tile and the grid/filmstrip tiles. Size comes
+         from TileWidth/TileHeight (RefreshCallTiles); initials show until the sender's video covers
+         them; a bottom scrim keeps the name legible. Tap a tile to pin/unpin focus. -->
+    <DataTemplate x:Key="GroupCallTileTemplate" x:DataType="local:GroupCallParticipantItem">
+      <Border
+        Width="{x:Bind TileWidth, Mode=OneWay}"
+        Height="{x:Bind TileHeight, Mode=OneWay}"
+        Margin="5"
+        Background="{ThemeResource OmniCallTileBrush}"
+        CornerRadius="14">
+        <Grid CornerRadius="14">
+          <shared:AvatarView
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"
+            Fill="{x:Bind AvatarBrush}"
+            Picture="{x:Bind Picture}"
+            PictureTitle="{x:Bind DisplayName}"
+            Size="64"
+            Text="{x:Bind Initials}" />
+          <Image
+            Loaded="OnTileVideoLoaded"
+            Stretch="{x:Bind VideoStretch, Mode=OneWay}"
+            Tag="{x:Bind TileKey}"
+            Visibility="{x:Bind VideoVisibility, Mode=OneWay}" />
+          <Border
+            BorderBrush="#4CC38A"
+            BorderThickness="3"
+            CornerRadius="14"
+            IsHitTestVisible="False"
+            Visibility="{x:Bind SpeakingRingVisibility, Mode=OneWay}" />
+          <Border Height="40" VerticalAlignment="Bottom" CornerRadius="0,0,14,14">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                <GradientStop Offset="0.0" Color="#00000000" />
+                <GradientStop Offset="1.0" Color="#99000000" />
+              </LinearGradientBrush>
+            </Border.Background>
+          </Border>
+          <TextBlock
+            Margin="10,0,10,8"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Bottom"
+            FontSize="13"
+            Foreground="White"
+            MaxLines="1"
+            Text="{x:Bind DisplayName}"
+            TextTrimming="CharacterEllipsis" />
+          <!-- Remote screen control: this member lets us control the screen they share. -->
+          <Button
+            Margin="6"
+            Padding="8,2"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Bottom"
+            AutomationProperties.Name="Управлять экраном участника"
+            Background="#B3000000"
+            Click="OnTileControlClicked"
+            Content="{x:Bind ControlButtonText, Mode=OneWay}"
+            FontSize="11"
+            Foreground="White"
+            Tag="{x:Bind MemberPub}"
+            Visibility="{x:Bind ControlButtonVisibility, Mode=OneWay}" />
+<!-- Our own tile is named "Вы" (no separate marker). -->
+          <StackPanel
+            Margin="6"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            Orientation="Horizontal"
+            Spacing="4">
+            <Border Padding="4,2" Background="#B3000000" CornerRadius="6" Visibility="{x:Bind MuteBadgeVisibility, Mode=OneWay}">
+              <FontIcon FontSize="12" Foreground="White" Glyph="&#xEC54;" />
+            </Border>
+            <Border Padding="4,2" Background="#B3000000" CornerRadius="6" Visibility="{x:Bind CameraOffBadgeVisibility, Mode=OneWay}">
+              <FontIcon FontSize="12" Foreground="White" Glyph="&#xE714;" />
+            </Border>
+          </StackPanel>
+        </Grid>
+      </Border>
+    </DataTemplate>
+  </UserControl.Resources>
+
+  <Grid ColumnSpacing="0">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*" />
+      <ColumnDefinition x:Name="GroupInfoColumn" Width="0" />
+    </Grid.ColumnDefinitions>
+
+    <!-- The conversation: the same language as a 1:1 chat — header and composer are bars, the
+         thread between them one solid field edge to edge (owner, 2026-10-10, «как в Телеграме»). -->
+    <Grid Grid.Column="0">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+
+      <!-- The shared conversation header (Features/Shared/ConversationHeader.xaml), the same as a
+           1:1 chat's: a tap on the avatar or the name opens the group's page, as in Telegram. -->
+      <shared:ConversationHeader x:Name="GroupHeader" Grid.Row="0">
+        <shared:ConversationHeader.Actions>
+          <StackPanel Orientation="Horizontal" Spacing="8">
+              <!-- An icon, as in a 1:1 chat; a call going on without us adds "Присоединиться · N". -->
+              <Button
+                x:Name="StartGroupCallButton"
+                AutomationProperties.Name="Звонок в группу"
+                Click="OnStartCallClicked"
+                Style="{StaticResource GhostIconButtonStyle}"
+                ToolTipService.ToolTip="Звонок в группу">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                  <FontIcon FontSize="16" Glyph="&#xE717;" />
+                  <TextBlock x:Name="StartGroupCallButtonText" VerticalAlignment="Center" Visibility="Collapsed" />
+                </StackPanel>
+              </Button>
+              <Button
+                x:Name="GroupInfoButton"
+                AutomationProperties.Name="Сведения о группе"
+                Click="OnGroupHeaderClicked"
+                Style="{StaticResource GhostIconButtonStyle}"
+                ToolTipService.ToolTip="Участники и управление">
+                <FontIcon FontSize="16" Glyph="&#xE712;" />
+              </Button>
+          </StackPanel>
+        </shared:ConversationHeader.Actions>
+      </shared:ConversationHeader>
+
+      <!-- Status line (errors, "приглашения отправлены"). -->
+      <TextBlock
+        x:Name="GroupStatusTextBlock"
+        Grid.Row="1"
+        Margin="16,0,16,10"
+        FontSize="12"
+        Opacity="0.8"
+        TextWrapping="Wrap"
+        Visibility="Collapsed" />
+
+      <!-- A call we are in, folded away (the stage below is the call's screen): one strip over the
+           thread — tap to go back to the people, mute or leave right here. -->
+      <Grid
+        x:Name="GroupCallStrip"
+        Grid.Row="2"
+        Height="40"
+        Background="{ThemeResource OmniCallAcceptBrush}"
+        Visibility="Collapsed">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <Button
+          MinWidth="0"
+          MinHeight="0"
+          Padding="16,0"
+          HorizontalAlignment="Stretch"
+          VerticalAlignment="Stretch"
+          HorizontalContentAlignment="Left"
+          AutomationProperties.Name="Вернуться к звонку"
+          Background="Transparent"
+          BorderThickness="0"
+          Click="OnExpandCallClicked"
+          CornerRadius="0"
+          Foreground="White">
+          <StackPanel Orientation="Horizontal" Spacing="10">
+            <FontIcon VerticalAlignment="Center" FontSize="13" Glyph="&#xE717;" />
+            <TextBlock x:Name="GroupCallStripText" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" />
+            <TextBlock VerticalAlignment="Center" FontSize="13" Opacity="0.85" Text="Вернуться к звонку" />
+          </StackPanel>
+        </Button>
+        <StackPanel Grid.Column="1" Margin="0,0,10,0" VerticalAlignment="Center" Orientation="Horizontal" Spacing="6">
+          <Button
+            x:Name="GroupCallStripMuteButton"
+            Width="30"
+            Height="30"
+            MinWidth="0"
+            MinHeight="0"
+            Padding="0"
+            AutomationProperties.Name="Выключить микрофон"
+            Background="#33FFFFFF"
+            BorderThickness="0"
+            Click="OnToggleGroupMuteClicked"
+            CornerRadius="15"
+            Foreground="White">
+            <FontIcon x:Name="GroupCallStripMuteIcon" FontSize="13" Glyph="&#xE720;" />
+          </Button>
+          <Button
+            Width="30"
+            Height="30"
+            MinWidth="0"
+            MinHeight="0"
+            Padding="0"
+            AutomationProperties.Name="Выйти из звонка"
+            Background="{ThemeResource OmniCallHangUpBrush}"
+            BorderThickness="0"
+            Click="OnLeaveCallClicked"
+            CornerRadius="15"
+            Foreground="White">
+            <FontIcon FontSize="13" Glyph="&#xE778;" />
+          </Button>
+        </StackPanel>
+      </Grid>
+
+      <!-- Thread: own messages right, others left with their name; system lines centred. -->
+      <Border Grid.Row="3" AllowDrop="True" Background="{ThemeResource OmniBgAppBrush}" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,1,0,0" DragOver="OnThreadDragOver" Drop="OnThreadDrop">
+        <Grid RowSpacing="10">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+        <ScrollViewer x:Name="GroupMessagesScroll" Margin="0,0,8,0" VerticalScrollBarVisibility="Auto">
+          <!-- As in the 1:1 chat: the list stands 8 off the edge and the bubbles 20 inside it, so
+               the overlaid 12-wide bar sits in the middle of the gap, not over the bubbles. -->
+          <ItemsControl x:Name="GroupMessagesList" Margin="16,12,20,8">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="local:GroupMessageItem">
+                <Grid Margin="0,3">
+                  <Border
+                    Padding="10,4"
+                    HorizontalAlignment="Center"
+                    Background="{ThemeResource OmniBgElevatedBrush}"
+                    CornerRadius="10"
+                    Visibility="{x:Bind SystemVisibility}">
+                    <TextBlock FontSize="12" Opacity="0.75" Text="{x:Bind Body}" TextWrapping="Wrap" />
+                  </Border>
+                  <Grid ColumnSpacing="8" Visibility="{x:Bind BubbleVisibility}">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <!-- The author's avatar at the foot of each incoming run, as in the 1:1 chat. -->
+                    <shared:AvatarView
+                      VerticalAlignment="Bottom"
+                      Fill="{x:Bind AvatarBrush}"
+                      Opacity="{x:Bind AvatarOpacity}"
+                      Picture="{x:Bind Picture}"
+                      PictureTitle="{x:Bind SenderName}"
+                      Size="34"
+                      Text="{x:Bind Initials}"
+                      Visibility="{x:Bind AvatarSlotVisibility}" />
+                  <Border
+                    Grid.Column="1"
+                    MaxWidth="560"
+                    Padding="12,8"
+                    HorizontalAlignment="{x:Bind Alignment}"
+                    Background="{x:Bind IsMine, Converter={StaticResource BubbleBrushConverter}}"
+                    BorderBrush="{ThemeResource OmniBubbleStrokeBrush}"
+                    BorderThickness="1"
+                    CornerRadius="12">
+                    <StackPanel Spacing="2">
+                      <TextBlock
+                        FontSize="12"
+                        FontWeight="SemiBold"
+                        Foreground="{ThemeResource OmniAccentBrush}"
+                        Text="{x:Bind SenderName}"
+                        Visibility="{x:Bind SenderVisibility}" />
+                      <!-- A photo and a file as in the 1:1 bubble (ChatsSectionControl.xaml). -->
+                      <Button
+                        Margin="-8,2,-8,2"
+                        Padding="0"
+                        AutomationProperties.Name="Фото"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Click="OnPhotoClicked"
+                        Tag="{x:Bind MessageId}"
+                        Visibility="{x:Bind PhotoVisibility}">
+                        <Button.ContextFlyout>
+                          <MenuFlyout Opening="OnPhotoMenuOpening">
+                            <MenuFlyoutItem Click="OnPhotoClicked" Text="Открыть">
+                              <MenuFlyoutItem.Icon>
+                                <FontIcon Glyph="&#xE8A7;" />
+                              </MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Click="OnPhotoSaveClicked" Text="Сохранить как…">
+                              <MenuFlyoutItem.Icon>
+                                <FontIcon Glyph="&#xE896;" />
+                              </MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
+                          </MenuFlyout>
+                        </Button.ContextFlyout>
+                        <shared:PhotoView
+                          Width="{x:Bind PhotoDisplayWidth}"
+                          Height="{x:Bind PhotoDisplayHeight}"
+                          DecodeWidth="{x:Bind PhotoDecodeWidth}"
+                          LocalPath="{x:Bind PhotoLocalPath}"
+                          PreviewBase64="{x:Bind PhotoPreviewBase64}" />
+                      </Button>
+                      <Button
+                        Padding="0"
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Stretch"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Click="OnFileClicked"
+                        Tag="{x:Bind MessageId}"
+                        Visibility="{x:Bind FileVisibility}">
+                        <Grid Padding="0,4" ColumnSpacing="10">
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                          </Grid.ColumnDefinitions>
+                          <Border
+                            Width="44"
+                            Height="44"
+                            VerticalAlignment="Top"
+                            Background="{ThemeResource AccentFillColorSecondaryBrush}"
+                            CornerRadius="22">
+                            <FontIcon HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="18" Glyph="&#xE130;" />
+                          </Border>
+                          <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                            <TextBlock FontWeight="SemiBold" Text="{x:Bind FileName}" TextWrapping="Wrap" />
+                            <TextBlock FontSize="12" Opacity="0.76" Text="{x:Bind FileSizeText}" />
+                            <TextBlock FontSize="12" Opacity="0.86" Text="{x:Bind FileStatusText}" TextWrapping="Wrap" Visibility="{x:Bind FileStatusVisibility}" />
+                            <ProgressBar
+                              Height="4"
+                              Maximum="100"
+                              Minimum="0"
+                              Value="{x:Bind FileProgressValue}"
+                              Visibility="{x:Bind FileProgressVisibility}" />
+                          </StackPanel>
+                        </Grid>
+                      </Button>
+                      <TextBlock
+                        Foreground="{ThemeResource OmniTextBrush}"
+                        IsTextSelectionEnabled="True"
+                        Text="{x:Bind Body}"
+                        TextWrapping="Wrap"
+                        Visibility="{x:Bind BodyVisibility}" />
+                      <TextBlock HorizontalAlignment="Right" FontSize="10" Opacity="0.6" Text="{x:Bind TimeText}" />
+                    </StackPanel>
+                  </Border>
+                  </Grid>
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+        <!-- Alone in the group: say so and offer the way out, right where the eye is. -->
+        <Border
+          x:Name="GroupAloneNudge"
+          Grid.Row="1"
+          Margin="0,0,0,12"
+          Padding="14,10"
+          HorizontalAlignment="Center"
+          Background="{ThemeResource OmniBgElevatedBrush}"
+          CornerRadius="12"
+          Visibility="Collapsed">
+          <StackPanel HorizontalAlignment="Center" Orientation="Horizontal" Spacing="14">
+            <TextBlock x:Name="GroupAloneNudgeText" VerticalAlignment="Center" TextWrapping="Wrap" />
+            <Button Click="OnAddMembersClicked" Style="{StaticResource AccentButtonStyle}">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <FontIcon FontSize="14" Glyph="&#xE8FA;" />
+                <TextBlock x:Name="GroupAloneNudgeButtonText" Text="Пригласить участников" />
+              </StackPanel>
+            </Button>
+          </StackPanel>
+        </Border>
+        </Grid>
+      </Border>
+
+      <!-- The shared composer (Features/Shared/MessageComposer.xaml), the same as a 1:1 chat's. -->
+      <shared:MessageComposer x:Name="GroupComposer" Grid.Row="4" />
+    </Grid>
+
+    <!-- The call's screen, over the whole conversation while we are in the call (fold it with the
+         chevron to get the thread back; the strip above the thread returns here). The same dark
+         stage and round control bar as the 1:1 call: people in the middle, sized to the space. -->
+    <Grid
+      x:Name="GroupCallStage"
+      Grid.Column="0"
+      Background="{ThemeResource OmniCallStageBrush}"
+      SizeChanged="OnCallStageSizeChanged"
+      Visibility="Collapsed">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+      <Grid Margin="16,14,20,8" ColumnSpacing="12">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+        <Button
+          Width="40"
+          Height="40"
+          MinWidth="0"
+          MinHeight="0"
+          Padding="0"
+          AutomationProperties.Name="Свернуть звонок"
+          Background="{ThemeResource OmniCallControlBrush}"
+          BorderThickness="0"
+          Click="OnFoldCallClicked"
+          CornerRadius="20"
+          Foreground="{ThemeResource OmniCallTextBrush}"
+          ToolTipService.ToolTip="Свернуть — звонок продолжится, а переписка будет под рукой">
+          <FontIcon FontSize="14" Glyph="&#xE70D;" />
+        </Button>
+        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="1">
+          <TextBlock
+            x:Name="GroupCallStageTitle"
+            FontSize="15"
+            FontWeight="SemiBold"
+            Foreground="{ThemeResource OmniCallTextBrush}"
+            TextTrimming="CharacterEllipsis" />
+          <TextBlock
+            x:Name="GroupCallBannerText"
+            FontSize="12.5"
+            Foreground="{ThemeResource OmniCallTextBrush}"
+            Opacity="0.75"
+            TextTrimming="CharacterEllipsis" />
+        </StackPanel>
+      </Grid>
+
+      <!-- People. Grid mode: everyone the same size; tap a tile to pin it big (focus mode) with the
+           rest in a strip under it. Sizes come from the stage (OnCallStageSizeChanged). -->
+      <Grid x:Name="GroupCallTilesHost" Grid.Row="1" Margin="12,0">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="*" />
+          <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <GridView
+          x:Name="GroupCallFocusList"
+          HorizontalAlignment="Center"
+          VerticalAlignment="Center"
+          IsItemClickEnabled="True"
+          ItemClick="OnCallTileClicked"
+          ItemTemplate="{StaticResource GroupCallTileTemplate}"
+          ScrollViewer.VerticalScrollBarVisibility="Disabled"
+          SelectionMode="None"
+          Visibility="Collapsed">
+          <GridView.ItemContainerStyle>
+            <Style TargetType="GridViewItem">
+              <Setter Property="Margin" Value="0" />
+              <Setter Property="Padding" Value="0" />
+              <Setter Property="MinWidth" Value="0" />
+              <Setter Property="MinHeight" Value="0" />
+            </Style>
+          </GridView.ItemContainerStyle>
+        </GridView>
+        <GridView
+          x:Name="GroupCallTilesList"
+          HorizontalAlignment="Center"
+          VerticalAlignment="Center"
+          IsItemClickEnabled="True"
+          ItemClick="OnCallTileClicked"
+          ItemTemplate="{StaticResource GroupCallTileTemplate}"
+          SelectionMode="None">
+          <GridView.ItemContainerStyle>
+            <Style TargetType="GridViewItem">
+              <Setter Property="Margin" Value="0" />
+              <Setter Property="Padding" Value="0" />
+              <Setter Property="MinWidth" Value="0" />
+              <Setter Property="MinHeight" Value="0" />
+            </Style>
+          </GridView.ItemContainerStyle>
+        </GridView>
+      </Grid>
+
+      <StackPanel
+        Grid.Row="2"
+        Margin="0,8,0,28"
+        HorizontalAlignment="Center"
+        Orientation="Horizontal"
+        Spacing="14">
+        <calls:CallButton
+          x:Name="ToggleGroupMuteButton"
+          IsWarning="True"
+          AutomationProperties.Name="Выключить микрофон"
+          Caption="Микрофон"
+          Click="OnToggleGroupMuteClicked">
+          <FontIcon x:Name="ToggleGroupMuteIcon" FontSize="22" Glyph="&#xE720;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="ToggleGroupCameraButton"
+          AutomationProperties.Name="Включить камеру"
+          Caption="Камера"
+          Click="OnToggleGroupCameraClicked">
+          <FontIcon FontSize="21" Glyph="&#xE714;" />
+        </calls:CallButton>
+        <calls:CallButton
+          x:Name="ToggleGroupScreenShareButton"
+          AutomationProperties.Name="Демонстрация экрана"
+          Caption="Экран"
+          Click="OnToggleGroupScreenShareClicked">
+          <FontIcon FontSize="21" Glyph="&#xE7F4;" />
+        </calls:CallButton>
+        <!-- Shown while we share a whole monitor: who may control it. -->
+        <calls:CallButton
+          x:Name="GroupScreenControlButton"
+          AutomationProperties.Name="Кто может управлять экраном"
+          Caption="Управление"
+          Visibility="Collapsed">
+          <FontIcon FontSize="21" Glyph="&#xF271;" />
+          <calls:CallButton.Flyout>
+            <MenuFlyout x:Name="GroupScreenControlFlyout" Opening="OnGroupScreenControlFlyoutOpening" />
+          </calls:CallButton.Flyout>
+        </calls:CallButton>
+        <calls:CallButton
+          AutomationProperties.Name="Выйти из звонка"
+          Background="{ThemeResource OmniCallHangUpBrush}"
+          Foreground="White"
+          Caption="Выйти"
+          Click="OnLeaveCallClicked">
+          <FontIcon FontSize="22" Glyph="&#xE778;" />
+        </calls:CallButton>
+      </StackPanel>
+    </Grid>
+
+    <!-- The group's page (a tap on the header, or «⋯»), as in Telegram: the picture and the name
+         big, a row of actions, then the people with their roles. A side bar on the chat's own
+         plane, not a card floating beside it. -->
+    <Grid
+      x:Name="GroupInfoPanel"
+      Grid.Column="1"
+      Background="{ThemeResource OmniBgPanelBrush}"
+      BorderBrush="{ThemeResource OmniStrokeBrush}"
+      BorderThickness="1,0,0,0"
+      Visibility="Collapsed">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+      <!-- The height of the conversation's header, so the line under both is one line. -->
+      <Grid Margin="16,3,8,4" MinHeight="40">
+        <TextBlock VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" Text="Сведения о группе" />
+        <Button
+          HorizontalAlignment="Right"
+          VerticalAlignment="Center"
+          AutomationProperties.Name="Закрыть сведения о группе"
+          Click="OnGroupInfoCloseClicked"
+          Style="{StaticResource GhostIconButtonStyle}">
+          <FontIcon FontSize="14" Glyph="&#xE711;" />
+        </Button>
+      </Grid>
+      <ScrollViewer Grid.Row="1" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,1,0,0" VerticalScrollBarVisibility="Auto">
+        <StackPanel Padding="16,12,16,16">
+          <shared:AvatarView x:Name="GroupInfoAvatar" HorizontalAlignment="Center" PictureTitle="{x:Bind GroupNameTextBlock.Text, Mode=OneWay}" Size="96" />
+          <TextBlock
+            x:Name="GroupInfoNameTextBlock"
+            Margin="0,14,0,0"
+            HorizontalAlignment="Center"
+            FontSize="20"
+            FontWeight="SemiBold"
+            TextAlignment="Center"
+            TextWrapping="Wrap" />
+          <TextBlock
+            x:Name="GroupInfoSubtitleTextBlock"
+            Margin="0,2,0,0"
+            HorizontalAlignment="Center"
+            FontSize="13"
+            Opacity="0.7" />
+
+          <!-- Actions: equal tiles across the width (LayoutActionTiles drops the hidden ones). -->
+          <Grid x:Name="GroupActionTilesGrid" Margin="0,20,0,0" ColumnSpacing="8">
+            <Button
+              x:Name="GroupInfoCallTile"
+              AutomationProperties.Name="Звонок в группу"
+              Click="OnStartCallClicked"
+              Style="{StaticResource ActionTileButtonStyle}">
+              <StackPanel Spacing="4">
+                <FontIcon FontSize="18" Glyph="&#xE717;" />
+                <TextBlock x:Name="GroupInfoCallTileText" HorizontalAlignment="Center" FontSize="12" Text="Звонок" />
+              </StackPanel>
+            </Button>
+            <Button
+              x:Name="GroupInfoInviteTile"
+              AutomationProperties.Name="Пригласить участников"
+              Click="OnAddMembersClicked"
+              Style="{StaticResource ActionTileButtonStyle}">
+              <StackPanel Spacing="4">
+                <FontIcon FontSize="18" Glyph="&#xE8FA;" />
+                <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Пригласить" />
+              </StackPanel>
+            </Button>
+            <!-- Admins only: the name and the picture, for everyone. -->
+            <Button
+              x:Name="GroupInfoManageTile"
+              AutomationProperties.Name="Управление группой"
+              Click="OnManageClicked"
+              Style="{StaticResource ActionTileButtonStyle}"
+              Visibility="Collapsed">
+              <StackPanel Spacing="4">
+                <FontIcon FontSize="18" Glyph="&#xE70F;" />
+                <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Изменить" />
+              </StackPanel>
+            </Button>
+            <Button
+              x:Name="GroupInfoMoreTile"
+              AutomationProperties.Name="Ещё действия с группой"
+              Style="{StaticResource ActionTileButtonStyle}">
+              <StackPanel Spacing="4">
+                <FontIcon FontSize="18" Glyph="&#xE712;" />
+                <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Ещё" />
+              </StackPanel>
+              <Button.Flyout>
+                <MenuFlyout Placement="Bottom">
+                  <MenuFlyoutItem x:Name="LeaveGroupMenuItem" Click="OnLeaveGroupClicked" Text="Выйти из группы">
+                    <MenuFlyoutItem.Icon>
+                      <FontIcon Glyph="&#xE89B;" />
+                    </MenuFlyoutItem.Icon>
+                  </MenuFlyoutItem>
+                  <MenuFlyoutItem
+                    x:Name="DeleteGroupMenuItem"
+                    Click="OnDeleteGroupClicked"
+                    Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                    Text="Удалить группу для всех"
+                    Visibility="Collapsed">
+                    <MenuFlyoutItem.Icon>
+                      <FontIcon Glyph="&#xE74D;" />
+                    </MenuFlyoutItem.Icon>
+                  </MenuFlyoutItem>
+                </MenuFlyout>
+              </Button.Flyout>
+            </Button>
+          </Grid>
+
+          <!-- «Управление»: opens under the tiles. -->
+          <StackPanel x:Name="GroupManagePanel" Margin="0,20,0,0" Spacing="8" Visibility="Collapsed">
+            <TextBlock FontSize="12" Opacity="0.7" Text="Название" />
+            <Grid ColumnSpacing="8">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <TextBox x:Name="GroupRenameTextBox" KeyDown="OnRenameKeyDown" />
+              <Button x:Name="GroupRenameButton" Grid.Column="1" MinWidth="0" Click="OnRenameClicked" Content="Сохранить" />
+            </Grid>
+            <TextBlock Margin="0,6,0,0" FontSize="12" Opacity="0.7" Text="Аватарка — видят все участники" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+              <Button x:Name="GroupChooseAvatarButton" MinWidth="0" Click="OnChooseGroupAvatarClicked" Content="Выбрать фото" />
+              <Button x:Name="GroupClearAvatarButton" MinWidth="0" Click="OnClearGroupAvatarClicked" Content="Убрать" />
+            </StackPanel>
+            <!-- New members get the last messages, each signed by its author (on by default). -->
+            <CheckBox
+              x:Name="GroupNewcomerHistoryCheckBox"
+              Margin="0,6,0,0"
+              Click="OnNewcomerHistoryClicked"
+              Content="Показывать новичкам историю" />
+          </StackPanel>
+
+          <!-- The people: a section under a line, rows without frames, as in the chat list. -->
+          <Border Margin="0,24,0,0" Style="{StaticResource SubtleBorderStyle}">
+            <StackPanel Spacing="2">
+              <Grid Margin="0,0,0,4">
+                <TextBlock x:Name="GroupMembersHeaderTextBlock" VerticalAlignment="Center" FontWeight="SemiBold" />
+                <Button
+                  x:Name="AddGroupMembersButton"
+                  HorizontalAlignment="Right"
+                  AutomationProperties.Name="Пригласить участников"
+                  Click="OnAddMembersClicked"
+                  Style="{StaticResource GhostIconButtonStyle}"
+                  ToolTipService.ToolTip="Пригласить участников">
+                  <FontIcon FontSize="16" Foreground="{ThemeResource OmniAccentBrush}" Glyph="&#xE8FA;" />
+                </Button>
+              </Grid>
+              <ItemsControl x:Name="GroupMembersListView">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="local:GroupMemberItem">
+                    <Grid MinHeight="48" ColumnSpacing="12">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                      </Grid.ColumnDefinitions>
+                      <shared:AvatarView Fill="{x:Bind AvatarBrush}" Picture="{x:Bind Picture}" PictureTitle="{x:Bind Title}" Size="36" Text="{x:Bind Initials}" />
+                      <TextBlock Grid.Column="1" VerticalAlignment="Center" Text="{x:Bind Title}" TextTrimming="CharacterEllipsis" />
+                      <TextBlock
+                        Grid.Column="2"
+                        VerticalAlignment="Center"
+                        FontSize="12"
+                        Foreground="{ThemeResource OmniAccentBrush}"
+                        Text="админ"
+                        Visibility="{x:Bind AdminVisibility}" />
+                      <Button
+                        Grid.Column="3"
+                        Width="32"
+                        Height="32"
+                        MinWidth="0"
+                        MinHeight="0"
+                        AutomationProperties.Name="Действия с участником"
+                        Click="OnMemberMenuClicked"
+                        Style="{StaticResource GhostIconButtonStyle}"
+                        Tag="{x:Bind MemberPub}"
+                        Visibility="{x:Bind MenuVisibility}">
+                        <FontIcon FontSize="14" Glyph="&#xE712;" />
+                      </Button>
+                    </Grid>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+              <!-- Invitations WE sent that nobody answered yet (only the inviter knows about them). -->
+              <TextBlock
+                x:Name="GroupInvitedHeaderTextBlock"
+                Margin="0,16,0,4"
+                FontWeight="SemiBold"
+                Visibility="Collapsed" />
+              <ItemsControl x:Name="GroupInvitedList">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="local:GroupInvitedItem">
+                    <Grid MinHeight="48" ColumnSpacing="12">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                      </Grid.ColumnDefinitions>
+                      <Border Width="36" Height="36" BorderBrush="{ThemeResource TextFillColorTertiaryBrush}" BorderThickness="1" CornerRadius="18">
+                        <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="13" FontWeight="SemiBold" Opacity="0.7" Text="{x:Bind Initials}" />
+                      </Border>
+                      <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock Text="{x:Bind Title}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock FontSize="12" Opacity="0.65" Text="{x:Bind Detail}" />
+                      </StackPanel>
+                      <Button
+                        Grid.Column="2"
+                        Width="32"
+                        Height="32"
+                        MinWidth="0"
+                        MinHeight="0"
+                        AutomationProperties.Name="Отменить приглашение"
+                        Click="OnCancelInviteClicked"
+                        Style="{StaticResource GhostIconButtonStyle}"
+                        Tag="{x:Bind DialogKey}"
+                        ToolTipService.ToolTip="Отменить приглашение">
+                        <FontIcon FontSize="12" Glyph="&#xE711;" />
+                      </Button>
+                    </Grid>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </ScrollViewer>
+    </Grid>
+  </Grid>
+</UserControl>

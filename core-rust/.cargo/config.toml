@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# /PDBALTPATH: the DLL/EXE records only the PDB's file name, not the build directory it was linked in.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/PDBALTPATH:%_PDB%"]

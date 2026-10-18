@@ -1,0 +1,63 @@
+name: windows-smoke
+
+# Runs on main, pull requests and by hand.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.201
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      # The database is SQLCipher over a vendored OpenSSL built from source: Configure runs on Perl and
+      # NASM assembles its AES-NI paths (scripts/build-tools-env.ps1). The runner's Strawberry Perl goes
+      # first: the Perl that ships with Git lacks modules Configure needs.
+      - name: Strawberry Perl first on PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Strawberry\perl\bin'
+
+      - uses: ilammy/setup-nasm@v1
+
+      # The vendored OpenSSL takes ~15 minutes to build from scratch; the cache keeps it between runs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core-rust
+
+      - name: UTF-8 guardrail
+        shell: pwsh
+        run: .\scripts\check-utf8.ps1
+        working-directory: .
+
+      - name: Restore WinUI solution
+        shell: pwsh
+        run: dotnet restore .\windows-app\Omni.Windows.sln --locked-mode
+        working-directory: .
+
+      - name: Build WinUI solution
+        shell: pwsh
+        run: dotnet build .\windows-app\Omni.Windows.sln -p:Platform=x64 --no-restore
+        working-directory: .
+
+      - name: Rust clippy (-D warnings)
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: .\core-rust
+
+      - name: Rust workspace tests
+        shell: pwsh
+        run: cargo test --workspace -- --test-threads=1
+        working-directory: .\core-rust

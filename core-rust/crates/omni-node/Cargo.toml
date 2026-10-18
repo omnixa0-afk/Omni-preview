@@ -1,0 +1,20 @@
+[package]
+name = "omni-node"
+version = "0.1.0"
+edition.workspace = true
+
+# Headless Omni core: a thin CLI/stdin driver over `omni-app` (no UI). Used as a
+# deterministic test harness for the mesh (e.g. the durable store-and-forward live
+# gate) and as the seed of a P3 volunteer relay node. See
+# docs/decisions/headless-omni-node.md.
+
+[[bin]]
+name = "omni-node"
+path = "src/main.rs"
+
+[dependencies]
+omni-app = { path = "../omni-app" }
+omni-daemon = { path = "../omni-daemon" }
+
+[lints]
+workspace = true

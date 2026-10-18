@@ -1,0 +1,27 @@
+[package]
+name = "omni-group-mls"
+version = "0.1.0"
+edition.workspace = true
+
+# Group crypto + membership on MLS (RFC 9420) via OpenMLS — docs/decisions/group-crypto-mls.md.
+# Pure Rust (RustCrypto provider; no aws-lc/openssl/ring): the same group bytes on every platform.
+
+[dependencies]
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+openmls = { version = "0.9", features = ["fork-resolution"] }
+openmls_basic_credential = "0.6"
+openmls_rust_crypto = "0.6"
+openmls_sqlite_storage = "0.3"
+openmls_traits = "0.6"
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand_core = { workspace = true }
+
+[lints]
+workspace = true
