@@ -90,7 +90,8 @@ internal sealed record FootprintRefreshPayload(
     LocalProfileFootprintSummary? FootprintSummary);
 
 internal sealed record TransportRefreshPayload(
-    TransportSnapshot Snapshot);
+    TransportSnapshot Snapshot,
+    MeshConnectionStateDto? Mesh);
 
 internal sealed record CallInboxRefreshPayload(
     CallInboxSnapshot Snapshot);

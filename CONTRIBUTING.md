@@ -40,19 +40,24 @@ Omni is pre-1.0. There are no external users to keep compatible with, so:
 These hold everywhere; a change that breaks one needs a discussion first.
 
 - Discovery, identity, relationship and presence are separate states. Seeing a peer on the network
-  never makes it a trusted contact.
+  never makes it a trusted contact: a neighbouring peer is a route candidate, nothing more.
 - 1:1 chat and calls are only for approved contacts. Group chat and calls are for group members;
-  group membership never opens a 1:1 channel.
+  group membership is a separate axis and never opens a 1:1 channel. A declined or blocked contact
+  is blocked for 1:1 only, not inside a group. It holds no direct mesh link with us either: group
+  traffic with it goes through other nodes, and where there is no other path it does not flow.
+- `Never met` is cleared only by a verified secure session; group membership does not clear it.
 - One call per profile, enforced in the core.
 - Ratchet sessions: read the session under `session_lock` and store it with `store_session_record`
-  (optimistic, by `revision`) before sending the frame.
+  (optimistic, by `revision`) before sending the frame. `replace_session_record` is only for a new
+  session from a bootstrap.
 - Media internals do not cross the FFI boundary, and raw media is never stored as chat history.
 - Everything needed to connect (pairing, adding contacts and relays) is available in the GUI. The
   daemon and CLI are for development only.
 - Tests use the real network path; nothing is tunnelled through VPNs or SSH to make NAT traversal
-  look easier than it is.
-- No node is privileged. The app must work with an empty bootstrap list, and every relay can be
-  removed by the user.
+  look easier than it is. Remote-control tools only drive the test machines.
+- No node is privileged. At most one removable base bootstrap node is built in; other relays are
+  added and removed by the user from the GUI. The app must work with an empty bootstrap list (LAN,
+  invite, rendezvous).
 
 ## Static registries
 
@@ -88,5 +93,5 @@ with a reason.
 - If you find something wrong while working (a test that locks in a bug, dead code, a misleading
   name, an outdated doc), say so in the issue or pull request rather than building on top of it.
 
-References such as `docs/decisions/…`, `docs/bugs/…` and `docs/notes/…` in code comments point to
-internal design notes that are not part of this repository.
+References such as `docs/decisions/…` and `docs/bugs/…` in code comments point to design notes and
+bug write-ups that a published copy of the repository may not carry.

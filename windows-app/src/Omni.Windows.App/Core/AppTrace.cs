@@ -21,6 +21,47 @@ namespace Omni.Windows.App.Core;
 internal static class AppTrace
 {
     /// <summary>
+    /// `OMNI_TRACE_FILE` set by hand before start (a test stand, a script): it wins over the settings
+    /// switch, which then shows it and stays locked. Read once, before <see cref="SetEnabled"/> ever
+    /// writes the variable itself.
+    /// </summary>
+    internal static readonly string? EnvironmentTraceFile =
+        Environment.GetEnvironmentVariable("OMNI_TRACE_FILE") is { Length: > 0 } raw && !string.IsNullOrWhiteSpace(raw)
+            ? raw
+            : null;
+
+    private static volatile bool enabled = EnvironmentTraceFile is not null;
+
+    internal static bool IsEnabled => enabled;
+
+    /// <summary>The file the settings switch writes: `logs\trace.log` in the data folder.</summary>
+    internal static string LogFilePath(string appDirectory) => Path.Combine(appDirectory, "logs", "trace.log");
+
+    /// <summary>
+    /// The settings switch «Журнал для разработчика»: the core starts or stops writing at once. The
+    /// variable is set too, so a helper process started later (the courier, the DHT engine) traces
+    /// into the same file; one already running keeps what it had. No-op under a hand-set variable.
+    /// </summary>
+    internal static void SetEnabled(string appDirectory, bool on)
+    {
+        if (EnvironmentTraceFile is not null)
+        {
+            return;
+        }
+
+        string? path = null;
+        if (on)
+        {
+            path = LogFilePath(appDirectory);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        }
+
+        NativeMethods.omni_trace_set_file(path);
+        Environment.SetEnvironmentVariable("OMNI_TRACE_FILE", path);
+        enabled = on;
+    }
+
+    /// <summary>
     /// Append one line. Silently does nothing when the sink is off, and never throws — a diagnostic
     /// must not be able to break the thing it is reporting on.
     /// </summary>
@@ -28,8 +69,7 @@ internal static class AppTrace
     {
         try
         {
-            string? sink = Environment.GetEnvironmentVariable("OMNI_TRACE_FILE");
-            if (string.IsNullOrWhiteSpace(sink))
+            if (!enabled)
             {
                 return;
             }

@@ -70,26 +70,7 @@ pub fn generate_local_key_hierarchy(
         updated_at_unix_ms: now_unix_ms,
     };
 
-    let signed_prekey_private = generate_x25519_secret();
-    let signed_prekey_public = PrekeyPublicKey(X25519PublicKey::from(&signed_prekey_private).to_bytes());
-    let signed_prekey_message = signed_prekey_signature_message(
-        account_id,
-        device_id,
-        identity_public,
-        signing_public,
-        signed_prekey_public,
-    );
-    let signed_prekey = SignedPrekey {
-        prekey_id: next_prekey_id(),
-        device_id: device_id.clone(),
-        public_key: signed_prekey_public,
-        protected_private_key: protect_bytes(signed_prekey_private.to_bytes().as_ref())?,
-        signature: sign_message(&identity_key.protected_signing_private_key, &signed_prekey_message)?,
-        suite_version: CRYPTO_SUITE_VERSION_CURRENT,
-        created_at_unix_ms: now_unix_ms,
-        expires_at_unix_ms: None,
-        updated_at_unix_ms: now_unix_ms,
-    };
+    let signed_prekey = generate_signed_prekey(&identity_key, device_id, next_prekey_id(), now_unix_ms)?;
 
     let one_time_prekeys =
         generate_one_time_prekeys(device_id, now_unix_ms, one_time_prekey_count)?;
@@ -99,6 +80,37 @@ pub fn generate_local_key_hierarchy(
         device_key,
         signed_prekey,
         one_time_prekeys,
+    })
+}
+
+/// A signed prekey of this device, signed by the identity key, usable for
+/// [`SIGNED_PREKEY_LIFETIME_MS`]. `prekey_id` is the caller's: a rotation numbers it after the ones
+/// the device already has (the process counter restarts at 1 every launch).
+pub fn generate_signed_prekey(
+    identity_key: &LocalIdentityKeyPair,
+    device_id: &DeviceId,
+    prekey_id: u32,
+    now_unix_ms: i64,
+) -> OmniResult<SignedPrekey> {
+    let private = generate_x25519_secret();
+    let public_key = PrekeyPublicKey(X25519PublicKey::from(&private).to_bytes());
+    let message = signed_prekey_signature_message(
+        &identity_key.account_id,
+        device_id,
+        identity_key.public_key,
+        identity_key.signing_public_key,
+        public_key,
+    );
+    Ok(SignedPrekey {
+        prekey_id,
+        device_id: device_id.clone(),
+        public_key,
+        protected_private_key: protect_bytes(private.to_bytes().as_ref())?,
+        signature: sign_message(&identity_key.protected_signing_private_key, &message)?,
+        suite_version: CRYPTO_SUITE_VERSION_CURRENT,
+        created_at_unix_ms: now_unix_ms,
+        expires_at_unix_ms: Some(now_unix_ms.saturating_add(SIGNED_PREKEY_LIFETIME_MS)),
+        updated_at_unix_ms: now_unix_ms,
     })
 }
 

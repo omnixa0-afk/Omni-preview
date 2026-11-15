@@ -2,6 +2,7 @@
 name = "omni-network"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Spike crate (2026-05-26) — Reticulum-style self-organizing mesh overlay.
 # См. docs/architecture/networking-overlay.md и

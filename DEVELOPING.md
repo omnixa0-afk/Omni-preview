@@ -46,7 +46,7 @@ rustc --version; dotnet --list-sdks; cmake --version
 dotnet build .\windows-app\Omni.Windows.sln -p:Platform=x64
 
 # Run it
-.\windows-app\src\Omni.Windows.App\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\Omni.Windows.App.exe
+.\windows-app\src\Omni.Windows.App\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\Omni.exe
 
 # Core tests (all) / one crate
 powershell -ExecutionPolicy Bypass -File .\scripts\test-core.ps1
@@ -68,7 +68,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\regen-docs.ps1
 Give each instance its own data directory:
 
 ```powershell
-$exe = ".\windows-app\src\Omni.Windows.App\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\Omni.Windows.App.exe"
+$exe = ".\windows-app\src\Omni.Windows.App\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\Omni.exe"
 & $exe --app-dir "$env:TEMP\omni-a"
 & $exe --app-dir "$env:TEMP\omni-b"
 ```
@@ -82,7 +82,7 @@ multi-device behaviour without a second machine.
 dotnet publish windows-app/src/Omni.Windows.App/Omni.Windows.App.csproj -p:PublishProfile=win-x64-standalone
 ```
 
-The result is one self-contained `Omni.Windows.App.exe` in
+The result is one self-contained `Omni.exe` in
 `windows-app\src\Omni.Windows.App\bin\x64\publish-standalone\` that runs on a clean Windows 10/11 x64
 without installing anything. Release builds remap source paths, so the binaries do not record where
 they were built.
@@ -124,7 +124,7 @@ gh attestation verify Omni.exe -R <owner>/<repo>
 | Visual Studio opened the repo but there is nothing to run | Open `windows-app\Omni.Windows.sln` instead of the folder |
 | `cargo: command not found` during the C# build | Rust is not on PATH for the IDE; reopen it after installing rustup |
 | `Rust DLL not found ... after cargo build` | `cargo build` failed — the real Rust error is earlier in the build output |
-| `omni_ffi.dll` is locked | The app is still running; close every `Omni.Windows.App.exe` |
+| `omni_ffi.dll` is locked | The app is still running; close every `Omni.exe` |
 | Platform errors | Build **x64** only, not Any CPU or x86 |
 | `net10.0` is not recognised | Install the .NET 10 SDK and a current Visual Studio |
 | Want a clean rebuild | Delete `core-rust\target` and `windows-app\src\Omni.Windows.App\bin` + `obj` |

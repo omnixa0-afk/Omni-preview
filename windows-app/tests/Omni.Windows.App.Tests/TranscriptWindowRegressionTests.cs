@@ -89,15 +89,18 @@ public sealed class TranscriptWindowRegressionTests
         // transcript binds no status text of its own.
         Assert.Empty(Regex.Matches(chatsXamlSource, "Text=\"\\{Binding StatusText\\}\"").Cast<Match>());
         Assert.Contains("ItemTemplate=\"{StaticResource PersonRowTemplate}\"", chatsXamlSource, StringComparison.Ordinal);
-        Assert.Contains("ToolTipService.ToolTip=\"{Binding DeliveryIndicatorToolTipText}\"", chatsXamlSource, StringComparison.Ordinal);
-        Assert.Contains("AutomationProperties.Name=\"{Binding DeliveryIndicatorAutomationName}\"", chatsXamlSource, StringComparison.Ordinal);
-        Assert.Contains("Glyph=\"{Binding DeliveryPrimaryGlyph}\"", chatsXamlSource, StringComparison.Ordinal);
-        Assert.Contains("FontFamily=\"{ThemeResource SymbolThemeFontFamily}\"", chatsXamlSource, StringComparison.Ordinal);
-        Assert.Contains("MaxWidth=\"{Binding BubbleMaxWidth}\"", chatsXamlSource, StringComparison.Ordinal);
+        // The bubble itself is the one template of every conversation.
+        string bubbleXamlSource = File.ReadAllText(ResolveRepoPath("src", "Omni.Windows.App", "Features", "Shared", "MessageBubble.xaml"));
+        Assert.Contains("<shared:MessageBubble", chatsXamlSource, StringComparison.Ordinal);
+        Assert.Contains("ToolTipService.ToolTip=\"{x:Bind Row.DeliveryIndicatorToolTipText, Mode=OneWay}\"", bubbleXamlSource, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.Name=\"{x:Bind Row.DeliveryIndicatorAutomationName, Mode=OneWay}\"", bubbleXamlSource, StringComparison.Ordinal);
+        Assert.Contains("Glyph=\"{x:Bind Row.DeliveryPrimaryGlyph, Mode=OneWay}\"", bubbleXamlSource, StringComparison.Ordinal);
+        Assert.Contains("FontFamily=\"{ThemeResource SymbolThemeFontFamily}\"", bubbleXamlSource, StringComparison.Ordinal);
+        Assert.Contains("MaxWidth=\"{x:Bind Row.BubbleMaxWidth, Mode=OneWay}\"", bubbleXamlSource, StringComparison.Ordinal);
         Assert.Contains("MessagesHostBorder.SizeChanged += OnMessagesHostBorderSizeChanged;", eventsSource, StringComparison.Ordinal);
-        Assert.Matches(new Regex("Text=\"\\{Binding Body\\}\"\\s+TextWrapping=\"Wrap\"", RegexOptions.CultureInvariant), chatsXamlSource);
-        Assert.Matches(new Regex("Text=\"\\{Binding AttachmentFileName\\}\"\\s+TextWrapping=\"Wrap\"", RegexOptions.CultureInvariant), chatsXamlSource);
-        Assert.Matches(new Regex("Text=\"\\{Binding AttachmentStatusText\\}\"\\s+TextWrapping=\"Wrap\"", RegexOptions.CultureInvariant), chatsXamlSource);
+        Assert.Matches(new Regex("Text=\"\\{x:Bind Row.Body, Mode=OneWay\\}\"\\s+TextWrapping=\"Wrap\"", RegexOptions.CultureInvariant), bubbleXamlSource);
+        Assert.Matches(new Regex("Text=\"\\{x:Bind Row.AttachmentFileName, Mode=OneWay\\}\"\\s+TextWrapping=\"Wrap\"", RegexOptions.CultureInvariant), bubbleXamlSource);
+        Assert.Matches(new Regex("Text=\"\\{x:Bind Row.AttachmentStatusText, Mode=OneWay\\}\"\\s+TextWrapping=\"Wrap\"", RegexOptions.CultureInvariant), bubbleXamlSource);
         Assert.Contains("MessagesListView.Loaded += OnMessagesListViewLoaded;", eventsSource, StringComparison.Ordinal);
     }
 

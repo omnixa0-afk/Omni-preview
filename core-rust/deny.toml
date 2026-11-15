@@ -1,0 +1,75 @@
+# Dependency gate for the Rust core: docs/decisions/dependency-gate.md.
+# Run by scripts/check-dependencies.ps1 (cargo-deny, pinned version there): the release fails on what
+# is an error here, the daily test-core run only reports it.
+
+[graph]
+# The platforms the core ships on, now and next: a crate only another platform pulls in is not ours.
+targets = ["x86_64-pc-windows-msvc", "aarch64-linux-android"]
+
+[advisories]
+# A known vulnerability is always an error. A yanked version too.
+yanked = "deny"
+# Unmaintained and unsound crates are reported as errors here; the script turns them into warnings
+# outside the crypto and network path (its $CriticalCrates), where they stay errors.
+unmaintained = "all"
+unsound = "all"
+# Exceptions: each with the advisory id and a reason that ends with its review date,
+# "… пересмотреть до YYYY-MM-DD". Past that date the release fails again until it is decided anew.
+# Example: { id = "RUSTSEC-0000-0000", reason = "no fix yet, the code path is unused — пересмотреть до 2027-01-31" },
+ignore = [
+    # Timing side channels in constant-time arithmetic. Fixed only in 0.7, which needs elliptic-curve
+    # 0.14 under openmls and k256. Our MLS suite is X25519 / Ed25519 (the P-256/P-384 code is built,
+    # not used); k256 signs throwaway Nostr envelopes, whose keys protect nothing.
+    { id = "RUSTSEC-2026-0387", reason = "fix needs openmls/k256 on elliptic-curve 0.14; our keys never go through it — пересмотреть до 2027-01-31" },
+    # SQLite before 3.54 can return stale page-cache bytes for a crafted database with a -wal of a
+    # different page size. SQLCipher in libsqlite3-sys 0.39 still bundles an affected SQLite, so an
+    # update does not close it. Omni opens only files it wrote, and a backup's database decrypted
+    # with that backup's key.
+    { id = "RUSTSEC-2026-0459", reason = "no SQLCipher build with SQLite 3.54 yet; only files Omni wrote are opened — пересмотреть до 2027-01-31" },
+]
+
+[licenses]
+# Licenses that can go into an AGPL-3.0 program. Anything else fails until it is looked at.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+    "GPL-3.0-or-later",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+]
+confidence-threshold = 0.9
+# The list is what may come in, not what is in now: a license on it no crate uses is fine.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# Our own crates are not published (publish = false): the repository's LICENSE covers them.
+ignore = true
+
+[bans]
+# Two versions of one crate are common in a tree this size: reported, not denied.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Crates come from crates.io only. A git dependency is added here by name, on purpose.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

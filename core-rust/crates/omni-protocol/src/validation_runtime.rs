@@ -1,5 +1,8 @@
 use base64::Engine as _;
 use omni_types::{
+    MessageDeleteV1,
+    MessagePinV1,
+    ReactionV1,
     ChatTextV1, ContactPresencePingV1, ContactPresencePongV1, ContactPresenceV1, DeliveryReceiptV1,
     EncryptedPayloadV1, LogicalEventEnvelopeV1, OmniError, OmniResult, PauseAutoReconnectV1,
     PublicProfileAvatarSyncV1, PublicProfileDescriptorSyncV1, RelaySetUpdateV1, RouteHintsSyncV1,
@@ -185,7 +188,7 @@ pub fn validate_session_bootstrap_message_v1(
 }
 
 pub fn validate_chat_text_v1(message: &ChatTextV1) -> OmniResult<()> {
-    validate_non_empty_field("chat text message_id", &message.message_id)?;
+    crate::validation_identity::validate_message_id("chat text message_id", &message.message_id)?;
     validate_non_empty_field("chat text body", &message.body)?;
     validate_max_utf8_len(
         "chat text message_id",
@@ -193,6 +196,40 @@ pub fn validate_chat_text_v1(message: &ChatTextV1) -> OmniResult<()> {
         CHAT_MESSAGE_ID_MAX_BYTES,
     )?;
     validate_max_utf8_len("chat text body", &message.body, CHAT_BODY_MAX_BYTES)?;
+    if let Some(reply_to) = &message.reply_to {
+        validate_max_utf8_len("chat text reply_to", reply_to, CHAT_MESSAGE_ID_MAX_BYTES)?;
+    }
+    Ok(())
+}
+
+/// An emoji with its modifiers takes a few dozen bytes at most; empty takes a reaction away.
+pub const REACTION_EMOJI_MAX_BYTES: usize = 64;
+
+pub fn validate_message_delete_v1(event: &MessageDeleteV1) -> OmniResult<()> {
+    validate_non_empty_field("deleted message_id", &event.message_id)?;
+    validate_max_utf8_len("deleted message_id", &event.message_id, CHAT_MESSAGE_ID_MAX_BYTES)?;
+    if event.at_unix_ms <= 0 {
+        return Err(OmniError::InvalidInput("deletion at_unix_ms must be positive".into()));
+    }
+    Ok(())
+}
+
+pub fn validate_message_pin_v1(event: &MessagePinV1) -> OmniResult<()> {
+    validate_non_empty_field("pinned message_id", &event.message_id)?;
+    validate_max_utf8_len("pinned message_id", &event.message_id, CHAT_MESSAGE_ID_MAX_BYTES)?;
+    if event.at_unix_ms <= 0 {
+        return Err(OmniError::InvalidInput("pin at_unix_ms must be positive".into()));
+    }
+    Ok(())
+}
+
+pub fn validate_reaction_v1(reaction: &ReactionV1) -> OmniResult<()> {
+    validate_non_empty_field("reaction message_id", &reaction.message_id)?;
+    validate_max_utf8_len("reaction message_id", &reaction.message_id, CHAT_MESSAGE_ID_MAX_BYTES)?;
+    validate_max_utf8_len("reaction emoji", &reaction.emoji, REACTION_EMOJI_MAX_BYTES)?;
+    if reaction.at_unix_ms <= 0 {
+        return Err(OmniError::InvalidInput("reaction at_unix_ms must be positive".into()));
+    }
     Ok(())
 }
 
@@ -222,6 +259,11 @@ pub fn validate_encrypted_payload_v1(payload: &EncryptedPayloadV1) -> OmniResult
     if payload.mac_hex.trim().len() != 32 {
         return Err(OmniError::InvalidInput(
             "encrypted payload mac_hex must encode 16 bytes".to_string(),
+        ));
+    }
+    if payload.header_mac_hex.as_deref().is_some_and(|mac| mac.trim().len() != 64) {
+        return Err(OmniError::InvalidInput(
+            "encrypted payload header_mac_hex must encode 32 bytes".to_string(),
         ));
     }
     Ok(())
@@ -561,11 +603,15 @@ pub fn validate_logical_event_envelope_v1(event: &LogicalEventEnvelopeV1) -> Omn
                 return validate_max_utf8_len("sent transcript body", &transcript.body, CHAT_BODY_MAX_BYTES);
             }
             validate_chat_text_v1(&omni_types::ChatTextV1 {
+                reply_to: None,
                 message_id: transcript.message_id.clone(),
                 body: transcript.body.clone(),
                 created_at_unix_ms: transcript.created_at_unix_ms,
             })
         }
+        omni_types::LogicalEventPayloadV1::Reaction(reaction) => validate_reaction_v1(reaction),
+        omni_types::LogicalEventPayloadV1::MessageDelete(event) => validate_message_delete_v1(event),
+        omni_types::LogicalEventPayloadV1::MessagePin(event) => validate_message_pin_v1(event),
         omni_types::LogicalEventPayloadV1::RemoteAccessGrant(grant) => {
             if grant.sent_at_unix_ms <= 0 {
                 return Err(OmniError::InvalidInput("remote access grant sent_at_unix_ms must be positive".into()));
@@ -725,6 +771,16 @@ pub fn validate_history_sync_message_v1(message: &omni_types::HistorySyncMessage
                 || buckets_hex.iter().any(|bucket| bucket.len() != 32 || !bucket.bytes().all(|byte| byte.is_ascii_hexdigit()))
             {
                 return Err(OmniError::InvalidInput("history buckets must be 256 fingerprints of 16 bytes".to_string()));
+            }
+            Ok(())
+        }
+        omni_types::HistorySyncMessageV1::Deleted { message_ids } => {
+            if message_ids.is_empty() || message_ids.len() > HISTORY_SYNC_MAX_LINES {
+                return Err(OmniError::InvalidInput("history deletions must name between 1 and 1024 lines".to_string()));
+            }
+            for id in message_ids {
+                validate_non_empty_field("deleted line id", id)?;
+                validate_max_utf8_len("deleted line id", id, CHAT_MESSAGE_ID_MAX_BYTES)?;
             }
             Ok(())
         }

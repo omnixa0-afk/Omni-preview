@@ -3,7 +3,7 @@ namespace Omni.Windows.App.Core;
 /// <summary>
 /// Removes what earlier versions of the one-file build left in the .NET extraction folder.
 ///
-/// The standalone build unpacks its native libraries to <c>%TEMP%\.net\Omni.Windows.App\&lt;hash&gt;\</c>
+/// The standalone build unpacks its native libraries to <c>%TEMP%\.net\Omni\&lt;hash&gt;\</c>
 /// on first launch, one folder per build, and .NET never removes the folders of older builds: every
 /// update left ~68 MB on the system drive. Found 2026-10-10 with 163 such folders, 11 GB, on a disk that
 /// had run out of space.

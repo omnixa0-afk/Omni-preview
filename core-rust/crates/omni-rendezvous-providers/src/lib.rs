@@ -11,6 +11,7 @@
 //! host (R7, N-of-many). BT-DHT (more decentralised still) follows.
 
 mod nostr;
+mod nostr_link;
 pub use nostr::NostrChannel;
 
 mod btdht;
@@ -32,6 +33,8 @@ const ALLOWANCE_RESERVE: u32 = 50;
 pub struct NtfyChannel {
     base_url: String,
     agent: ureq::Agent,
+    /// Connect only to public addresses, follow no redirect — a courier someone else named (V-13).
+    public_only: bool,
     /// Messages left to publish today, as the broker last said (and counted down since), and when it
     /// said it. `None` — not asked yet, or the broker does not say (a self-hosted one without limits).
     allowance: Mutex<Option<(u32, Instant)>>,
@@ -52,11 +55,21 @@ impl NtfyChannel {
     /// Point at a specific broker base URL (self-hosted ntfy, or another instance — user-addable,
     /// like all providers).
     pub fn with_base(base_url: impl Into<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(8))
-            .timeout_read(Duration::from_secs(8))
-            .build();
-        Self { base_url: base_url.into(), agent, allowance: Mutex::new(None) }
+        Self {
+            base_url: base_url.into(),
+            agent: agent(Duration::from_secs(8), false),
+            public_only: false,
+            allowance: Mutex::new(None),
+        }
+    }
+
+    /// The same broker, reached only at public addresses (checked on every resolve, so a name
+    /// that later resolves into the LAN is refused too) and without redirects: for a courier a
+    /// contact named, which must not make us reach into our own network (V-13).
+    pub fn public_only(mut self) -> Self {
+        self.agent = agent(Duration::from_secs(8), true);
+        self.public_only = true;
+        self
     }
 
     /// Messages left to publish, asking the broker when the last answer is older than
@@ -146,14 +159,17 @@ impl RendezvousChannel for NtfyChannel {
         // `poll=1` returns the cached messages then closes; `since=all` includes the (short-lived)
         // history. The response is newline-delimited JSON, one object per message.
         let url = format!("{}/{}/json?poll=1&since=all", self.base_url, topic.id());
-        let body = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|e| channel_error("ntfy fetch", e))?
-            .into_string()
+        use std::io::Read;
+        let response = self.agent.get(&url).call().map_err(|e| channel_error("ntfy fetch", e))?;
+        let mut body = String::new();
+        let read = response
+            .into_reader()
+            .take(NTFY_MAX_BODY as u64 + 1)
+            .read_to_string(&mut body)
             .map_err(|e| ChannelError(format!("ntfy body: {e}")))?;
-
+        if read > NTFY_MAX_BODY {
+            return Err(ChannelError(format!("ntfy body over {NTFY_MAX_BODY} bytes")));
+        }
         Ok(body.lines().filter_map(ntfy_message_blob).collect())
     }
 
@@ -165,16 +181,14 @@ impl RendezvousChannel for NtfyChannel {
     /// per event (`open`, a `keepalive` every ~45 s, `message`). Free on the server side — the quota
     /// counts publishes, not subscribers.
     fn watch(&self, topics: &[Topic], wait: Duration) -> Result<Vec<Vec<u8>>, ChannelError> {
-        use std::io::BufRead;
+        use std::io::{BufRead, Read};
         let ids: Vec<String> = topics.iter().map(Topic::id).collect();
         let url = format!("{}/{}/json", self.base_url, ids.join(","));
         let started = std::time::Instant::now();
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(8))
-            .timeout_read(wait)
-            .build();
-        let response = agent.get(&url).call().map_err(|e| channel_error("ntfy watch", e))?;
-        for line in std::io::BufReader::new(response.into_reader()).lines() {
+        let response = agent(wait, self.public_only).get(&url).call().map_err(|e| channel_error("ntfy watch", e))?;
+        // Bounded as a whole: keepalives are tiny, the first message ends the wait (V-12).
+        let body = response.into_reader().take(NTFY_MAX_BODY as u64);
+        for line in std::io::BufReader::new(body).lines() {
             // A read timeout ends the wait like a deadline does: nothing arrived.
             let Ok(line) = line else { break };
             if let Some(blob) = ntfy_message_blob(&line) {
@@ -187,6 +201,34 @@ impl RendezvousChannel for NtfyChannel {
         Ok(Vec::new())
     }
 }
+
+/// An HTTP agent; `public_only` — resolve to public addresses only and follow no redirect (V-13).
+fn agent(read_timeout: Duration, public_only: bool) -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(8)).timeout_read(read_timeout);
+    if public_only {
+        builder.redirects(0).resolver(|netloc: &str| resolve_public(netloc)).build()
+    } else {
+        builder.build()
+    }
+}
+
+/// `host:port` → its public addresses; none is an error (the name leads only into a local network).
+pub(crate) fn resolve_public(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let public: Vec<std::net::SocketAddr> =
+        netloc.to_socket_addrs()?.filter(|addr| omni_rendezvous::is_public_ip(addr.ip())).collect();
+    if public.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{netloc} has no public address"),
+        ));
+    }
+    Ok(public)
+}
+
+/// The most a single ntfy read takes from the broker (V-12). ntfy caps a message at 4 KiB and
+/// keeps its cache for hours, so a topic's poll is a few hundred KiB at most.
+const NTFY_MAX_BODY: usize = 2 * 1024 * 1024;
 
 /// The blob of one ntfy JSON event line, if it is a `message` carrying one (ntfy also emits
 /// `open`/`keepalive` events).
@@ -226,6 +268,36 @@ mod tests {
     use super::*;
     use omni_rendezvous::{collect_beacons, publish_beacon, Beacon, NatType};
 
+    /// V-13: a courier a contact named never connects into our own network or host — not by its
+    /// URL, and not by a name that resolves there. A courier of our own still may (a broker on the LAN).
+    #[test]
+    fn a_public_only_courier_does_not_connect_to_a_local_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let topic = Topic::from_hex(&"ab".repeat(32)).unwrap();
+        for base in [format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}")] {
+            assert!(NtfyChannel::with_base(base.clone()).public_only().fetch(&topic, None).is_err(), "{base}");
+            assert!(listener.accept().is_err(), "{base}: nothing reached the local server");
+        }
+        let nostr = crate::NostrChannel::with_relay(format!("ws://localhost:{port}")).public_only();
+        assert!(nostr.fetch(&topic, None).is_err());
+        assert!(listener.accept().is_err(), "nostr: nothing reached the local server");
+
+        // Our own courier at the same address does connect.
+        let own = std::thread::spawn(move || NtfyChannel::with_base(format!("http://127.0.0.1:{port}")).fetch(&topic, None));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reached = loop {
+            match listener.accept() {
+                Ok(_) => break true, // dropping the connection ends the fetch
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break false,
+            }
+        };
+        assert!(reached, "an own courier on loopback is reached");
+        let _ = own.join();
+    }
+
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -258,6 +330,7 @@ mod tests {
             node: [0u8; 20],
             reflexive: vec!["203.0.113.7:51820".into()],
             tcp_direct: vec![],
+            tcp_punch: None,
             nat_type: NatType::Symmetric,
             relay_bundle: None,
             revoked_through_ms: None,

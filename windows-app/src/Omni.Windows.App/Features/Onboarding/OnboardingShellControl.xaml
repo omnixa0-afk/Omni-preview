@@ -25,16 +25,11 @@
             <Setter Target="OnboardingFormPanel.(Grid.ColumnSpan)" Value="1" />
             <Setter Target="OnboardingLayoutGrid.Padding" Value="68" />
             <Setter Target="OnboardingLayoutGrid.ColumnSpacing" Value="112" />
+            <Setter Target="OnboardingFormCard.Width" Value="560" />
             <Setter Target="OnboardingLayoutGrid.RowSpacing" Value="24" />
             <Setter Target="OnboardingHeroColumn.Width" Value="78*" />
             <Setter Target="OnboardingFormColumn.Width" Value="122*" />
             <Setter Target="WelcomeActionsPanel.Orientation" Value="Vertical" />
-            <Setter Target="RestoreAccountButton.(Grid.Row)" Value="0" />
-            <Setter Target="RestoreAccountButton.(Grid.Column)" Value="0" />
-            <Setter Target="RestoreAccountButton.(Grid.ColumnSpan)" Value="1" />
-            <Setter Target="ImportAccountButton.(Grid.Row)" Value="0" />
-            <Setter Target="ImportAccountButton.(Grid.Column)" Value="1" />
-            <Setter Target="ImportAccountButton.(Grid.ColumnSpan)" Value="1" />
             <Setter Target="RetryBootButton.HorizontalAlignment" Value="Right" />
             <Setter Target="BootRecoveryActionsPanel.Orientation" Value="Horizontal" />
             <Setter Target="ProfileChooserPrimaryActionsPanel.Orientation" Value="Horizontal" />
@@ -58,16 +53,11 @@
             <Setter Target="OnboardingFormPanel.(Grid.ColumnSpan)" Value="1" />
             <Setter Target="OnboardingLayoutGrid.Padding" Value="40" />
             <Setter Target="OnboardingLayoutGrid.ColumnSpacing" Value="56" />
+            <Setter Target="OnboardingFormCard.Width" Value="480" />
             <Setter Target="OnboardingLayoutGrid.RowSpacing" Value="24" />
             <Setter Target="OnboardingHeroColumn.Width" Value="72*" />
             <Setter Target="OnboardingFormColumn.Width" Value="128*" />
             <Setter Target="WelcomeActionsPanel.Orientation" Value="Vertical" />
-            <Setter Target="RestoreAccountButton.(Grid.Row)" Value="0" />
-            <Setter Target="RestoreAccountButton.(Grid.Column)" Value="0" />
-            <Setter Target="RestoreAccountButton.(Grid.ColumnSpan)" Value="1" />
-            <Setter Target="ImportAccountButton.(Grid.Row)" Value="0" />
-            <Setter Target="ImportAccountButton.(Grid.Column)" Value="1" />
-            <Setter Target="ImportAccountButton.(Grid.ColumnSpan)" Value="1" />
             <Setter Target="RetryBootButton.HorizontalAlignment" Value="Right" />
             <Setter Target="BootRecoveryActionsPanel.Orientation" Value="Horizontal" />
             <Setter Target="ProfileChooserPrimaryActionsPanel.Orientation" Value="Horizontal" />
@@ -169,7 +159,9 @@
         Grid.ColumnSpan="2"
         VerticalAlignment="Center"
         VerticalScrollBarVisibility="Auto">
+        <!-- One width on every step, so the card does not jump between them. -->
         <Border
+          x:Name="OnboardingFormCard"
           MaxWidth="860"
           Padding="56"
           HorizontalAlignment="Center"
@@ -267,7 +259,7 @@
                     Grid.Row="0"
                     Grid.Column="0"
                     Grid.ColumnSpan="2"
-                    MinHeight="64"
+                    MinHeight="48"
                     HorizontalAlignment="Stretch"
                     FontWeight="SemiBold"
                     Content="У меня есть фраза восстановления" />
@@ -276,7 +268,7 @@
                     Grid.Row="1"
                     Grid.Column="0"
                     Grid.ColumnSpan="2"
-                    MinHeight="64"
+                    MinHeight="48"
                     HorizontalAlignment="Stretch"
                     FontWeight="SemiBold"
                     Content="Восстановить из резервной копии" />
@@ -413,14 +405,14 @@
               Visibility="Collapsed"
               Spacing="16">
               <StackPanel Spacing="8">
-                <TextBlock Text="Ваше имя" />
                 <TextBox
+                  Header="Ваше имя"
                   x:Name="CreateDisplayNameTextBox" MaxLength="64"
                   PlaceholderText="Например, Алексей" />
               </StackPanel>
               <StackPanel Spacing="8">
-                <TextBlock Text="Название устройства" />
                 <TextBox
+                  Header="Название устройства"
                   x:Name="CreateDeviceLabelTextBox" MaxLength="64"
                   PlaceholderText="Например, Домашний ноутбук" />
               </StackPanel>
@@ -430,7 +422,8 @@
                 <Button
                   x:Name="CreateAccountExecuteButton"
                   AutomationProperties.AutomationId="CreateAccountExecuteButton"
-                  Content="Создать" />
+                  Content="Создать"
+                  Style="{StaticResource AccentPrimaryButtonStyle}" />
                 <Button
                   x:Name="BackToWelcomeFromCreateButton"
                   Content="Назад" />
@@ -461,8 +454,8 @@
                 </StackPanel>
               </Border>
               <StackPanel Spacing="8">
-                <TextBlock Text="Фраза восстановления" />
                 <TextBox
+                  Header="Фраза восстановления"
                   x:Name="ImportAccountMnemonicTextBox"
                   AcceptsReturn="True"
                   MinHeight="88"
@@ -477,7 +470,8 @@
                   Content="Выбрать файл копии…" />
                 <Button
                   x:Name="ImportAccountExecuteButton"
-                  Content="Восстановить" />
+                  Content="Восстановить"
+                  Style="{StaticResource AccentPrimaryButtonStyle}" />
               </StackPanel>
               <Button
                 x:Name="BackToWelcomeFromImportButton"
@@ -501,18 +495,16 @@
                 Background="{ThemeResource OmniBgElevatedBrush}"
                 CornerRadius="12">
                 <StackPanel Spacing="6">
-                  <TextBlock
-                    FontWeight="SemiBold"
-                    Text="Профиль" />
                   <TextBlock x:Name="RecoveryDisplayNameTextBlock" />
-                  <TextBlock x:Name="RecoveryAccountIdTextBlock" />
+                  <TextBlock x:Name="RecoveryAccountIdTextBlock" Visibility="Collapsed" />
                 </StackPanel>
               </Border>
               <StackPanel Spacing="8">
-                <TextBlock Text="Фраза восстановления" />
                 <TextBox
+                  Header="Фраза восстановления"
                   x:Name="RecoveryPhraseTextBox"
-                  IsReadOnly="True" />
+                  IsReadOnly="True"
+                  TextWrapping="Wrap" />
               </StackPanel>
               <Expander Header="Технические данные для сохранения">
                 <StackPanel Spacing="8">
@@ -541,7 +533,8 @@
                 <Button
                   x:Name="RecoveryContinueButton"
                   AutomationProperties.AutomationId="RecoveryContinueButton"
-                  Content="Фраза сохранена — продолжить" />
+                  Content="Фраза сохранена — продолжить"
+                  Style="{StaticResource AccentPrimaryButtonStyle}" />
               </StackPanel>
             </StackPanel>
 
@@ -553,20 +546,20 @@
                 Text="24 английских слова, которые вы сохранили при создании профиля."
                 TextWrapping="WrapWholeWords" />
               <StackPanel Spacing="8">
-                <TextBlock Text="Ваше имя" />
                 <TextBox
+                  Header="Ваше имя"
                   x:Name="RestoreDisplayNameTextBox" MaxLength="64"
                   PlaceholderText="Например, Алексей" />
               </StackPanel>
               <StackPanel Spacing="8">
-                <TextBlock Text="Фраза восстановления" />
                 <TextBox
+                  Header="Фраза восстановления"
                   x:Name="RestoreRecoveryPhraseTextBox"
                   PlaceholderText="Введите фразу восстановления" />
               </StackPanel>
               <StackPanel Spacing="8">
-                <TextBlock Text="Название устройства" />
                 <TextBox
+                  Header="Название устройства"
                   x:Name="RestoreDeviceLabelTextBox" MaxLength="64"
                   PlaceholderText="Например, Рабочий ПК" />
               </StackPanel>
@@ -575,7 +568,8 @@
                 Spacing="12">
                 <Button
                   x:Name="RestoreAccountExecuteButton"
-                  Content="Восстановить" />
+                  Content="Восстановить"
+                  Style="{StaticResource AccentPrimaryButtonStyle}" />
                 <Button
                   x:Name="BackToWelcomeFromRestoreButton"
                   Content="Назад" />

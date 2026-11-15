@@ -9,6 +9,8 @@ use omni_types::{
     ListMessagesRequest, OmniError, OmniResult, SendAttachmentRequest, SendTextRequest,
 };
 
+#[cfg(feature = "dev-tools")]
+mod core_heap;
 mod ffi_support;
 mod requests_account_contacts;
 mod requests_calls;
@@ -17,6 +19,7 @@ mod requests_daemon;
 mod requests_discoverability;
 mod requests_groups;
 mod requests_transport;
+mod requests_workspace;
 
 pub(crate) use ffi_support::*;
 pub(crate) use requests_account_contacts::*;
@@ -26,13 +29,18 @@ pub(crate) use requests_daemon::*;
 pub(crate) use requests_discoverability::*;
 pub(crate) use requests_groups::*;
 pub(crate) use requests_transport::*;
+pub(crate) use requests_workspace::*;
 
 #[no_mangle]
 pub extern "C" fn omni_app_init(config_json: *const c_char) -> *mut OmniAppHandle {
     match catch_unwind(AssertUnwindSafe(|| init_impl(config_json))) {
         Ok(Ok(handle)) => {
             set_last_init_error(None);
-            Box::into_raw(Box::new(handle))
+            let raw = Box::into_raw(Box::new(handle));
+            // SAFETY: just made; nothing else has it yet.
+            register_media_app(unsafe { (*raw).media_app_id }, raw);
+            register_live_handle(raw);
+            raw
         }
         Ok(Err(error)) => {
             // Причину НЕЛЬЗЯ ронять в `_`. Раньше именно так и было, и оболочке оставалось написать
@@ -171,9 +179,24 @@ pub extern "C" fn omni_app_free(handle: *mut OmniAppHandle) {
     }
 
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        // No new call takes it from here on; a second free of it does nothing.
+        let Some(serializer) = retire_live_handle(handle) else {
+            return;
+        };
         // The embedded daemon lets go first (waiting for a dispatch in flight).
         requests_daemon::release_daemon_handle(handle);
-        drop(Box::from_raw(handle));
+        // So does the media send path: a packet in flight finishes, later ones find no app
+        // (code audit 2026-11-09, OMNI-01).
+        release_media_app((*handle).media_app_id);
+        // Then the call in flight finishes: it holds the app's lock (blind audit 2026-11-10). Taken
+        // after the daemon let go — a dispatch holds the daemon's lock, then this one.
+        let in_flight = serializer.lock();
+        // The core is dropped in place; the handle's memory is kept, never given back. Given back,
+        // the next core could be born at the same address, and a stale copy the shell still held
+        // would pass as live and act on it — or free it (blind audit 2026-11-11, G6). One small
+        // allocation per core opened, a few per process.
+        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*handle).inner));
+        drop(in_flight);
     }));
 }
 
@@ -270,6 +293,8 @@ include!("ffi_exports_realtime_media.rs");
 include!("ffi_exports_mesh.rs");
 
 include!("ffi_exports_groups.rs");
+
+include!("ffi_exports_workspace.rs");
 
 include!("ffi_exports_screen_control.rs");
 

@@ -829,19 +829,12 @@ impl Storage {
         &self,
         profile_id: &LocalProfileId,
     ) -> OmniResult<()> {
+        // Inside a transaction (deleting a profile), only once it commits.
         for profile_dir in [
             self.profile_media_profile_dir(profile_id)?,
             self.legacy_profile_media_profile_dir(profile_id)?,
         ] {
-            if !profile_dir.exists() {
-                continue;
-            }
-            fs::remove_dir_all(&profile_dir).map_err(|error| {
-                OmniError::Storage(format!(
-                    "failed to delete profile media directory '{}': {error}",
-                    profile_dir.display()
-                ))
-            })?;
+            self.remove_after_commit(AfterCommit::Folder(profile_dir))?;
         }
         Ok(())
     }

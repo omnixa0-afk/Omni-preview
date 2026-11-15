@@ -49,9 +49,9 @@ fn helper_binary_path(stem: &str) -> OmniResult<std::path::PathBuf> {
 ///     extract one: "one file" must stay literally one file). Its startup intercepts the flag and
 ///     re-enters the same courier code through the FFI (`omni_run_helper`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HelperLaunch {
-    program: std::path::PathBuf,
-    prefix_args: Vec<String>,
+pub(crate) struct HelperLaunch {
+    pub(crate) program: std::path::PathBuf,
+    pub(crate) prefix_args: Vec<String>,
 }
 
 impl HelperLaunch {
@@ -69,9 +69,9 @@ impl HelperLaunch {
 /// a dev multi-file build behaves exactly as before with this set.
 const HELPER_SELF_EXEC_ENV: &str = "OMNI_HELPER_SELF_EXEC";
 
-/// Resolve how to launch helper `kind` ("rendezvous" | "dht"): sibling binary first, self-exec as
-/// the fallback when the host opted in.
-fn helper_launch(kind: &str) -> OmniResult<HelperLaunch> {
+/// Resolve how to launch helper `kind` ("rendezvous" | "dht" | "git"): sibling binary first, self-exec
+/// as the fallback when the host opted in.
+pub(crate) fn helper_launch(kind: &str) -> OmniResult<HelperLaunch> {
     let sibling = helper_binary_path(&format!("omni-{kind}-helper"));
     let sibling_error = match sibling {
         Ok(path) => return Ok(HelperLaunch::binary(path)),
@@ -107,7 +107,6 @@ fn spawn_listener_child(
     listening_prefix: &str,
     what: &str,
 ) -> OmniResult<(std::process::Child, String, Vec<String>)> {
-    use std::io::BufRead;
     let mut command = std::process::Command::new(&launch.program);
     command
         .args(&launch.prefix_args)
@@ -119,6 +118,11 @@ fn spawn_listener_child(
     for (key, value) in envs {
         command.env(key, value);
     }
+    // Who may talk to the helper: only those holding this process's token (V-21).
+    command.env(
+        omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV,
+        omni_rendezvous::helper_ipc::process_helper_token(),
+    );
     // Never flash a console window (the helpers also FreeConsole defensively).
     #[cfg(windows)]
     {
@@ -140,16 +144,16 @@ fn spawn_listener_child(
         .take()
         .ok_or_else(|| OmniError::Internal(format!("{what} stderr not captured")))?;
     let mut reader = std::io::BufReader::new(stderr);
-    let mut line = String::new();
     // Pre-listen lines (e.g. the DHT helper's "UPnP public endpoint …") are handed back so the caller
     // can parse them; the loop ends at the listening line.
     let mut preamble: Vec<String> = Vec::new();
     loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|error| OmniError::Internal(format!("read {what} stderr: {error}")))?;
-        if read == 0 {
+        let line = omni_rendezvous::helper_ipc::read_line_capped(
+            &mut reader,
+            omni_rendezvous::helper_ipc::HELPER_BANNER_LINE_MAX,
+        )
+        .map_err(|error| OmniError::Internal(format!("read {what} stderr: {error}")))?;
+        if line.is_empty() {
             let _ = child.kill();
             return Err(OmniError::Internal(format!(
                 "{what} exited before it bound a port"
@@ -167,11 +171,14 @@ fn spawn_listener_child(
             )));
         }
         let trimmed = line.trim();
-        if !trimmed.is_empty() {
+        if !trimmed.is_empty() && preamble.len() < HELPER_PREAMBLE_MAX_LINES {
             preamble.push(trimmed.to_string());
         }
     }
 }
+
+/// How many pre-listen stderr lines of a helper are kept (a few are real; V-12).
+const HELPER_PREAMBLE_MAX_LINES: usize = 64;
 
 /// A spawned `omni-rendezvous-helper` child + a line-IPC client to drive it. The helper
 /// binds an ephemeral loopback port; we read the resolved address from its stderr.
@@ -220,9 +227,12 @@ fn courier_statuses(attribution: &str, now_ms: u64) -> Vec<(String, CourierStatu
             };
             let result = result.split('+').next().unwrap_or(result);
             let state = match result {
-                "ok" | "empty" => "ok",
+                // `again`: a subscription handed a copy of a beacon already seen — it works.
+                "ok" | "empty" | "again" => "ok",
                 "quota" => "quota",
                 "skip" => "cooling",
+                // The round stopped waiting for it: how it ends is not known here, its status stays.
+                "late" => return None,
                 _ => "fail",
             };
             Some((label.to_string(), CourierStatus { state: state.to_string(), detail, at_unix_ms: now_ms }))
@@ -560,6 +570,14 @@ impl RendezvousHelper {
         }
     }
 
+    /// What every courier did since the helper started (`stats` in the helper): one line, logged
+    /// as is under `rendezvous/stats` — the measure of what rendezvous costs the providers.
+    pub fn trace_stats(&self) {
+        if let Ok(reply) = self.command("stats") {
+            omni_app_trace_log("rendezvous/stats", reply.trim_start_matches("OK ").trim());
+        }
+    }
+
     /// One request line → one reply line, over a fresh loopback connection. Bounded by a
     /// read/write timeout so a stuck helper can't wedge a caller.
     fn command(&self, line: &str) -> OmniResult<String> {
@@ -567,18 +585,22 @@ impl RendezvousHelper {
     }
 
     fn command_within(&self, line: &str, timeout: std::time::Duration) -> OmniResult<String> {
-        use std::io::{BufRead, Write};
         let mut stream = std::net::TcpStream::connect(&self.endpoint)
             .map_err(|error| OmniError::Transport(format!("connect helper: {error}")))?;
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
-        writeln!(stream, "{line}")
-            .map_err(|error| OmniError::Transport(format!("write helper: {error}")))?;
+        omni_rendezvous::helper_ipc::write_request(
+            &mut stream,
+            omni_rendezvous::helper_ipc::process_helper_token(),
+            line,
+        )
+        .map_err(|error| OmniError::Transport(format!("write helper: {error}")))?;
         let mut reader = std::io::BufReader::new(stream);
-        let mut reply = String::new();
-        reader
-            .read_line(&mut reply)
-            .map_err(|error| OmniError::Transport(format!("read helper: {error}")))?;
+        let reply = omni_rendezvous::helper_ipc::read_line_capped(
+            &mut reader,
+            omni_rendezvous::helper_ipc::HELPER_REPLY_MAX,
+        )
+        .map_err(|error| OmniError::Transport(format!("read helper: {error}")))?;
         let reply = reply.trim().to_string();
         if let (_, Some(attribution)) = split_courier_attribution(&reply) {
             let mut status = self.courier_status.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -755,14 +777,16 @@ fn dht_helper_request_timeout(
     line: &str,
     timeout: std::time::Duration,
 ) -> Option<String> {
-    use std::io::{BufRead, Write};
     let mut stream = std::net::TcpStream::connect(endpoint).ok()?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
-    writeln!(stream, "{line}").ok()?;
-    let _ = stream.flush();
-    let mut reply = String::new();
-    std::io::BufReader::new(stream).read_line(&mut reply).ok()?;
+    omni_rendezvous::helper_ipc::write_request(&mut stream, omni_rendezvous::helper_ipc::process_helper_token(), line)
+        .ok()?;
+    let reply = omni_rendezvous::helper_ipc::read_line_capped(
+        &mut std::io::BufReader::new(stream),
+        omni_rendezvous::helper_ipc::HELPER_REPLY_MAX,
+    )
+    .ok()?;
     Some(reply.trim().to_string())
 }
 
@@ -835,6 +859,10 @@ static DHT_PROXY_SERVE_LOG: std::sync::OnceLock<Mutex<HashMap<String, Vec<u64>>>
 pub(crate) fn dht_proxy_admit_origin(origin: &str, now_ms: u64) -> bool {
     let log = DHT_PROXY_SERVE_LOG.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = log.lock().unwrap_or_else(|p| p.into_inner());
+    dht_proxy_admit_origin_in(&mut map, origin, now_ms)
+}
+
+fn dht_proxy_admit_origin_in(map: &mut HashMap<String, Vec<u64>>, origin: &str, now_ms: u64) -> bool {
     let window_start = now_ms.saturating_sub(DHT_PROXY_WINDOW_MS);
     // Lazy global GC only when the map grows large (keeps the common path O(1) on one origin's window).
     if map.len() > 4096 {
@@ -842,6 +870,12 @@ pub(crate) fn dht_proxy_admit_origin(origin: &str, now_ms: u64) -> bool {
             hits.retain(|&t| t >= window_start);
             !hits.is_empty()
         });
+        // Still that many, all within the window: an origin we have no record of is not served —
+        // the log grew with every new origin for as long as the others kept asking (blind audit
+        // 2026-11-11, pass 13).
+        if map.len() > 4096 && !map.contains_key(origin) {
+            return false;
+        }
     }
     let hits = map.entry(origin.to_string()).or_default();
     hits.retain(|&t| t >= window_start);
@@ -1252,6 +1286,7 @@ fn build_self_beacon(
         // (`rendezvous_dial_with`) overwrites this with our UPnP-mapped
         // bridge endpoint from `MeshRuntime::direct_tcp_endpoint`. See tcp-direct-peer-fallback.md.
         tcp_direct: Vec::new(),
+        tcp_punch: None,
         nat_type,
         // R1c increment 3b: attach my current signed `om3relay:` bundle (the relays I flagged `shared`)
         // so an approved friend's mesh auto-learns my — possibly rotated — relay set on the next sweep.
@@ -1277,20 +1312,20 @@ const BEACON_TTL_SECS: u32 = (omni_rendezvous::TOPIC_WINDOW_SECS + 60 * 60) as u
 /// known pair secret. Returns `(topic_id_hex, dhtkey_hex, sealed_wire)` triples to hand the helper —
 /// the helper only ever sees opaque blobs under opaque topics + the per-bucket BT-DHT seed (NOT the
 /// raw pair secret). Pure (no storage).
+#[cfg(test)]
 fn seal_beacon_under_secret(secret: &[u8; 32], beacon: &Beacon) -> Vec<(String, String, Vec<u8>)> {
-    seal_beacon_for_topics(secret, beacon, rendezvous_topics_with_keys(secret, current_unix_ms() as u64))
+    seal_beacon_for_topics(secret, beacon, rendezvous_topics_with_keys(secret, current_unix_ms() as u64), &InviteSeal::None)
 }
 
 fn seal_beacon_for_topics(
     secret: &[u8; 32],
     beacon: &Beacon,
     topics: Vec<(omni_rendezvous::Topic, [u8; 32])>,
+    invite: &InviteSeal,
 ) -> Vec<(String, String, Vec<u8>)> {
     topics
         .iter()
-        .map(|(topic, dht_key)| {
-            (topic.id(), hex::encode(dht_key), seal_beacon(secret, topic, beacon).to_wire())
-        })
+        .filter_map(|(topic, dht_key)| Some((topic.id(), hex::encode(dht_key), invite.seal(secret, topic, beacon)?)))
         .collect()
 }
 
@@ -1298,11 +1333,101 @@ fn seal_beacon_for_topics(
 /// any whose `node` matches `exclude_node` (used to drop my OWN echo on the shared
 /// topic). Tries the current + previous topic bucket; AEAD/TTL/replay are enforced by
 /// `open_beacon`. Pure.
+#[cfg(test)]
 fn open_beacon_under_secret(
     secret: &[u8; 32],
     blobs: &[Vec<u8>],
     exclude_nodes: &[[u8; 20]],
 ) -> Option<Beacon> {
+    open_beacon_of(secret, blobs, exclude_nodes, &InviteSeal::None)
+}
+
+/// Our side of a first-contact invite, for its topic. The topic's secret comes from the invite's nonce,
+/// and an invite given to several people seats all of them there: each importer's beacon is
+/// addressed to the inviter's reply key, so another importer can neither read its addresses nor be
+/// dialed by mistake (docs/bugs/an-invite-importer-dialed-another-importer.md). The inviter's own
+/// beacon stays sealed to the topic alone — it is for every importer. `None` everywhere else: a pair's
+/// and the account's topics are theirs alone.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InviteSeal {
+    #[default]
+    None,
+    /// We imported the invite of `inviter`: our beacon goes to its `inviter_key`, sealed with our
+    /// X25519 secret `own` (one per invite, in memory), and only its beacon is dialed.
+    Importer { inviter: [u8; 20], own: [u8; 32], inviter_key: [u8; 32] },
+    /// The invite is ours: importers' beacons open with our `reply` secret.
+    Inviter { reply: [u8; 32] },
+}
+
+/// Keys never reach a log: `Debug` says only the side.
+impl std::fmt::Debug for InviteSeal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Importer { .. } => f.write_str("Importer"),
+            Self::Inviter { .. } => f.write_str("Inviter"),
+        }
+    }
+}
+
+impl InviteSeal {
+    /// The one peer this topic is dialed for: the inviter, for its importer.
+    pub(crate) fn only(&self) -> Option<[u8; 20]> {
+        match self {
+            Self::Importer { inviter, .. } => Some(*inviter),
+            Self::None | Self::Inviter { .. } => None,
+        }
+    }
+
+    /// Our beacon for `topic`. `None` — not published — for an inviter key that agrees on nothing.
+    fn seal(&self, secret: &[u8; 32], topic: &omni_rendezvous::Topic, beacon: &Beacon) -> Option<Vec<u8>> {
+        match self {
+            Self::Importer { own, inviter_key, .. } => {
+                omni_rendezvous::seal_beacon_to(secret, topic, beacon, own, inviter_key)
+            }
+            Self::None | Self::Inviter { .. } => Some(seal_beacon(secret, topic, beacon).to_wire()),
+        }
+    }
+
+    /// Open one blob on `topic`: sealed to the topic, or addressed to us — or ours, addressed.
+    fn open(
+        &self,
+        secret: &[u8; 32],
+        topic: &omni_rendezvous::Topic,
+        blob: &[u8],
+        now_ms: u64,
+        guard: &mut ReplayGuard,
+    ) -> Result<Beacon, omni_rendezvous::RvError> {
+        let to_topic = SealedBeacon::from_wire(blob)
+            .ok_or(omni_rendezvous::RvError::Malformed)
+            .and_then(|sealed| open_beacon(secret, topic, &sealed, now_ms, guard));
+        let reader = match self {
+            Self::None => return to_topic,
+            Self::Importer { own, inviter_key, .. } => {
+                omni_rendezvous::BeaconReader::Sender { secret: own, addressee: inviter_key }
+            }
+            Self::Inviter { reply } => omni_rendezvous::BeaconReader::Addressee(reply),
+        };
+        match to_topic {
+            Err(omni_rendezvous::RvError::Forged | omni_rendezvous::RvError::Malformed) => {
+                omni_rendezvous::open_addressed_beacon(secret, topic, blob, reader, now_ms, guard)
+            }
+            opened => opened,
+        }
+    }
+}
+
+/// [`open_beacon_under_secret`] for our side of `invite`, taking only the inviter's beacon for its
+/// importer. A topic keyed by something several people hold — an invite nonce — carries the beacons
+/// of everyone who imported it, and the freshest stranger's used to win: the importer then dialed
+/// another importer it never meant to reach (docs/bugs/an-invite-importer-dialed-another-importer.md).
+fn open_beacon_of(
+    secret: &[u8; 32],
+    blobs: &[Vec<u8>],
+    exclude_nodes: &[[u8; 20]],
+    invite: &InviteSeal,
+) -> Option<Beacon> {
+    let only = invite.only();
     let now_ms = current_unix_ms() as u64;
     let topics = rendezvous_topics(secret, now_ms);
     // Anti-replay dedup scoped to THIS poll (fresh guard per call): a polling/caching courier (ntfy
@@ -1312,17 +1437,14 @@ fn open_beacon_under_secret(
     let mut guard = ReplayGuard::new();
     let mut best: Option<Beacon> = None;
     for (i, blob) in blobs.iter().enumerate() {
-        let Some(sealed) = SealedBeacon::from_wire(blob) else {
-            omni_app_trace_log("rendezvous/open", &format!("blob[{i}] from_wire=FAIL len={}", blob.len()));
-            continue;
-        };
         let mut opened = false;
         let mut last_err = String::new();
         for topic in &topics {
-            match open_beacon(secret, topic, &sealed, now_ms, &mut guard) {
+            match invite.open(secret, topic, blob, now_ms, &mut guard) {
                 Ok(beacon) => {
                     opened = true;
-                    let excluded = exclude_nodes.contains(&beacon.node);
+                    let excluded = exclude_nodes.contains(&beacon.node)
+                        || only.is_some_and(|node| node != beacon.node);
                     omni_app_trace_log(
                         "rendezvous/open",
                         &format!(
@@ -1360,6 +1482,7 @@ fn open_beacon_under_secret(
 /// Seal `beacon` for the current blinded topics and publish each via `courier`. Returns
 /// how many topics were published to. The core seals (it holds the secret); the courier
 /// carries only opaque blobs.
+#[cfg(test)]
 fn publish_beacon_via(
     courier: &dyn RendezvousCourier,
     secret: &[u8; 32],
@@ -1512,10 +1635,12 @@ fn publish_own_beacon_via(
     courier: &dyn RendezvousCourier,
     secret: &[u8; 32],
     beacon: &Beacon,
+    invite: &InviteSeal,
 ) -> OmniResult<usize> {
     let now_ms = current_unix_ms() as u64;
     let Some(log) = courier.beacon_publish_log() else {
-        return publish_beacon_via(courier, secret, beacon);
+        let sealed = seal_beacon_for_topics(secret, beacon, rendezvous_topics_with_keys(secret, now_ms), invite);
+        return publish_sealed_beacon_via(courier, secret, beacon, sealed);
     };
     let key = (*secret, beacon.node);
     let now = BeaconPublishRecord {
@@ -1555,7 +1680,7 @@ fn publish_own_beacon_via(
         courier,
         secret,
         beacon,
-        seal_beacon_for_topics(secret, beacon, topics),
+        seal_beacon_for_topics(secret, beacon, topics, invite),
         &route,
     )?;
     // Taken nowhere: the next sweep tries again.
@@ -1605,7 +1730,7 @@ fn publish_sealed_beacon_reaching(
     });
     // Observability for the unlinked-beacon fallback (R1c): how many blinded topics we sealed for and
     // how many the courier accepted. A `published=0` here = the publish leg failed (broker/helper), not
-    // a topic mismatch. See docs/notes/CONTINUE-HERE.md (R1c ntfy convergence).
+    // a topic mismatch. See docs/decisions/r1c-rotatable-white-relay.md (ntfy convergence).
     omni_app_trace_log(
         "rendezvous/publish",
         &format!("topics={topics} published={published} steps={:?} reach={} relay_bundle={}", route.steps, route.reach, beacon.relay_bundle.is_some()),
@@ -1646,8 +1771,8 @@ fn fetch_beacon_via(
 }
 
 /// Whether any of `blobs` is a valid beacon of `node` under this pair secret.
-fn beacon_of_node_among(secret: &[u8; 32], blobs: &[Vec<u8>], node: [u8; 20]) -> bool {
-    open_beacons_quietly(secret, blobs).iter().any(|beacon| beacon.node == node)
+fn beacon_of_node_among(secret: &[u8; 32], blobs: &[Vec<u8>], node: [u8; 20], invite: &InviteSeal) -> bool {
+    open_beacons_quietly(secret, blobs, invite).iter().any(|beacon| beacon.node == node)
 }
 
 /// Every blob the couriers in `legs` hold under the current and previous pair topics, and whether any
@@ -2054,12 +2179,13 @@ fn fetch_overpeer_beacon(
     leg: &dyn DhtOverPeerLeg,
     secret: &[u8; 32],
     exclude_nodes: &[[u8; 20]],
+    invite: &InviteSeal,
 ) -> Option<Beacon> {
     let mut blobs: Vec<Vec<u8>> = Vec::new();
     for (_topic, dht_key) in rendezvous_topics_with_keys(secret, current_unix_ms() as u64) {
         blobs.extend(leg.fetch(&dht_key));
     }
-    open_beacon_under_secret(secret, &blobs, exclude_nodes)
+    open_beacon_of(secret, &blobs, exclude_nodes, invite)
 }
 
 /// The fresher of two candidate beacons by `ts_ms` (either may be `None`).
@@ -2076,7 +2202,35 @@ fn freshest_beacon(a: Option<Beacon>, b: Option<Beacon>) -> Option<Beacon> {
 /// `dht_leg` (R7 2e-3) is an optional ADDITIONAL N-of-many leg that publishes/fetches the beacon
 /// through a proxy peer's DHT (mode b) — `None` in tests / when no proxy is available. The
 /// only thing this can't prove on one machine is the live cross-NAT round-trip.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn rendezvous_connect(
+    courier: &dyn RendezvousCourier,
+    dht_leg: Option<&dyn DhtOverPeerLeg>,
+    secret: &[u8; 32],
+    my_beacon: &Beacon,
+    skip_nodes: &[[u8; 20]],
+    mut dial: impl FnMut([u8; 20], Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) -> OmniResult<()>,
+    consume_peer_beacon: impl FnMut(&Beacon),
+    allow_direct: bool,
+    on_peer_nat: impl FnMut([u8; 20], NatType, bool),
+) -> OmniResult<RendezvousOutcome> {
+    rendezvous_connect_to(
+        courier,
+        dht_leg,
+        secret,
+        my_beacon,
+        skip_nodes,
+        InviteSeal::None,
+        move |node, udp, tcp, _punch| dial(node, udp, tcp),
+        consume_peer_beacon,
+        allow_direct,
+        on_peer_nat,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rendezvous_connect_to(
     courier: &dyn RendezvousCourier,
     // R7 2e-3: optional DHT-over-peer leg (mode b) run alongside the courier's web/local-DHT legs.
     dht_leg: Option<&dyn DhtOverPeerLeg>,
@@ -2085,13 +2239,18 @@ fn rendezvous_connect(
     // Peers on the topic not to dial: on the account's own topic, the devices already linked
     // (several publish there). My own beacon is always passed over.
     skip_nodes: &[[u8; 20]],
-    // dial(node, udp_reflexive, tcp_direct): UDP-direct is the preferred carrier; tcp_direct are the
-    // peer's TLS-over-TCP front doors to fall back to on a UDP-hostile carrier (same wrapper as the
-    // relay fallback). The dialer attempts both; `path_rank` prefers UDP when it comes up.
+    // Our side of a first-contact invite on its topic (`InviteSeal::None` elsewhere): an importer
+    // addresses its beacon to the inviter and dials nobody else who imported the same invite.
+    invite: InviteSeal,
+    // dial(node, udp_reflexive, tcp_direct, tcp_punch): UDP-direct is the preferred carrier; tcp_direct
+    // are the peer's TLS-over-TCP front doors to fall back to on a UDP-hostile carrier (same wrapper as
+    // the relay fallback). The dialer attempts both; `path_rank` prefers UDP when it comes up.
+    // tcp_punch is the peer's door as its NAT shows it, for a TCP hole punch when neither comes up.
     dial: impl FnMut(
         [u8; 20],
         Vec<std::net::SocketAddr>,
         Vec<std::net::SocketAddr>,
+        Option<std::net::SocketAddr>,
     ) -> OmniResult<()>,
     // The peer's beacon, as soon as it opens — before and independent of the dial: what it carries
     // for us (a relay bundle, a revocation mark) matters most exactly when the dial cannot succeed.
@@ -2123,6 +2282,7 @@ fn rendezvous_connect(
         stripped.forwarded.clear();
         stripped.reflexive.clear();
         stripped.tcp_direct.clear();
+        stripped.tcp_punch = None;
         relay_only_beacon = stripped;
         &relay_only_beacon
     };
@@ -2132,7 +2292,7 @@ fn rendezvous_connect(
     // 2026-10-03, docs/bugs/reconnect-hangs-on-public-couriers.md. The scope still waits for the
     // publish, so the call returns with my beacon out, as before.
     std::thread::scope(|scope| {
-        let publishing = scope.spawn(|| publish_own_beacon_via(courier, secret, beacon_to_publish));
+        let publishing = scope.spawn(|| publish_own_beacon_via(courier, secret, beacon_to_publish, &invite));
         let outcome = find_and_dial_peer(
             courier,
             dht_leg,
@@ -2140,6 +2300,7 @@ fn rendezvous_connect(
             my_beacon,
             beacon_to_publish,
             skip_nodes,
+            &invite,
             dial,
             consume_peer_beacon,
             allow_direct,
@@ -2170,10 +2331,12 @@ fn find_and_dial_peer(
     my_beacon: &Beacon,
     beacon_to_publish: &Beacon,
     skip_nodes: &[[u8; 20]],
+    invite: &InviteSeal,
     mut dial: impl FnMut(
         [u8; 20],
         Vec<std::net::SocketAddr>,
         Vec<std::net::SocketAddr>,
+        Option<std::net::SocketAddr>,
     ) -> OmniResult<()>,
     mut consume_peer_beacon: impl FnMut(&Beacon),
     allow_direct: bool,
@@ -2185,9 +2348,10 @@ fn find_and_dial_peer(
         if let Some((topic, dht_key)) =
             rendezvous_topics_with_keys(secret, current_unix_ms() as u64).into_iter().next()
         {
-            let wire = seal_beacon(secret, &topic, beacon_to_publish).to_wire();
-            let slim = slim_beacon_wire(secret, &topic.id(), beacon_to_publish, &wire);
-            leg.publish(&dht_key, slim.as_deref().unwrap_or(&wire));
+            if let Some(wire) = invite.seal(secret, &topic, beacon_to_publish) {
+                let slim = slim_beacon_wire(secret, &topic.id(), beacon_to_publish, &wire);
+                leg.publish(&dht_key, slim.as_deref().unwrap_or(&wire));
+            }
         }
     }
     // Fetch the peer's beacon from the courier legs, and (2e-3) merge with whatever the DHT-over-peer
@@ -2200,14 +2364,14 @@ fn find_and_dial_peer(
     // public Wi-Fi, 2026-10-14), and the leg below reads the same slots the way that works. Its
     // recovery is seen by the node count every sweep, not by these reads.
     let (mut blobs, web_reached) = fetch_beacon_blobs_via(courier, secret, CourierLegs::Web)?;
-    let mut helper_peer = open_beacon_under_secret(secret, &blobs, &exclude);
+    let mut helper_peer = open_beacon_of(secret, &blobs, &exclude, invite);
     if helper_peer.is_none()
         && dht_leg.is_none()
         && dht_read_due(courier, secret, web_reached, current_unix_ms() as u64)
     {
         if let Ok((dht_blobs, _)) = fetch_beacon_blobs_via(courier, secret, CourierLegs::Dht) {
             blobs.extend(dht_blobs);
-            helper_peer = open_beacon_under_secret(secret, &blobs, &exclude);
+            helper_peer = open_beacon_of(secret, &blobs, &exclude, invite);
         }
     }
     omni_app_trace_log(
@@ -2215,12 +2379,12 @@ fn find_and_dial_peer(
         &format!("blobs={} opened={}", blobs.len(), helper_peer.is_some()),
     );
     if let Some(log) = courier.beacon_publish_log() {
-        if !beacon_of_node_among(secret, &blobs, my_beacon.node) {
+        if !beacon_of_node_among(secret, &blobs, my_beacon.node, invite) {
             log.note_own_beacon_missing(secret, my_beacon.node, current_unix_ms() as u64);
         }
     }
     let peer = match dht_leg {
-        Some(leg) => freshest_beacon(helper_peer, fetch_overpeer_beacon(leg, secret, &exclude)),
+        Some(leg) => freshest_beacon(helper_peer, fetch_overpeer_beacon(leg, secret, &exclude, invite)),
         None => helper_peer,
     };
     let Some(peer) = peer else {
@@ -2230,7 +2394,7 @@ fn find_and_dial_peer(
     on_peer_nat(
         peer.node,
         peer.nat_type,
-        !peer.forwarded.is_empty() || !peer.tcp_direct.is_empty(),
+        !peer.forwarded.is_empty() || !peer.tcp_direct.is_empty() || peer.tcp_punch.is_some(),
     );
     // R1c inc.3b: apply a propagated relay bundle straight from the OPENED beacon — BEFORE and
     // INDEPENDENT of the dial. Relay propagation exists precisely for when we CANNOT reach the friend
@@ -2270,6 +2434,7 @@ fn find_and_dial_peer(
         .collect();
     let tcp_endpoints: Vec<std::net::SocketAddr> =
         peer.tcp_direct.iter().filter_map(|s| s.parse().ok()).collect();
+    let tcp_punch: Option<std::net::SocketAddr> = peer.tcp_punch.as_deref().and_then(|s| s.parse().ok());
     // Why the UDP leg has (or hasn't) anything to dial. A peer advertising a perfectly good UDP
     // endpoint still ends up with an EMPTY list when both sides are symmetric — the suppression
     // below — and without this line that is indistinguishable from "the peer published nothing",
@@ -2277,7 +2442,7 @@ fn find_and_dial_peer(
     omni_app_trace_log(
         "rendezvous/dial-plan",
         &format!(
-            "peer_nat={:?} my_nat={:?} both_symmetric={both_symmetric} peer_forwarded={} peer_reflexive={} udp_kept={} tcp_direct={}",
+            "peer_nat={:?} my_nat={:?} both_symmetric={both_symmetric} peer_forwarded={} peer_reflexive={} udp_kept={} tcp_direct={} tcp_punch={tcp_punch:?}",
             peer.nat_type,
             my_beacon.nat_type,
             peer.forwarded.len(),
@@ -2286,16 +2451,17 @@ fn find_and_dial_peer(
             tcp_endpoints.len(),
         ),
     );
-    if endpoints.is_empty() && tcp_endpoints.is_empty() {
+    if endpoints.is_empty() && tcp_endpoints.is_empty() && tcp_punch.is_none() {
         return Ok(RendezvousOutcome::NoEndpoints);
     }
-    dial(peer.node, endpoints.clone(), tcp_endpoints.clone())?;
+    dial(peer.node, endpoints.clone(), tcp_endpoints.clone(), tcp_punch)?;
     Ok(RendezvousOutcome::Dialed {
         node: peer.node,
         // Trace every endpoint we dialed — UDP reflexive + TCP-direct front doors.
         endpoints: endpoints
             .iter()
             .chain(tcp_endpoints.iter())
+            .chain(tcp_punch.iter())
             .map(|e| e.to_string())
             .collect(),
         relay_bundle: peer.relay_bundle,
@@ -2397,19 +2563,33 @@ fn beacon_reflexive(runtime: &MeshRuntime) -> BeaconUdpEndpoints {
     // so it does not ask at all — the query would show our mesh socket to the STUN operators for
     // nothing. Traced whatever it says: a failed STUN used to vanish here without a word.
     if runtime.allows_direct_punch() {
-        let found = runtime.stun_reflexive();
+        let probe = runtime.stun_probe();
+        let (asked, answered) = probe.as_ref().map_or((0, 0), |p| (p.asked, p.answers.len()));
+        let consensus = probe.as_ref().and_then(|p| p.consensus());
+        // A lone answer — the other servers silent — is still our address, only unconfirmed and with
+        // the NAT class unknown. Dropping it left a node with no IPv4 in its beacon at all: stand
+        // 2026-11-08, the laptop's servers answered one at a time, its beacon carried only IPv6, and
+        // the IPv4-only PC had nothing to dial — the contact worked only when the laptop dialed.
+        let lone = if consensus.is_none() { probe.as_ref().and_then(|p| p.lone()) } else { None };
         omni_app_trace_log(
             "rendezvous/stun",
-            &match found {
-                Some(r) => format!(
-                    "reply=OK {} {} (mesh socket)",
+            &match (consensus, lone) {
+                (Some(r), _) => format!(
+                    "reply=OK {} {} ({answered} of {asked} answered, mesh socket)",
                     r.addr,
                     if r.endpoint_independent { "cone" } else { "symmetric" }
                 ),
-                None => "reply=none: fewer than two STUN servers agreed".to_string(),
+                (None, Some(addr)) => format!(
+                    "reply=lone {addr} NAT class unknown (1 of {asked} answered, mesh socket)"
+                ),
+                (None, None) if probe.is_none() => "reply=none: no socket to ask from".to_string(),
+                (None, None) => format!(
+                    "reply=none: {answered} of {asked} answered{}",
+                    if answered >= 2 { ", disagreeing on the IP" } else { "" }
+                ),
             },
         );
-        if let Some(r) = found {
+        if let Some(r) = consensus {
             reflexive_ip = Some(r.addr.ip());
             stun_endpoint = Some(r.addr.to_string());
             nat_type = if r.endpoint_independent {
@@ -2417,6 +2597,9 @@ fn beacon_reflexive(runtime: &MeshRuntime) -> BeaconUdpEndpoints {
             } else {
                 NatType::Symmetric
             };
+        } else if let Some(addr) = lone {
+            reflexive_ip = Some(addr.ip());
+            stun_endpoint = Some(addr.to_string());
         }
     }
     // ORDER = PREFERENCE: forwards are dialable by anyone and come first, the STUN address comes
@@ -2636,6 +2819,8 @@ fn rendezvous_dial_with(
     secret: &[u8; 32],
     my_node: [u8; 20],
     skip_nodes: &[[u8; 20]],
+    // See `rendezvous_connect_to`: our side of a first-contact invite.
+    invite: InviteSeal,
     my_relay_bundle: Option<String>,
     // A revocation of ours the peer's account may not have heard of: its mark rides my beacon, the
     // notice itself goes to the pair's mailbox topic (runtime_revocation_notice.rs).
@@ -2656,6 +2841,12 @@ fn rendezvous_dial_with(
     // TCP-direct — now including the OPTIMISTIC raw UPnP-TCP map on first contact (see
     // `beacon_tcp_direct`), not only the AutoNAT-confirmed one. See tcp-direct-peer-fallback.md.
     my_beacon.tcp_direct = beacon_tcp_direct(runtime, reflexive_ip);
+    // The TCP hole punch: our door as the NAT shows it to everyone, when two STUN servers agreed on
+    // it. The peer punches only when our door (if any) did not answer. See tcp-hole-punch.md.
+    my_beacon.tcp_punch = runtime
+        .tcp_punch_endpoint()
+        .map(|addr| addr.to_string())
+        .filter(|addr| !my_beacon.tcp_direct.contains(addr));
     // Our hop's carrier decides what the peer may dial us by: TCP — only our door (no UDP address, so
     // the peer does not bring the link up over UDP); QUIC — no door.
     let carrier = runtime.carrier_preference();
@@ -2664,14 +2855,32 @@ fn rendezvous_dial_with(
             my_beacon.reflexive.clear();
             my_beacon.forwarded.clear();
         }
-        omni_mesh_runtime::CarrierPreference::Quic => my_beacon.tcp_direct.clear(),
+        omni_mesh_runtime::CarrierPreference::Quic => {
+            my_beacon.tcp_direct.clear();
+            my_beacon.tcp_punch = None;
+        }
         omni_mesh_runtime::CarrierPreference::Auto => {}
     }
     // What the PEER can reach us by regardless of our NAT class — only what we actually publish, so
     // a RelayOnly profile (which strips every endpoint) never claims to be directly reachable.
     let allows_direct = runtime.allows_direct_punch();
-    let local_nat_independent =
-        allows_direct && (!my_beacon.forwarded.is_empty() || !my_beacon.tcp_direct.is_empty());
+    let local_nat_independent = allows_direct
+        && (!my_beacon.forwarded.is_empty() || !my_beacon.tcp_direct.is_empty() || my_beacon.tcp_punch.is_some());
+    // The address families of what we publish (none in RelayOnly): with the peer's, they tell an
+    // IPv6-only node from an IPv4-only one — a pair no dial can join (`address_family_gap`).
+    let local_families = if allows_direct {
+        crate::app_nat_class::AddressFamilies::of(
+            my_beacon
+                .forwarded
+                .iter()
+                .chain(&my_beacon.reflexive)
+                .chain(&my_beacon.tcp_direct)
+                .chain(&my_beacon.tcp_punch),
+        )
+        .with_host_routes()
+    } else {
+        crate::app_nat_class::AddressFamilies::default()
+    };
     // R7 2e-3: a node whose own DHT UDP is blocked still reaches the BT-DHT rendezvous class — through
     // a friend's engine (mode b) if one on a link serves, else (or when it does not answer) through
     // the pkarr relays over HTTPS (docs/decisions/dht-over-pkarr-relays.md). Only while our own engine
@@ -2704,13 +2913,14 @@ fn rendezvous_dial_with(
         publish_revocation_notice_if_due(&courier, db_path, secret, notice, current_unix_ms());
     }
     let consume_db_path_for_mark = consume_db_path.clone();
-    let outcome = rendezvous_connect(
+    let outcome = rendezvous_connect_to(
         &courier,
         dht_leg.as_ref().map(|l| l as &dyn DhtOverPeerLeg),
         secret,
         &my_beacon,
         skip_nodes,
-        |node, udp_endpoints, tcp_endpoints| {
+        invite,
+        |node, udp_endpoints, tcp_endpoints, tcp_punch| {
             let peer = MeshNodeAddress::from_bytes(node);
             // S3 honest failover: remember the peer's advertised direct-TCP door (first endpoint) so a
             // later phantom-drop migrates this peer's connection onto it instead of the inert UDP demote.
@@ -2753,8 +2963,24 @@ fn rendezvous_dial_with(
                 Some(Err(error)) => Err(error),
                 None => Err(omni_mesh_runtime::MeshRuntimeError::Dial("our hops are QUIC".to_string())),
             };
+            // Neither came up: punch a TCP path through both NATs, in the background (the window
+            // runs on the mesh runtime, so the sweep does not wait for it). See tcp-hole-punch.md.
+            let punching = match (udp.is_err() && tcp.is_err() && door_allowed, tcp_punch) {
+                (true, Some(punch)) => {
+                    let started = runtime.start_tcp_punch(peer, punch);
+                    omni_app_trace_log("rendezvous/tcp-punch", &format!("node={peer} punch={punch} {started:?}"));
+                    matches!(
+                        started,
+                        omni_mesh_runtime::TcpPunchStart::Started
+                            | omni_mesh_runtime::TcpPunchStart::Extended
+                            | omni_mesh_runtime::TcpPunchStart::AlreadyLinked
+                    )
+                }
+                _ => false,
+            };
             match (udp, tcp) {
                 (Ok(_), _) | (_, Ok(_)) => Ok(()),
+                (Err(_), Err(_)) if punching => Ok(()),
                 (Err(error), Err(_)) => {
                     Err(OmniError::Transport(format!("rendezvous dial: {error}")))
                 }
@@ -2766,6 +2992,13 @@ fn rendezvous_dial_with(
             let Some(db_path) = consume_db_path.as_deref() else {
                 return;
             };
+            crate::app_nat_class::set_peer_address_families(
+                db_path,
+                &peer.node,
+                crate::app_nat_class::AddressFamilies::of(
+                    peer.forwarded.iter().chain(&peer.reflexive).chain(&peer.tcp_direct),
+                ),
+            );
             if let Some(token) = peer.relay_bundle.as_deref() {
                 apply_propagated_relay_bundle_on_worker(db_path, peer.node, token);
             }
@@ -2783,6 +3016,7 @@ fn rendezvous_dial_with(
         |peer_node, peer_nat, peer_nat_independent| {
             if let Some(db_path) = consume_db_path.as_deref() {
                 crate::app_nat_class::set_local_nat_class(db_path, nat_type, local_nat_independent);
+                crate::app_nat_class::set_local_address_families(db_path, local_families);
                 crate::app_nat_class::set_peer_nat_class(
                     db_path,
                     &peer_node,
@@ -2864,6 +3098,7 @@ fn identity_beacon_fingerprint(
     node: &[u8; 20],
     reflexive: &[String],
     tcp_direct: &[String],
+    tcp_punch: Option<&str>,
     relay_bundle: Option<&str>,
     prekeys: &[u8],
 ) -> u64 {
@@ -2872,6 +3107,7 @@ fn identity_beacon_fingerprint(
     node.hash(&mut hasher);
     reflexive.hash(&mut hasher);
     tcp_direct.hash(&mut hasher);
+    tcp_punch.hash(&mut hasher);
     relay_bundle.hash(&mut hasher);
     prekeys.hash(&mut hasher);
     hasher.finish()
@@ -2961,8 +3197,8 @@ fn build_identity_beacon_body(
         }
         keys
     };
-    let (prekey_compact, reflexive, tcp_direct) = if withdrawn {
-        (Vec::new(), Vec::new(), Vec::new())
+    let (prekey_compact, reflexive, tcp_direct, tcp_punch) = if withdrawn {
+        (Vec::new(), Vec::new(), Vec::new(), None)
     } else {
         let udp = beacon_reflexive(runtime);
         let reflexive = udp.combined();
@@ -2970,13 +3206,34 @@ fn build_identity_beacon_body(
         // only the AutoNAT-confirmed endpoint — the live gap where the identity beacon shipped
         // `tcp_direct=[]`.
         let tcp_direct: Vec<String> = beacon_tcp_direct(runtime, udp.reflexive_ip);
-        (prekey_compact, reflexive, tcp_direct)
+        if runtime.allows_direct_punch() {
+            crate::app_nat_class::set_local_address_families(
+                &storage.db_path().to_string_lossy(),
+                crate::app_nat_class::AddressFamilies::of(reflexive.iter().chain(&tcp_direct))
+                    .with_host_routes(),
+            );
+        }
+        // The TCP hole punch (tcp-hole-punch.md): our door as the NAT shows it, and the key a finder
+        // seals its knock to — its own punch address, so that we punch towards it too. The address
+        // moves only while a window runs (`MeshRuntime::tcp_punch_endpoint`), so it does not make
+        // every sweep a publication.
+        let tcp_punch = runtime
+            .tcp_punch_endpoint()
+            .map(|addr| addr.to_string())
+            .filter(|addr| !tcp_direct.contains(addr));
+        (prekey_compact, reflexive, tcp_direct, tcp_punch)
     };
+    let knock_key = tcp_punch
+        .as_ref()
+        .and_then(|_| own_knock_key(storage))
+        .map(|(_, public)| public);
+    let tcp_punch = tcp_punch.filter(|_| knock_key.is_some());
     let node = *runtime.node_address().as_bytes();
     let fingerprint = identity_beacon_fingerprint(
         &node,
         &reflexive,
         &tcp_direct,
+        tcp_punch.as_deref(),
         my_relay_bundle.as_deref(),
         if withdrawn { &[] } else { &prekeys },
     );
@@ -2995,6 +3252,8 @@ fn build_identity_beacon_body(
         reflexive,
         tcp_direct,
         relay_bundle: my_relay_bundle,
+        tcp_punch,
+        knock_key,
         ts_ms: now as u64,
         ttl_secs: IDENTITY_BEACON_TTL_SECS,
         seq: now as u64, // wall-clock is a monotone-enough freshest-wins seq (no persist needed)
@@ -3015,6 +3274,36 @@ fn post_identity_beacon(
     my_relay_bundle: Option<String>,
     withdrawn: bool,
 ) -> bool {
+    post_identity_beacon_via(storage, runtime, db_path, my_relay_bundle, withdrawn, &[])
+}
+
+/// A real identity beacon, as the sweep posts it, but never to the courier kinds in `never_via` — for
+/// a publication someone else set off (a knock: app_tcp_knock.rs).
+pub(crate) fn post_identity_beacon_avoiding(
+    storage: &Storage,
+    runtime: &Arc<MeshRuntime>,
+    db_path: &str,
+    my_relay_bundle: Option<String>,
+    never_via: &[&str],
+) -> bool {
+    post_identity_beacon_via(storage, runtime, db_path, my_relay_bundle, false, never_via)
+}
+
+fn post_identity_beacon_via(
+    storage: &Storage,
+    runtime: &Arc<MeshRuntime>,
+    db_path: &str,
+    my_relay_bundle: Option<String>,
+    withdrawn: bool,
+    never_via: &[&str],
+) -> bool {
+    let avoid = |steps: Vec<Vec<String>>| -> Vec<Vec<String>> {
+        steps
+            .into_iter()
+            .map(|step| step.into_iter().filter(|kind| !never_via.contains(&kind.as_str())).collect::<Vec<_>>())
+            .filter(|step| !step.is_empty())
+            .collect()
+    };
     let Ok(rendezvous) = profile_rendezvous_runtime(db_path) else {
         return false;
     };
@@ -3026,12 +3315,12 @@ fn post_identity_beacon(
     // Don't spend the couriers' publish budget re-posting an unchanged, still-valid beacon: unchanged,
     // only the plan's blocks whose frequency came up.
     let steps = if withdrawn {
-        helper.due_steps_for(crate::Publication::OmniId, "omni_id", true)
+        avoid(helper.due_steps_for(crate::Publication::OmniId, "omni_id", true))
     } else {
         let registry = IDENTITY_BEACON_PUBLISHES.get_or_init(|| Mutex::new(HashMap::new()));
         let mut map = registry.lock().unwrap_or_else(|poison| poison.into_inner());
         let changed = identity_beacon_changed(map.get(db_path).copied(), fingerprint);
-        let steps = helper.due_steps_for(crate::Publication::OmniId, "omni_id", changed);
+        let steps = avoid(helper.due_steps_for(crate::Publication::OmniId, "omni_id", changed));
         if steps.is_empty() {
             return false;
         }
@@ -3206,6 +3495,7 @@ fn spawn_rendezvous_dial(
     couriers: PairCouriers,
     my_node: [u8; 20],
     skip_nodes: Vec<[u8; 20]>,
+    invite: InviteSeal,
     my_relay_bundle: Option<String>,
     revocation_notice: Option<RevocationNotice>,
     consume_db_path: Option<String>,
@@ -3221,6 +3511,7 @@ fn spawn_rendezvous_dial(
                 &secret,
                 my_node,
                 &skip_nodes,
+                invite,
                 my_relay_bundle,
                 revocation_notice,
                 consume_db_path.clone(),
@@ -3271,40 +3562,53 @@ fn beacon_watch_needs_pause(blobs: &[String], elapsed: std::time::Duration) -> b
 /// each), which bounds how many fit one request.
 pub(crate) const BEACON_WATCH_TOPICS_PER_SUBSCRIPTION: usize = 32;
 
-/// What a subscription listens for under one secret: a contact's device on our pair topic, or — with
-/// `node: None` — on the account topic, any device of ours that is not in `exclude` (the ones already
-/// linked).
+/// What a subscription listens for under one secret (any beacon in `exclude` — the devices already
+/// linked — and our own never count).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BeaconWatchTarget {
     pub(crate) secret: [u8; 32],
-    pub(crate) node: Option<[u8; 20]>,
+    pub(crate) awaits: Awaited,
     pub(crate) exclude: Vec<[u8; 20]>,
     /// Where the pair's other device posts (see [`PairCouriers`]); `None` — our own set.
     pub(crate) read_from: Option<Vec<String>>,
 }
 
-/// What a fresh beacon on a subscription asks the worker to do: rendezvous that contact device, or
-/// meet a device of ours it has not met yet.
+/// Whose beacon a subscription waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Awaited {
+    /// This contact device's, on our pair topic.
+    Contact([u8; 20]),
+    /// Any device of ours, on the account topic.
+    OwnAccount,
+    /// The other side of a first-contact invite, on its bootstrap topic: the inviter (we imported its
+    /// invite) or whoever imported ours — by our side of it.
+    Invite(InviteSeal),
+    /// Someone who found us by Omni-ID knocking for a TCP hole punch, on our knock topic: the knock is
+    /// addressed to our knock key, the `reply` of this seal (app_tcp_knock.rs).
+    Knock(InviteSeal),
+}
+
+/// What a fresh beacon on a subscription asks the worker to do: rendezvous that contact device, meet
+/// a device of ours it has not met yet, or meet the other side of the invite with this bootstrap
+/// secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BeaconWake {
     Contact([u8; 20]),
     OwnAccount,
+    Invite([u8; 32]),
+    /// A knock: punch towards `punch`, the finder `node`'s door.
+    Knock { node: [u8; 20], punch: std::net::SocketAddr },
 }
 
 /// The beacons among `blobs` that open under `secret`, quietly: on a shared subscription every target
 /// tries every blob, and most of them belong to another target.
-fn open_beacons_quietly(secret: &[u8; 32], blobs: &[Vec<u8>]) -> Vec<Beacon> {
+fn open_beacons_quietly(secret: &[u8; 32], blobs: &[Vec<u8>], invite: &InviteSeal) -> Vec<Beacon> {
     let now_ms = current_unix_ms() as u64;
     let topics = rendezvous_topics(secret, now_ms);
     let mut guard = ReplayGuard::new();
     blobs
         .iter()
-        .filter_map(|blob| SealedBeacon::from_wire(blob))
-        .filter_map(|sealed| {
-            topics
-                .iter()
-                .find_map(|topic| open_beacon(secret, topic, &sealed, now_ms, &mut guard).ok())
-        })
+        .filter_map(|blob| topics.iter().find_map(|topic| invite.open(secret, topic, blob, now_ms, &mut guard).ok()))
         .collect()
 }
 
@@ -3312,14 +3616,25 @@ fn open_beacons_quietly(secret: &[u8; 32], blobs: &[Vec<u8>]) -> Vec<Beacon> {
 fn beacon_wakes(targets: &[BeaconWatchTarget], my_node: [u8; 20], blobs: &[Vec<u8>]) -> Vec<BeaconWake> {
     let mut wakes: Vec<BeaconWake> = Vec::new();
     for target in targets {
-        for beacon in open_beacons_quietly(&target.secret, blobs) {
+        let invite = match target.awaits {
+            Awaited::Invite(invite) | Awaited::Knock(invite) => invite,
+            Awaited::Contact(_) | Awaited::OwnAccount => InviteSeal::None,
+        };
+        for beacon in open_beacons_quietly(&target.secret, blobs, &invite) {
             if beacon.node == my_node || target.exclude.contains(&beacon.node) {
                 continue;
             }
-            let wake = match target.node {
-                Some(node) if beacon.node == node => BeaconWake::Contact(node),
-                Some(_) => continue,
-                None => BeaconWake::OwnAccount,
+            let wake = match target.awaits {
+                Awaited::Contact(node) if beacon.node == node => BeaconWake::Contact(node),
+                Awaited::OwnAccount => BeaconWake::OwnAccount,
+                Awaited::Invite(invite) if invite.only().is_none_or(|inviter| beacon.node == inviter) => {
+                    BeaconWake::Invite(target.secret)
+                }
+                Awaited::Knock(_) => match beacon.tcp_punch.as_deref().and_then(|addr| addr.parse().ok()) {
+                    Some(punch) => BeaconWake::Knock { node: beacon.node, punch },
+                    None => continue,
+                },
+                Awaited::Contact(_) | Awaited::Invite(_) => continue,
             };
             if !wakes.contains(&wake) {
                 wakes.push(wake);
@@ -3447,6 +3762,7 @@ impl OmniApp {
         &self,
         account_id: &AccountId,
     ) -> OmniResult<Option<Vec<String>>> {
+        let _ = self.ensure_runtime_profile_active("rendezvous_topic_for_contact")?;
         let now = current_unix_ms() as u64;
         let topics: Vec<String> = rendezvous_peers_for_account(&self.storage, account_id)
             .iter()
@@ -3504,6 +3820,7 @@ impl OmniApp {
             &secret,
             my_node,
             &[],
+            InviteSeal::None,
             my_relay_bundle,
             peer.revocation_notice.clone(),
             consume_db_path,
@@ -3613,6 +3930,7 @@ impl OmniApp {
                 peer.couriers.clone(),
                 my_node,
                 Vec::new(),
+                InviteSeal::None,
                 my_relay_bundle.clone(),
                 peer.revocation_notice.clone(),
                 consume_db_path.clone(),
@@ -3640,8 +3958,8 @@ mod beacon_watch_pause_tests {
 #[cfg(test)]
 mod rendezvous_helper_tests {
     use super::{
-        CourierLegs, PublishPriority,
-        build_self_beacon, current_unix_ms, dht_helper_get, dht_helper_put, dht_proxy_admit_origin,
+        CourierLegs, InviteSeal, PublishPriority,
+        build_self_beacon, current_unix_ms, dht_helper_get, dht_helper_put, dht_helper_request_timeout, dht_proxy_admit_origin,
         any_courier_answered, fetch_beacon_via, fetch_identity_beacons, helper_binary_path,
         helper_launch, identity_beacon_fingerprint, identity_beacon_changed,
         lookup_identity_beacon, IdentityBeaconLookup,
@@ -3760,6 +4078,8 @@ mod rendezvous_helper_tests {
             reflexive: vec!["203.0.113.9:51820".to_string()],
             tcp_direct: vec![],
             relay_bundle: None,
+            tcp_punch: None,
+            knock_key: None,
             ts_ms: now,
             ttl_secs: 900,
             seq: now,
@@ -3883,6 +4203,38 @@ mod rendezvous_helper_tests {
         assert!(verify_identity_beacon(&omni_id, &wrong_node).is_err());
     }
 
+    /// The finder following a found device through its punch window (app_tcp_knock.rs): the device's
+    /// newer signed beacon gives its new punch address; an older one, another device's, or one whose
+    /// address was changed after signing gives nothing.
+    #[test]
+    fn a_found_devices_newer_signed_beacon_reaims_the_finders_punch() {
+        let (mut beacon, omni_id, identity) = signed_identity_beacon(1);
+        let resign = |beacon: &mut omni_rendezvous::IdentityBeacon| {
+            beacon.signature = omni_crypto::sign_message(
+                &identity.protected_signing_private_key,
+                &omni_rendezvous::identity_beacon_signing_bytes(beacon),
+            )
+            .unwrap()
+            .bytes;
+        };
+        beacon.tcp_punch = Some("198.51.100.30:40100".into());
+        beacon.knock_key = Some([4u8; 32]);
+        resign(&mut beacon);
+        let now = current_unix_ms() as u64;
+        let blobs = vec![hex::encode(beacon.to_wire())];
+        let new_address: std::net::SocketAddr = "198.51.100.30:40100".parse().unwrap();
+        assert_eq!(
+            crate::fresher_punch_address(&omni_id, beacon.node, &blobs, beacon.seq - 1, now),
+            Some((beacon.seq, Some(new_address)))
+        );
+        assert_eq!(crate::fresher_punch_address(&omni_id, beacon.node, &blobs, beacon.seq, now), None, "not newer");
+        assert_eq!(crate::fresher_punch_address(&omni_id, [9u8; 20], &blobs, 0, now), None, "another device");
+        let mut moved = beacon.clone();
+        moved.tcp_punch = Some("198.51.100.31:40100".into());
+        let forged = vec![hex::encode(moved.to_wire())];
+        assert_eq!(crate::fresher_punch_address(&omni_id, beacon.node, &forged, 0, now), None, "changed after signing");
+    }
+
     #[test]
     fn an_unchanged_identity_beacon_is_not_a_change() {
         // The waste that starved ntfy.sh: a 900 s beacon re-posted every ~100 s. Unchanged, it goes
@@ -3899,20 +4251,23 @@ mod rendezvous_helper_tests {
         let _ = now;
         assert!(identity_beacon_changed(Some((now, 7)), 8));
 
-        let a = identity_beacon_fingerprint(&[1u8; 20], &["1.2.3.4:1".into()], &[], None, b"{}");
-        let moved = identity_beacon_fingerprint(&[1u8; 20], &["5.6.7.8:1".into()], &[], None, b"{}");
+        let a = identity_beacon_fingerprint(&[1u8; 20], &["1.2.3.4:1".into()], &[], None, None, b"{}");
+        let moved = identity_beacon_fingerprint(&[1u8; 20], &["5.6.7.8:1".into()], &[], None, None, b"{}");
         let door = identity_beacon_fingerprint(
             &[1u8; 20],
             &["1.2.3.4:1".into()],
             &["1.2.3.4:2".into()],
             None,
+            None,
             b"{}",
         );
+        let punch = identity_beacon_fingerprint(&[1u8; 20], &["1.2.3.4:1".into()], &[], Some("1.2.3.4:3"), None, b"{}");
         assert_ne!(a, moved, "a new reflexive endpoint must republish");
         assert_ne!(a, door, "a new TCP front door must republish");
+        assert_ne!(a, punch, "a new punch address must republish");
         assert_eq!(
             a,
-            identity_beacon_fingerprint(&[1u8; 20], &["1.2.3.4:1".into()], &[], None, b"{}"),
+            identity_beacon_fingerprint(&[1u8; 20], &["1.2.3.4:1".into()], &[], None, None, b"{}"),
             "identical content must fingerprint identically"
         );
     }
@@ -4047,6 +4402,33 @@ mod rendezvous_helper_tests {
         }
     }
 
+    /// V-21: the helper answers only a client holding the token the core gave it — a local process
+    /// without it, or a web page's request to its port, gets the connection closed and no reply.
+    #[test]
+    fn a_spawned_helper_answers_only_a_client_with_its_token() {
+        use std::io::{Read, Write};
+        let bin = built_helper_binary();
+        if !bin.exists() {
+            eprintln!("SKIP: helper binary not built at {}", bin.display());
+            return;
+        }
+        let helper = RendezvousHelper::spawn_binary(&bin).expect("spawn helper");
+        for request in [
+            "watch 1 ".to_string() + &"ab".repeat(32) + "\n",
+            "auth not-the-token\nwatch 1 ".to_string() + &"ab".repeat(32) + "\n",
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\nwatch 1 ".to_string() + &"ab".repeat(32) + "\n",
+        ] {
+            let mut stream = std::net::TcpStream::connect(helper.endpoint()).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut reply = Vec::new();
+            let _ = stream.read_to_end(&mut reply);
+            assert!(reply.is_empty(), "{request:?} got {:?}", String::from_utf8_lossy(&reply));
+        }
+        // The core's own request, with the token, is answered.
+        assert!(helper.command("watch 1 ").is_ok_and(|reply| reply.starts_with("ERR") || reply.starts_with("OK")));
+    }
+
     #[test]
     fn spawns_helper_and_round_trips_a_line_command() {
         let bin = built_helper_binary();
@@ -4137,6 +4519,42 @@ mod rendezvous_helper_tests {
     /// `omni-dht-helper` line server (no real DHT, no network) — proves we speak the helper's put/get
     /// protocol. The full mesh round-trip is covered once the requester await lands (2e-2). See
     /// docs/decisions/dht-over-peer.md.
+    /// V-12: a helper that answers with an endless line costs the core one failed request, not
+    /// its memory — the read stops a byte past `HELPER_REPLY_MAX`.
+    #[test]
+    fn an_endless_helper_reply_is_refused_after_the_cap() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock helper");
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let sent = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64];
+            let _ = stream.read(&mut request);
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut sent = 0usize;
+            // Until the core hangs up — or far past the cap, if it never does.
+            while sent < 16 * omni_rendezvous::helper_ipc::HELPER_REPLY_MAX {
+                if stream.write_all(&chunk).is_err() {
+                    break;
+                }
+                sent += chunk.len();
+            }
+            sent
+        });
+        let reply = dht_helper_request_timeout(&endpoint, "nodes", std::time::Duration::from_secs(10));
+        assert_eq!(reply, None, "an over-long reply is no reply");
+        let sent = sent.join().unwrap();
+        // What the helper got out includes what the kernel's buffers took after the core stopped
+        // reading — on Windows loopback, autotuned to several MiB (2× the cap was crossed by 64 KiB
+        // once, 2026-11-09). The core hanging up shows as the helper stopping far short of the end.
+        assert!(
+            sent < 8 * omni_rendezvous::helper_ipc::HELPER_REPLY_MAX,
+            "the core stopped reading at the cap, the helper got {sent} bytes out"
+        );
+    }
+
     #[test]
     fn dht_helper_ipc_client_put_get_round_trips() {
         use std::io::{BufRead, BufReader, Write};
@@ -4155,6 +4573,10 @@ mod rendezvous_helper_tests {
                     let Ok(read_half) = stream.try_clone() else { return };
                     let mut reader = BufReader::new(read_half);
                     let mut writer = stream;
+                    let token = omni_rendezvous::helper_ipc::process_helper_token();
+                    if !omni_rendezvous::helper_ipc::accept_client(&mut reader, token) {
+                        return;
+                    }
                     let mut line = String::new();
                     loop {
                         line.clear();
@@ -4270,7 +4692,7 @@ mod rendezvous_helper_tests {
     #[test]
     fn a_courier_report_becomes_a_status_per_courier() {
         let statuses = super::courier_statuses(
-            "ntfy:ntfy.sh=quota+30ms:ntfy_publish:_status_429 nostr:nos.lol=ok+300ms dht:mainline=empty+4000ms nostr:nostr.mom=skip nostr:x=fail+5ms:connect_refused",
+            "ntfy:ntfy.sh=quota+30ms:ntfy_publish:_status_429 nostr:nos.lol=ok+300ms dht:mainline=empty+4000ms nostr:nostr.mom=skip nostr:x=fail+5ms:connect_refused nostr:y=late+1500ms nostr:z=again+40ms",
             7,
         );
         let state = |label: &str| statuses.iter().find(|(l, _)| l == label).map(|(_, s)| s.state.as_str());
@@ -4279,6 +4701,8 @@ mod rendezvous_helper_tests {
         assert_eq!(state("dht:mainline"), Some("ok"), "nothing for us is still an answer");
         assert_eq!(state("nostr:nostr.mom"), Some("cooling"));
         assert_eq!(state("nostr:x"), Some("fail"));
+        assert_eq!(state("nostr:y"), None, "a courier the round did not wait for keeps its status");
+        assert_eq!(state("nostr:z"), Some("ok"), "a copy already seen is still an answer");
         let ntfy = &statuses.iter().find(|(l, _)| l == "ntfy:ntfy.sh").unwrap().1;
         assert_eq!(ntfy.detail, "ntfy publish: status 429");
     }
@@ -4316,21 +4740,21 @@ mod rendezvous_helper_tests {
         let courier = LoggedCourier::default();
         let beacon = build_self_beacon([3u8; 20], vec!["198.51.100.9:7777".to_string()], NatType::Cone, None);
 
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 2, "new: both topics");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 2, "new: both topics");
         let posts = courier.posts();
         let later = build_self_beacon([3u8; 20], vec!["198.51.100.9:7777".to_string()], NatType::Cone, None);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &later).unwrap(), 0);
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &later, &InviteSeal::None).unwrap(), 0);
         assert_eq!(courier.posts(), posts, "the next sweep in the same window posts nothing");
         assert!(fetch_beacon_via(&courier, &secret, &[]).unwrap().is_some(), "and the contact still finds it");
 
         let moved = build_self_beacon([3u8; 20], vec!["203.0.113.4:4444".to_string()], NatType::Cone, None);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &moved).unwrap(), 2, "a new address goes at once");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &moved, &InviteSeal::None).unwrap(), 2, "a new address goes at once");
         let found = fetch_beacon_via(&courier, &secret, &[]).unwrap().unwrap();
         assert_eq!(found.reflexive, vec!["203.0.113.4:4444".to_string()]);
 
         // Another device of ours on the same topic keeps its own record.
         let other = build_self_beacon([4u8; 20], vec!["198.51.100.10:7777".to_string()], NatType::Cone, None);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &other).unwrap(), 2);
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &other, &InviteSeal::None).unwrap(), 2);
 
         // A pair beacon outlives the window it was posted in, by an hour.
         assert_eq!(beacon.ttl_secs as u64, omni_rendezvous::TOPIC_WINDOW_SECS + 3600);
@@ -4378,10 +4802,10 @@ mod rendezvous_helper_tests {
         let beacon = build_self_beacon(node, vec!["198.51.100.9:7777".to_string()], NatType::Cone, None);
         let kinds = || courier.kinds.lock().unwrap().clone();
 
-        super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap();
+        super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap();
         assert!(kinds().iter().all(|k| *k == 1), "one kind at first: {:?}", kinds());
         let posts = kinds().len();
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 0, "nothing new, no wider");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 0, "nothing new, no wider");
 
         let log = &courier.inner.log;
         // The start of the current window: every step below stays in it, as the posts do.
@@ -4391,23 +4815,23 @@ mod rendezvous_helper_tests {
         // Seen once, then linked for a long while, then seen again: not one stretch — no wider.
         log.note_peer_seen_unlinked(&secret, node, t0);
         log.note_peer_seen_unlinked(&secret, node, t0 + 30 * minute);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 0, "a gap starts the clock again");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 0, "a gap starts the clock again");
 
         // Seen sweep after sweep (every 2 minutes) for 10 minutes: one kind more.
         let start = t0 + 30 * minute;
         for step in 1..5 {
             log.note_peer_seen_unlinked(&secret, node, start + step * 2 * minute);
         }
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 0, "8 minutes is not yet");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 0, "8 minutes is not yet");
         log.note_peer_seen_unlinked(&secret, node, start + super::PAIR_REACH_WIDEN_EVERY_MS);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 1, "wider: the current window again");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 1, "wider: the current window again");
         assert_eq!(kinds()[posts..], [2]);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 0, "posted that wide already");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 0, "posted that wide already");
 
         for step in 6..60 {
             log.note_peer_seen_unlinked(&secret, node, start + step * 2 * minute);
         }
-        super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap();
+        super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap();
         assert_eq!(*kinds().last().unwrap(), super::COURIER_KIND_COUNT, "at most every kind");
     }
 
@@ -4419,20 +4843,20 @@ mod rendezvous_helper_tests {
         let secret = [13u8; 32];
         let courier = LoggedCourier::default();
         let beacon = build_self_beacon([6u8; 20], vec!["198.51.100.9:7777".to_string()], NatType::Cone, None);
-        super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap();
+        super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap();
         let (blobs, _) = super::fetch_beacon_blobs_via(&courier, &secret, super::CourierLegs::All).unwrap();
-        assert!(super::beacon_of_node_among(&secret, &blobs, [6u8; 20]), "our beacon is there");
-        assert!(!super::beacon_of_node_among(&secret, &blobs, [7u8; 20]), "nobody else's");
+        assert!(super::beacon_of_node_among(&secret, &blobs, [6u8; 20], &InviteSeal::None), "our beacon is there");
+        assert!(!super::beacon_of_node_among(&secret, &blobs, [7u8; 20], &InviteSeal::None), "nobody else's");
 
         courier.inner.topics.lock().unwrap().clear(); // the courier lost it
         let (blobs, _) = super::fetch_beacon_blobs_via(&courier, &secret, super::CourierLegs::All).unwrap();
-        assert!(!super::beacon_of_node_among(&secret, &blobs, [6u8; 20]));
+        assert!(!super::beacon_of_node_among(&secret, &blobs, [6u8; 20], &InviteSeal::None));
         let now = current_unix_ms() as u64;
         courier.log.note_own_beacon_missing(&secret, [6u8; 20], now);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 0, "just posted: not lost");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 0, "just posted: not lost");
 
         courier.log.note_own_beacon_missing(&secret, [6u8; 20], now + super::LOST_BEACON_GRACE_MS);
-        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon).unwrap(), 2, "lost: posted again");
+        assert_eq!(super::publish_own_beacon_via(&courier, &secret, &beacon, &InviteSeal::None).unwrap(), 2, "lost: posted again");
         assert!(super::fetch_beacon_via(&courier, &secret, &[]).unwrap().is_some());
     }
 
@@ -4773,7 +5197,7 @@ mod rendezvous_helper_tests {
     /// device, a third party under a contact's secret and nothing at all wake nothing.
     #[test]
     fn a_shared_watch_wakes_each_target_by_its_own_beacon_only() {
-        use crate::{beacon_wakes, BeaconWake, BeaconWatchTarget};
+        use crate::{beacon_wakes, Awaited, BeaconWake, BeaconWatchTarget};
         use omni_rendezvous::rendezvous_topics;
         let (pair_secret, account_secret) = ([11u8; 32], [12u8; 32]);
         let (me, peer, linked_own, new_own) = ([0xA1u8; 20], [0xB2u8; 20], [0xC3u8; 20], [0xD4u8; 20]);
@@ -4783,8 +5207,8 @@ mod rendezvous_helper_tests {
             seal_beacon(&secret, &topic, &beacon).to_wire()
         };
         let targets = vec![
-            BeaconWatchTarget { secret: pair_secret, node: Some(peer), exclude: Vec::new(), read_from: None },
-            BeaconWatchTarget { secret: account_secret, node: None, exclude: vec![linked_own], read_from: None },
+            BeaconWatchTarget { secret: pair_secret, awaits: Awaited::Contact(peer), exclude: Vec::new(), read_from: None },
+            BeaconWatchTarget { secret: account_secret, awaits: Awaited::OwnAccount, exclude: vec![linked_own], read_from: None },
         ];
         assert!(beacon_wakes(&targets, me, &[]).is_empty());
         let quiet = [sealed(pair_secret, me), sealed(pair_secret, [0xE5; 20]), sealed(account_secret, me), sealed(account_secret, linked_own)];
@@ -4798,6 +5222,55 @@ mod rendezvous_helper_tests {
             beacon_wakes(&targets, me, &both),
             vec![BeaconWake::Contact(peer), BeaconWake::OwnAccount]
         );
+    }
+
+    /// An invite's bootstrap topic: the inviter wakes on whoever answers it, the importer only on the
+    /// inviter — everyone who imported the same invite publishes there too.
+    #[test]
+    fn an_invite_watch_wakes_the_inviter_on_any_answer_and_the_importer_on_the_inviter_only() {
+        use crate::{beacon_wakes, Awaited, BeaconWake, BeaconWatchTarget};
+        use omni_rendezvous::rendezvous_topics;
+        let secret = [13u8; 32];
+        let (me, inviter, importer) = ([0xA1u8; 20], [0xB2u8; 20], [0xC3u8; 20]);
+        let sealed = |node: [u8; 20]| {
+            let beacon = build_self_beacon(node, vec!["198.51.100.1:1".to_string()], NatType::Cone, None);
+            let topic = rendezvous_topics(&secret, current_unix_ms() as u64)[0];
+            seal_beacon(&secret, &topic, &beacon).to_wire()
+        };
+        let watching = |awaits| vec![BeaconWatchTarget { secret, awaits, exclude: Vec::new(), read_from: None }];
+        let (reply, inviter_key) = ([0x11u8; 32], invite_reply_public(&[0x11u8; 32]));
+        let as_inviter = watching(Awaited::Invite(InviteSeal::Inviter { reply }));
+        assert!(beacon_wakes(&as_inviter, me, &[sealed(me)]).is_empty(), "our own beacon is not an answer");
+        assert_eq!(beacon_wakes(&as_inviter, me, &[sealed(importer)]), vec![BeaconWake::Invite(secret)]);
+        let as_importer = watching(Awaited::Invite(InviteSeal::Importer { inviter, own: [0x22u8; 32], inviter_key }));
+        assert!(beacon_wakes(&as_importer, me, &[sealed(importer)]).is_empty(), "another importer");
+        assert_eq!(beacon_wakes(&as_importer, me, &[sealed(inviter)]), vec![BeaconWake::Invite(secret)]);
+    }
+
+    /// Our knock topic: a knock addressed to our knock key wakes us with the finder and its punch
+    /// address; one without a punch address, or addressed to another device's key, does not.
+    #[test]
+    fn a_knock_addressed_to_our_knock_key_wakes_us_with_the_finders_address() {
+        use crate::{beacon_wakes, Awaited, BeaconWake, BeaconWatchTarget};
+        use omni_rendezvous::{knock_secret, rendezvous_topics, seal_beacon_to};
+        let secret = knock_secret(&[0x77u8; 20]);
+        let (me, finder) = ([0xA1u8; 20], [0xF1u8; 20]);
+        let (reply, other) = ([0x31u8; 32], [0x32u8; 32]);
+        let knock = |punch: Option<&str>, to: &[u8; 32]| {
+            let mut beacon = build_self_beacon(finder, Vec::new(), NatType::Unknown, None);
+            beacon.tcp_punch = punch.map(str::to_string);
+            let topic = rendezvous_topics(&secret, current_unix_ms() as u64)[0];
+            seal_beacon_to(&secret, &topic, &beacon, &[0x41u8; 32], &invite_reply_public(to)).unwrap()
+        };
+        let targets =
+            vec![BeaconWatchTarget { secret, awaits: Awaited::Knock(InviteSeal::Inviter { reply }), exclude: Vec::new(), read_from: None }];
+        let punch: std::net::SocketAddr = "198.51.100.40:40200".parse().unwrap();
+        assert_eq!(
+            beacon_wakes(&targets, me, &[knock(Some("198.51.100.40:40200"), &reply)]),
+            vec![BeaconWake::Knock { node: finder, punch }]
+        );
+        assert!(beacon_wakes(&targets, me, &[knock(None, &reply)]).is_empty(), "no address, nothing to punch");
+        assert!(beacon_wakes(&targets, me, &[knock(Some("198.51.100.40:40200"), &other)]).is_empty(), "another device's");
     }
 
     /// A courier as slow as BT-DHT (every operation waits for it) must cost ONE operation before the
@@ -5036,6 +5509,10 @@ mod rendezvous_helper_tests {
     /// R7 2e-4: the DHT-proxy responder caps serves per origin — admits up to the budget, then refuses
     /// within the window, doesn't penalise other origins, and recovers once the window slides. See
     /// docs/decisions/dht-over-peer.md (masterplan §4 minimal-harm).
+    fn many_origins() -> HashMap<String, Vec<u64>> {
+        (0..4097).map(|i| (format!("origin-{i}"), vec![1_000u64])).collect()
+    }
+
     #[test]
     fn dht_proxy_origin_cap_admits_then_blocks_then_recovers() {
         // Unique origins so the node-global log can't collide with another test.
@@ -5048,6 +5525,12 @@ mod rendezvous_helper_tests {
         }
         assert!(!dht_proxy_admit_origin(origin, t0), "over budget within the window → refused");
         assert!(dht_proxy_admit_origin(other, t0), "a different origin is unaffected");
+        assert!(
+            !super::dht_proxy_admit_origin_in(&mut many_origins(), "one-more", 1_000),
+            "the log is full of origins within the window: a new one is not served"
+        );
+        assert!(super::dht_proxy_admit_origin_in(&mut many_origins(), "origin-7", 1_000), "a known one is");
+        assert!(super::dht_proxy_admit_origin_in(&mut many_origins(), "one-more", 1_000 + DHT_PROXY_WINDOW_MS + 1), "their time is past: served");
         assert!(
             dht_proxy_admit_origin(origin, t0 + DHT_PROXY_WINDOW_MS + 1),
             "after the window slides the origin is admitted again"
@@ -5151,6 +5634,63 @@ mod rendezvous_helper_tests {
         .expect("connect");
         assert!(matches!(outcome2, RendezvousOutcome::Dialed { .. }), "TCP-only peer is dialed");
         assert_eq!(dialed2, vec![vec!["198.51.100.50:8443".parse::<std::net::SocketAddr>().unwrap()]]);
+    }
+
+    /// A peer that publishes only a TCP punch address (no UDP endpoint, no door — two NATs, TCP
+    /// carrier) is dialed with it, not reported NoEndpoints; a RelayOnly profile never publishes its
+    /// own. See docs/decisions/tcp-hole-punch.md.
+    #[test]
+    fn a_peer_with_only_a_tcp_punch_address_reaches_the_dialer() {
+        let secret = [34u8; 32];
+        let my_beacon = build_self_beacon([0xAAu8; 20], vec![], NatType::Cone, None);
+        let courier = InMemoryCourier::default();
+        let mut peer_beacon = build_self_beacon([0xBBu8; 20], vec![], NatType::Cone, None);
+        peer_beacon.tcp_punch = Some("198.51.100.60:47500".to_string());
+        publish_beacon_via(&courier, &secret, &peer_beacon).expect("peer publishes");
+        let mut punches = Vec::new();
+        let outcome = super::rendezvous_connect_to(
+            &courier,
+            None,
+            &secret,
+            &my_beacon,
+            &[],
+            InviteSeal::None,
+            |_, udp, tcp, punch| {
+                assert!(udp.is_empty() && tcp.is_empty());
+                punches.push(punch);
+                Ok(())
+            },
+            |_| {},
+            true,
+            |_, _, _| {},
+        )
+        .expect("connect");
+        assert_eq!(punches, vec![Some("198.51.100.60:47500".parse().unwrap())]);
+        assert!(
+            matches!(&outcome, RendezvousOutcome::Dialed { endpoints, .. }
+                if endpoints == &vec!["198.51.100.60:47500".to_string()]),
+            "the trace lists the punch address: {outcome:?}"
+        );
+
+        // RelayOnly: my punch address stays out of the beacon the peer reads.
+        let courier = InMemoryCourier::default();
+        let mut mine = build_self_beacon([0xAAu8; 20], vec![], NatType::Cone, None);
+        mine.tcp_punch = Some("203.0.113.9:47500".to_string());
+        let _ = super::rendezvous_connect_to(
+            &courier,
+            None,
+            &secret,
+            &mine,
+            &[],
+            InviteSeal::None,
+            |_, _, _, _| Ok(()),
+            |_| {},
+            false,
+            |_, _, _| {},
+        );
+        let published = super::fetch_beacon_via(&courier, &secret, &[]).expect("fetch").expect("my beacon is there");
+        assert_eq!(published.node, [0xAAu8; 20]);
+        assert_eq!(published.tcp_punch, None, "RelayOnly strips the punch address");
     }
 
     /// A revocation mark rides the sealed pair beacon and reaches the reader with the opened beacon,
@@ -5316,6 +5856,94 @@ mod rendezvous_helper_tests {
             "importer dialed the inviter's bootstrap endpoint"
         );
         assert_eq!(dialed.len(), 1, "dialed exactly once");
+    }
+
+    /// The public half of an X25519 secret — an inviter's reply key, in tests.
+    fn invite_reply_public(secret: &[u8; 32]) -> [u8; 32] {
+        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).to_bytes()
+    }
+
+    /// Two importers of one invite on its topic: each one's beacon is addressed to the inviter, who
+    /// reads both; neither importer reads the other's — not its addresses, not even that it is there.
+    /// Each still finds its own (the "is my beacon at the couriers" check) and the inviter's.
+    #[test]
+    fn an_invite_importers_beacon_is_read_by_the_inviter_and_not_by_another_importer() {
+        let secret = omni_crypto::derive_rendezvous_bootstrap_secret(&[0x46u8; 32]).unwrap();
+        let courier = InMemoryCourier::default();
+        let (inviter, first, second) = ([0xA1u8; 20], [0xB2u8; 20], [0xC3u8; 20]);
+        let reply = [0x61u8; 32];
+        let inviter_key = invite_reply_public(&reply);
+        let as_inviter = InviteSeal::Inviter { reply };
+        let first_seal = InviteSeal::Importer { inviter, own: [0x62u8; 32], inviter_key };
+        let second_seal = InviteSeal::Importer { inviter, own: [0x63u8; 32], inviter_key };
+        let beacon = |node| build_self_beacon(node, vec!["198.51.100.40:4000".to_string()], NatType::Cone, None);
+        for (node, seal) in [(inviter, as_inviter), (first, first_seal), (second, second_seal)] {
+            super::publish_own_beacon_via(&courier, &secret, &beacon(node), &seal).expect("published");
+        }
+        let (blobs, _) = super::fetch_beacon_blobs_via(&courier, &secret, super::CourierLegs::All).unwrap();
+        let nodes = |seal: &InviteSeal| {
+            let mut nodes: Vec<[u8; 20]> = super::open_beacons_quietly(&secret, &blobs, seal).iter().map(|b| b.node).collect();
+            nodes.sort();
+            nodes.dedup();
+            nodes
+        };
+        assert_eq!(nodes(&as_inviter), vec![inviter, first, second], "the inviter reads every answer");
+        assert_eq!(nodes(&first_seal), vec![inviter, first], "an importer: the inviter's and its own");
+        assert_eq!(nodes(&second_seal), vec![inviter, second]);
+        assert_eq!(nodes(&InviteSeal::None), vec![inviter], "the topic secret alone opens the inviter's only");
+        assert!(super::beacon_of_node_among(&secret, &blobs, first, &first_seal), "its own beacon is seen as there");
+    }
+
+    /// One invite handed to two people puts both importers on its topic. The freshest beacon used to
+    /// win, so an importer dialed the OTHER importer — a stranger it never meant to reach, who then
+    /// held a verified session with it (docs/bugs/an-invite-importer-dialed-another-importer.md). The
+    /// importer knows the inviter's node from the invite and takes that beacon only; with the inviter
+    /// away it dials nobody.
+    #[test]
+    fn an_invite_importer_dials_the_inviter_and_never_another_importer() {
+        let secret = omni_crypto::derive_rendezvous_bootstrap_secret(&[0x43u8; 32]).unwrap();
+        let courier = InMemoryCourier::default();
+        let inviter_node = [0xA1u8; 20];
+        let other_importer = [0xC3u8; 20];
+        let me = [0xB2u8; 20];
+        let inviter_beacon =
+            build_self_beacon(inviter_node, vec!["198.51.100.7:5000".to_string()], NatType::Public, None);
+        let mut other_beacon =
+            build_self_beacon(other_importer, vec!["192.0.2.33:7000".to_string()], NatType::Cone, None);
+        other_beacon.ts_ms = inviter_beacon.ts_ms + 1_000; // the stranger's is the freshest
+        publish_beacon_via(&courier, &secret, &other_beacon).expect("other importer publishes");
+        let my_beacon = build_self_beacon(me, vec!["203.0.113.9:6000".to_string()], NatType::Cone, None);
+        let connect = |dialed: &mut Vec<[u8; 20]>| {
+            super::rendezvous_connect_to(
+                &courier,
+                None,
+                &secret,
+                &my_beacon,
+                &[],
+                InviteSeal::Importer { inviter: inviter_node, own: [0x44u8; 32], inviter_key: invite_reply_public(&[0x55u8; 32]) },
+                |node, _eps, _tcp, _punch| {
+                    dialed.push(node);
+                    Ok(())
+                },
+                |_| {},
+                true,
+                |_, _, _| {},
+            )
+            .expect("bootstrap connect")
+        };
+
+        let mut dialed = Vec::new();
+        assert_eq!(connect(&mut dialed), RendezvousOutcome::NoPeerBeacon, "the inviter is away");
+        assert!(dialed.is_empty(), "the other importer is never dialed");
+
+        publish_beacon_via(&courier, &secret, &inviter_beacon).expect("inviter publishes");
+        let mut dialed = Vec::new();
+        let outcome = connect(&mut dialed);
+        assert!(
+            matches!(outcome, RendezvousOutcome::Dialed { node, .. } if node == inviter_node),
+            "the inviter is dialed, got {outcome:?}"
+        );
+        assert_eq!(dialed, vec![inviter_node]);
     }
 
     #[test]

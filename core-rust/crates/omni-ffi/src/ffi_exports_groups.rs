@@ -27,6 +27,22 @@ pub extern "C" fn omni_groups_list(handle: *mut OmniAppHandle) -> *mut c_char {
 }
 
 #[no_mangle]
+pub extern "C" fn omni_groups_leave_notice(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        groups_leave_notice_impl(handle, request_json)
+    })) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn omni_groups_list_members(
     handle: *mut OmniAppHandle,
     request_json: *const c_char,
@@ -137,6 +153,23 @@ pub extern "C" fn omni_groups_set_call_media_state(
 ) -> *mut c_char {
     match catch_unwind(AssertUnwindSafe(|| {
         groups_set_call_media_state_impl(handle, request_json)
+    })) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+/// Our microphone level for active-speaker gating, on the shell's call tick (C1c).
+#[no_mangle]
+pub extern "C" fn omni_groups_set_call_audio_level(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        groups_set_call_audio_level_impl(handle, request_json)
     })) {
         Ok(payload) => payload,
         Err(_) => to_c_string_payload(&ErrorEnvelope {

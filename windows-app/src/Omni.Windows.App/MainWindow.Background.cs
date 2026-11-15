@@ -127,6 +127,7 @@ public sealed partial class MainWindow
             CloseButtonText = "Не сейчас",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
 
         try

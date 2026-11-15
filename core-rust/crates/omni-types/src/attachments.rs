@@ -46,6 +46,60 @@ impl AttachmentMediaProtectionMode {
     }
 }
 
+/// A file name as someone else wrote it, made safe to show and to write to disk (V-18): no control
+/// characters, no bidirectional overrides or isolates and no zero-width characters — `invoice<U+202E>fdp.exe`
+/// would show as `invoiceexe.pdf` — no characters Windows forbids in a name, no leading or trailing
+/// dots or spaces, and no name of a Windows device (`CON`, `NUL`, `COM1`…) whatever its extension.
+/// Empty when nothing is left.
+pub fn clean_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|ch| !is_hidden_or_reordering(*ch))
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            _ => ch,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|ch: char| ch == '.' || ch.is_whitespace()).to_string();
+    let stem = cleaned.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    if device {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    }
+}
+
+/// Characters a name must not carry: controls, and those that change how the rest is shown
+/// (bidirectional marks, embeddings, overrides, isolates; zero-width joiners and spaces; BOM).
+fn is_hidden_or_reordering(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+        )
+}
+
+/// Extensions Windows runs as a program or a script (or that hand one over: a shortcut, a disk image,
+/// an installer, a help file with scripts) rather than open as a document.
+const PROGRAM_EXTENSIONS: &[&str] = &[
+    "exe", "com", "scr", "pif", "cpl", "msi", "msp", "msix", "msixbundle", "appx", "appxbundle", "appref-ms",
+    "application", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "wsc", "hta", "jar",
+    "lnk", "url", "scf", "reg", "inf", "msc", "chm", "iso", "img", "vhd", "vhdx", "library-ms",
+    "settingcontent-ms", "search-ms", "gadget", "xll", "dll",
+];
+
+/// Whether opening a file of this name starts a program or a script: the shell asks first (V-18).
+pub fn file_name_opens_as_program(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| PROGRAM_EXTENSIONS.contains(&extension.trim().to_ascii_lowercase().as_str()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentDownloadRequest {
     pub message_id: String,
@@ -87,6 +141,9 @@ pub struct AttachmentRecord {
     /// its one sender).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub source_count: u32,
+    /// Opening it starts a program or a script (by its name): the shell asks first (V-18).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opens_as_program: bool,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -100,16 +157,29 @@ pub enum AttachmentPresentationKindV1 {
     /// A picture shown in the bubble: the sender re-encoded it (JPEG, metadata gone, long side
     /// capped) and put a small preview in the offer.
     Photo,
+    /// A voice message: an Ogg/Opus file played in the bubble.
+    Voice,
+    /// A round video message: a short MP4 played in the bubble.
+    VideoNote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentPresentationV1 {
     pub kind: AttachmentPresentationKindV1,
+    /// A photo's size.
+    #[serde(default)]
     pub width: u32,
+    #[serde(default)]
     pub height: u32,
     /// A small JPEG the bubble draws before (or instead of) the full picture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_jpeg_b64: Option<String>,
+    /// A voice or video message's length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    /// A voice message's outline: up to 64 bars, 0..255.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +202,9 @@ pub struct AttachmentOfferV1 {
     pub created_at_unix_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<AttachmentPresentationV1>,
+    /// The message this one answers, in the same conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

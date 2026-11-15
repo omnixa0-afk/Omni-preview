@@ -10,6 +10,99 @@ mod tests {
         WireEnvelopeDelivery,
     };
 
+    /// Blind audit 2026-11-11, pass 13: the queue to the app's callback had no bound — a peer
+    /// sending faster than the app handled grew it without end. An event now waits for room.
+    #[test]
+    fn an_event_waits_for_room_while_the_apps_callback_is_behind() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&handled);
+        let (forward, dispatch) = super::ReceiveDispatcher::spawn(Arc::new(move |_event| {
+            let _ = held.lock().unwrap().recv();
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let event = || {
+            ReceivedTransportEvent::SessionClosed(super::ReceivedChatContext {
+                peer_id: String::new(),
+                dialog_key: "d".into(),
+                remote_instance_id: "i".into(),
+                remote_prekey_bundle: None,
+                initiated_locally: false,
+            })
+        };
+        // One is taken by the callback (which waits); the queue then fills to its bound.
+        for _ in 0..=super::RECEIVE_QUEUE_MAX {
+            forward(event());
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, pusher_forward) = (Arc::clone(&done), Arc::clone(&forward));
+        let pusher = std::thread::spawn(move || {
+            pusher_forward(event());
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "no room: it waits");
+        release.send(()).unwrap();
+        pusher.join().unwrap();
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst), "room came: queued");
+        drop(release);
+        dispatch.shutdown();
+        assert_eq!(handled.load(std::sync::atomic::Ordering::SeqCst), super::RECEIVE_QUEUE_MAX + 2, "none lost");
+    }
+
+    /// Blind audit 2026-11-11, pass 14: past its wait every event was queued over the bound, with
+    /// no end to it; and media waited for room like the rest.
+    #[test]
+    fn the_queue_to_the_app_has_a_ceiling_and_media_does_not_wait() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let (_forward, dispatch) = super::ReceiveDispatcher::spawn(Arc::new(move |_event| {
+            let _ = held.lock().unwrap().recv();
+        }));
+        let context = || super::ReceivedChatContext {
+            peer_id: String::new(),
+            dialog_key: "d".into(),
+            remote_instance_id: "i".into(),
+            remote_prekey_bundle: None,
+            initiated_locally: false,
+        };
+        let queued = || dispatch.queue.lock().unwrap().events.len();
+        let wire = || ReceivedTransportEvent::WireEnvelope(WireEnvelopeV1::chat_text("m".to_string(), "x".to_string(), 1), context());
+        // Not waiting (as the dispatcher's own thread hands in): up to the ceiling, no further.
+        for _ in 0..super::RECEIVE_QUEUE_CEILING + 50 {
+            dispatch.push(wire(), false);
+        }
+        assert!(queued() <= super::RECEIVE_QUEUE_CEILING, "{}", queued());
+        let full = queued();
+        let started = std::time::Instant::now();
+        dispatch.push(ReceivedTransportEvent::RealtimeMediaDatagram(vec![0; 8], context()), true);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "media does not wait for room");
+        assert_eq!(queued(), full, "and is dropped");
+        let states = || dispatch.queue.lock().unwrap().events.iter().filter(|e| super::session_of_state(e).is_some()).count();
+        dispatch.push(ReceivedTransportEvent::SessionClosed(context()), false);
+        assert_eq!(states(), 1, "a session's state is kept");
+        assert_eq!(queued(), full + 1, "over the ceiling, and no other event made room for it (pass 17)");
+        // Pass 15: a flapping session does not grow it — over the ceiling, its state replaces the
+        // one of it already waiting, and the last one stands.
+        for _ in 0..2_000 {
+            dispatch.push(ReceivedTransportEvent::SessionActivated(context()), false);
+            dispatch.push(ReceivedTransportEvent::SessionClosed(context()), false);
+        }
+        assert_eq!(queued(), full + 1, "one state per session over the ceiling");
+        assert!(matches!(dispatch.queue.lock().unwrap().events.back(), Some(ReceivedTransportEvent::SessionClosed(_))), "the last one stands");
+        // Pass 16: nor do states of ever new sessions grow it for good — they have headroom of
+        // their own; pass 17: and no other event is taken out for them.
+        for n in 0..2 * super::RECEIVE_QUEUE_MAX {
+            let other = super::ReceivedChatContext { dialog_key: format!("d-{n}"), ..context() };
+            dispatch.push(ReceivedTransportEvent::SessionActivated(other), false);
+        }
+        assert_eq!(queued(), super::RECEIVE_QUEUE_STATE_CEILING, "the states stop at their own ceiling");
+        assert_eq!(queued() - states(), full, "and every event that is no state is still there");
+        drop(release);
+        dispatch.shutdown();
+    }
+
     /// A stand-in for the mesh carrier: answers every send with `outcome` and every durable hold
     /// with `durable`, and records which dialogs it was asked about.
     struct FakeCarrier {

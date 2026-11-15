@@ -2,6 +2,7 @@
 name = "omni-crypto"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 aes-gcm.workspace = true
@@ -16,6 +17,7 @@ serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true
 x25519-dalek.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

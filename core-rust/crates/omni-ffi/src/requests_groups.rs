@@ -14,6 +14,10 @@ pub(crate) struct GroupIdRequest {
 pub(crate) struct SendGroupTextRequest {
     pub(crate) group_id: String,
     pub(crate) body: String,
+    #[serde(default)]
+    pub(crate) reply_to: Option<String>,
+    #[serde(default)]
+    pub(crate) mentions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +30,12 @@ pub(crate) struct SendGroupAttachmentRequest {
     pub(crate) display_file_name: Option<String>,
     #[serde(default)]
     pub(crate) as_photo: bool,
+    #[serde(default)]
+    pub(crate) as_voice: bool,
+    #[serde(default)]
+    pub(crate) as_video_note: bool,
+    #[serde(default)]
+    pub(crate) reply_to: Option<String>,
 }
 
 /// Invite contacts by their 1:1 dialog: `dialog_keys`, or the single `dialog_key`.
@@ -68,6 +78,13 @@ pub(crate) struct SetGroupAdminRequest {
     pub(crate) group_id: String,
     pub(crate) member_pub: String,
     pub(crate) admin: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SetGroupCallAudioLevelRequest {
+    pub(crate) group_id: String,
+    /// The capture's smoothed RMS, 0..1.
+    pub(crate) level: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

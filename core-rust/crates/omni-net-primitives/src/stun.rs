@@ -208,6 +208,53 @@ pub fn reflexive_consensus(answers: &[SocketAddr]) -> Option<Reflexive> {
     None
 }
 
+/// Public STUN servers that answer over TCP (RFC 5389 §7.2.2), for the TCP hole punch: the address a
+/// NAT gives a TCP socket has nothing to do with the UDP one. Most UDP servers do not listen on TCP —
+/// of a dozen tried (2026-11-08) these three answered; Cloudflare's and Google's did not.
+pub const DEFAULT_TCP_STUN_SERVERS: &[&str] =
+    &["stun.nextcloud.com:3478", "stun.antisip.com:3478", "stun.freeswitch.org:3478"];
+
+/// The TCP address worth publishing for a hole punch: two servers saw exactly the same `ip:port`, and
+/// no answer shows the same IP with another port. Stricter than [`reflexive_consensus`] on purpose —
+/// a peer dials this exact port, so it is useless unless the NAT hands the same port to every
+/// destination (one answer with a different port means it does not).
+pub fn tcp_punch_consensus(answers: &[SocketAddr]) -> Option<SocketAddr> {
+    let agreed = answers
+        .iter()
+        .find(|candidate| answers.iter().filter(|other| other == candidate).count() >= 2)?;
+    let mapping_depends_on_destination =
+        answers.iter().any(|other| other.ip() == agreed.ip() && other.port() != agreed.port());
+    (!mapping_depends_on_destination).then_some(*agreed)
+}
+
+/// One round of STUN from one socket: how many servers were asked and what the ones that answered
+/// said. Kept whole rather than reduced to the consensus, because «no consensus» covers three
+/// different situations — nobody answered, one answered, answers disagreed — and the first two
+/// were indistinguishable in the trace (stand 2026-11-08: twelve rounds of «fewer than two agreed»).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StunProbe {
+    pub asked: usize,
+    pub answers: Vec<SocketAddr>,
+}
+
+impl StunProbe {
+    /// The cross-checked answer: ≥2 servers agree on the IP (`reflexive_consensus`).
+    pub fn consensus(&self) -> Option<Reflexive> {
+        reflexive_consensus(&self.answers)
+    }
+
+    /// The address of the ONLY server that answered. Not cross-checked and saying nothing about the
+    /// NAT class, but it came from a server we asked, with our transaction id — a far better guess
+    /// than none: without it a node whose other servers were silent published no IPv4 at all, and a
+    /// peer with no IPv6 had nothing to dial (stand 2026-11-08).
+    pub fn lone(&self) -> Option<SocketAddr> {
+        match self.answers.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,8 +362,8 @@ mod tests {
         assert!(!r.endpoint_independent);
     }
 
-    /// One answer (or two that disagree on the IP) is not a consensus — a lone server can't dictate
-    /// what we advertise.
+    /// One answer (or two that disagree on the IP) is not a consensus: it can't classify the NAT.
+    /// A lone answer is still used as an address (`StunProbe::lone`); a disagreeing pair is not.
     #[test]
     fn a_single_or_disagreeing_answer_is_no_consensus() {
         assert_eq!(reflexive_consensus(&[v4("203.0.113.7:8452")]), None);
@@ -324,6 +371,47 @@ mod tests {
             reflexive_consensus(&[v4("203.0.113.7:8452"), v4("198.51.100.1:8452")]),
             None
         );
+    }
+
+    /// The three ways to have no consensus are told apart: a lone answer gives an address (NAT class
+    /// unknown), silence and disagreement give none — and a consensus is never read as «lone».
+    #[test]
+    fn a_tcp_punch_address_needs_two_identical_answers_and_no_other_port() {
+        // Two servers saw the same ip:port (the third was silent) — publishable.
+        assert_eq!(
+            tcp_punch_consensus(&[v4("203.0.113.7:28848"), v4("203.0.113.7:28848")]),
+            Some(v4("203.0.113.7:28848"))
+        );
+        // A port-preserving NAT, all three answering — publishable.
+        let same = v4("198.51.100.4:47013");
+        assert_eq!(tcp_punch_consensus(&[same, same, same]), Some(same));
+        // One answer: nothing to cross-check.
+        assert_eq!(tcp_punch_consensus(&[same]), None);
+        // Two agree, a third saw another port from the same IP: the mapping depends on the
+        // destination, so the peer would dial a port that is not ours towards it.
+        assert_eq!(
+            tcp_punch_consensus(&[v4("203.0.113.7:28848"), v4("203.0.113.7:28848"), v4("203.0.113.7:9010")]),
+            None
+        );
+        // Same IP, every port different — the UDP consensus would still name an IP; this must not.
+        assert_eq!(tcp_punch_consensus(&[v4("203.0.113.7:1000"), v4("203.0.113.7:2000")]), None);
+    }
+
+    #[test]
+    fn a_probe_tells_a_lone_answer_from_silence_and_disagreement() {
+        let lone = StunProbe { asked: 4, answers: vec![v4("203.0.113.7:8452")] };
+        assert_eq!(lone.consensus(), None);
+        assert_eq!(lone.lone(), Some(v4("203.0.113.7:8452")));
+
+        let silent = StunProbe { asked: 4, answers: vec![] };
+        assert_eq!((silent.consensus(), silent.lone()), (None, None));
+
+        let split = StunProbe { asked: 4, answers: vec![v4("203.0.113.7:8452"), v4("198.51.100.1:8452")] };
+        assert_eq!((split.consensus(), split.lone()), (None, None));
+
+        let agreed = StunProbe { asked: 4, answers: vec![v4("203.0.113.7:8452"), v4("203.0.113.7:8452")] };
+        assert!(agreed.consensus().is_some());
+        assert_eq!(agreed.lone(), None);
     }
 
     /// The demux test on a socket shared with QUIC: a binding response is STUN, a QUIC Initial is not,

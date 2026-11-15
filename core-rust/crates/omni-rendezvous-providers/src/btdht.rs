@@ -39,7 +39,7 @@
 //! put/get primitive. The rare same-slot first-contact race is covered by bucket-rotation + the
 //! ntfy/Nostr legs, exactly as before (see the courier ADR's residual note).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::BufReader;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -181,12 +181,14 @@ fn request(endpoint: &str, line: &str) -> Result<String, ChannelError> {
         TcpStream::connect(endpoint).map_err(|e| ChannelError(format!("btdht connect {endpoint}: {e}")))?;
     let _ = stream.set_read_timeout(Some(IPC_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
-    writeln!(stream, "{line}").map_err(|e| ChannelError(format!("btdht write: {e}")))?;
-    let _ = stream.flush();
-    let mut reply = String::new();
-    BufReader::new(stream)
-        .read_line(&mut reply)
-        .map_err(|e| ChannelError(format!("btdht read: {e}")))?;
+    // The DHT helper takes the token the core gave both helpers (V-21).
+    omni_rendezvous::helper_ipc::write_request(&mut stream, omni_rendezvous::helper_ipc::process_helper_token(), line)
+        .map_err(|e| ChannelError(format!("btdht write: {e}")))?;
+    let reply = omni_rendezvous::helper_ipc::read_line_capped(
+        &mut BufReader::new(stream),
+        omni_rendezvous::helper_ipc::HELPER_REPLY_MAX,
+    )
+    .map_err(|e| ChannelError(format!("btdht read: {e}")))?;
     Ok(reply.trim().to_string())
 }
 
@@ -275,6 +277,9 @@ mod tests {
         let Ok(read_half) = stream.try_clone() else { return };
         let mut reader = BufReader::new(read_half);
         let mut writer = stream;
+        if !omni_rendezvous::helper_ipc::accept_client(&mut reader, omni_rendezvous::helper_ipc::process_helper_token()) {
+            return;
+        }
         let mut line = String::new();
         loop {
             line.clear();

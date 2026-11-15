@@ -22,7 +22,7 @@ The guiding rule is simple:
 
 - `windows-app/`
   - WinUI 3 shell
-  - renders chats, contacts, settings, devices, files, diagnostics, saved profiles, LAN peers, and call surfaces
+  - renders chats, contacts, groups, settings, devices, files, diagnostics, saved profiles and call surfaces
   - talks to Rust through FFI only
 - `core-rust/crates/omni-ffi`
   - stable C ABI
@@ -31,7 +31,7 @@ The guiding rule is simple:
   - shared product types, screen snapshots, call DTOs, and foundational errors
 - `core-rust/crates/omni-app`
   - orchestration layer
-  - composes storage, transport, identity, messaging, routing, and projections
+  - composes storage, transport, identity, messaging, mesh, calls, groups and projections
 - `core-rust/crates/omni-transport`
   - session seam for the mesh: verified connections registered by mesh links, inbound envelope dispatch, send through the mesh carrier or durable store-and-forward (the pre-mesh QUIC listener/dialer is gone, `docs/decisions/no-friend-tier.md` part 2)
 - `core-rust/crates/omni-storage`
@@ -44,8 +44,24 @@ The guiding rule is simple:
   - encrypted 1:1 envelope flow
 - `core-rust/crates/omni-protocol`
   - versioned DTOs and control-plane payload contracts
-- `core-rust/crates/omni-sync`
-  - device and sync domain helpers
+- `core-rust/crates/omni-group-mls`
+  - group membership and messaging crypto (MLS)
+- `core-rust/crates/omni-network`
+  - the mesh overlay: links, announce routing, relays, durable store-and-forward, media datagrams
+- `core-rust/crates/omni-mesh-runtime`
+  - the `MeshRuntime` facade over `omni-network` (links, carriers, lifecycle)
+- `core-rust/crates/omni-net-primitives`
+  - identity-agnostic network primitives (QUIC config, multicast, STUN)
+- `core-rust/crates/omni-rendezvous`
+  - serverless rendezvous: the channel trait, topics, sealed beacons
+- `core-rust/crates/omni-rendezvous-providers`
+  - rendezvous couriers: ntfy, Nostr, BitTorrent DHT
+- `core-rust/crates/omni-rendezvous-helper`, `core-rust/crates/omni-dht-helper`
+  - the courier and Mainline DHT helper processes (key-free, untrusted)
+- `core-rust/crates/omni-daemon`
+  - the reusable daemon/CLI command dispatcher
+- `core-rust/crates/omni-node`
+  - a headless node over `omni-app`, for development and validation
 
 ## Active Session Boundary
 

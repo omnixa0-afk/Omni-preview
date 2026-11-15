@@ -503,6 +503,9 @@ fn build_call_history_message_record(summary: &CallSummary) -> Option<ChatMessag
             remote_control: summary.remote_control.is_some(),
         }),
         told_by_contact: false,
+        reply: None,
+        reactions: Vec::new(),
+        pinned: false,
     })
 }
 

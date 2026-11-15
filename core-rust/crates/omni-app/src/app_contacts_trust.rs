@@ -219,37 +219,6 @@ impl OmniApp {
         Ok((bound, true))
     }
 
-    pub fn add_contact_by_identifier(
-        &self,
-        account_id: impl Into<String>,
-        petname: impl Into<String>,
-        public_display_name: Option<String>,
-    ) -> OmniResult<ContactSnapshot> {
-        let _ = self.ensure_runtime_profile_active("add_contact_by_identifier")?;
-        let account_id = account_id.into();
-        let account_id = account_id.trim();
-
-        if account_id.is_empty() {
-            return Err(OmniError::InvalidInput(
-                "account_id must not be empty".to_string(),
-            ));
-        }
-
-        let public_display_name = public_display_name
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| account_id.to_string());
-
-        self.add_contact(&AddContactInput {
-            petname: petname.into(),
-            remote_account_id: Some(omni_identity::AccountId(account_id.to_string())),
-            public_display_name: Some(public_display_name),
-            remote_instance_id: None,
-            primary_dialog_key: None,
-            initial_observation: None,
-        })
-    }
-
     pub fn request_contact_by_identifier(
         &self,
         account_id: impl Into<String>,
@@ -304,10 +273,23 @@ impl OmniApp {
         Ok(renamed)
     }
 
+    /// End a call with the contact before it loses its 1:1 rights (F2, audit 2026-11-09 #5).
+    fn end_call_with_contact(&self, contact_id: &ContactId) -> OmniResult<()> {
+        match self.storage.get_contact(contact_id)?.remote_account_id {
+            Some(account) => self.end_call_with_account(&account),
+            None => Ok(()),
+        }
+    }
+
     pub fn block_contact(&self, contact_id: &ContactId) -> OmniResult<ContactSnapshot> {
         let _ = self.ensure_runtime_profile_active("block_contact")?;
+        self.end_call_with_contact(contact_id)?;
         let blocked = self.storage.decline_contact(contact_id, current_unix_ms())?;
         self.push_contact_change_to_own_devices();
+        // Its direct links go now, not on the next tick.
+        if let Some(runtime) = self.mesh_runtime() {
+            crate::refuse_direct_links_with_blocked(&self.storage, &runtime);
+        }
         Ok(blocked)
     }
 
@@ -323,6 +305,12 @@ impl OmniApp {
             ));
         }
         let approved = self.storage.approve_contact(contact_id, now_unix_ms)?;
+        // A contact taken back from a block may link with us from now, not from the next tick: its
+        // first dial after the unblock was refused, and where no tick runs (a mesh started without
+        // autoconnect) every one after it (live 2026-11-11).
+        if let Some(runtime) = self.mesh_runtime() {
+            crate::refuse_direct_links_with_blocked(&self.storage, &runtime);
+        }
         let (mut approved, matched_active_transport) =
             self.maybe_bind_contact_to_active_transport(&approved, now_unix_ms)?;
         let latest_session = if matched_active_transport {
@@ -559,15 +547,16 @@ impl OmniApp {
         Ok(approved)
     }
 
+    /// Declining is blocking (the same state): one path, so its direct links go at once too. A copy
+    /// of `block_contact` without that step left them up until the next tick — and with no
+    /// auto-connect, no tick (blind audit 2026-11-11, F8).
     pub fn decline_contact(&self, contact_id: &ContactId) -> OmniResult<ContactSnapshot> {
-        let _ = self.ensure_runtime_profile_active("decline_contact")?;
-        let declined = self.storage.decline_contact(contact_id, current_unix_ms())?;
-        self.push_contact_change_to_own_devices();
-        Ok(declined)
+        self.block_contact(contact_id)
     }
 
     pub fn forget_contact(&self, contact_id: &ContactId) -> OmniResult<ContactSnapshot> {
         let _ = self.ensure_runtime_profile_active("forget_contact")?;
+        self.end_call_with_contact(contact_id)?;
         let _session_guard = lock_app_session_guard(&self.session_lock)?;
         let removed = self.storage.forget_contact(contact_id, current_unix_ms())?;
         if let Some(remote_account_id) = removed.remote_account_id.as_ref() {
@@ -588,6 +577,7 @@ impl OmniApp {
         contact_id: &ContactId,
     ) -> OmniResult<ContactSnapshot> {
         let _ = self.ensure_runtime_profile_active("forget_contact_and_reset_peer")?;
+        self.end_call_with_contact(contact_id)?;
         let _session_guard = lock_app_session_guard(&self.session_lock)?;
         let contact = self.storage.get_contact(contact_id)?;
         let dialog_keys = contact_dialog_keys_for_peer_reset(&contact);
@@ -625,14 +615,17 @@ impl OmniApp {
     }
 
     pub fn list_contacts(&self) -> OmniResult<Vec<ContactSnapshot>> {
+        let _ = self.ensure_runtime_profile_active("list_contacts")?;
         self.storage.list_contacts()
     }
 
     pub fn get_contacts_refresh_summary(&self) -> OmniResult<omni_types::ContactsRefreshSummary> {
+        let _ = self.ensure_runtime_profile_active("get_contacts_refresh_summary")?;
         self.storage.get_contacts_refresh_summary()
     }
 
     pub fn get_contacts_screen_snapshot(&self) -> OmniResult<ContactsScreenSnapshot> {
+        let _ = self.ensure_runtime_profile_active("get_contacts_screen_snapshot")?;
         Ok(ContactsScreenSnapshot {
             refresh_summary: self.storage.get_contacts_refresh_summary()?,
             contacts: self.storage.list_contacts()?,
@@ -640,6 +633,7 @@ impl OmniApp {
     }
 
     pub fn get_contact_card(&self, contact_id: &ContactId) -> OmniResult<ContactCardSnapshot> {
+        let _ = self.ensure_runtime_profile_active("get_contact_card")?;
         self.storage.get_contact_card(contact_id)
     }
 
@@ -647,6 +641,7 @@ impl OmniApp {
         &self,
         contact_id: &ContactId,
     ) -> OmniResult<Option<omni_types::EntityRevisionSnapshot>> {
+        let _ = self.ensure_runtime_profile_active("get_contact_card_revision")?;
         self.storage.get_contact_card_revision(contact_id)
     }
 

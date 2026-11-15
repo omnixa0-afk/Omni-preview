@@ -145,6 +145,7 @@ fn handle_incoming_contact_sync(
         }
     }
     forget_runtime_state_of_removed_contacts(storage, &removed);
+    end_calls_with_contacts_no_longer_approved(storage, Some(transport), &sync.entries);
     omni_app_trace_log(
         "own_devices/contacts_in",
         &format!(
@@ -190,6 +191,30 @@ fn handle_incoming_contact_sync_ack(
 }
 
 /// Merge one entry and make the contacts table follow. Returns the contact when this removed it.
+/// A contact blocked or removed on another device of ours ends a call with them here too, as it does
+/// where it was done (A01, audit 2026-11-09 #6) — whichever way the record came (a sync, the account
+/// mailbox, a recovered passport). By the state now, not by the entry: an entry older than what this
+/// device holds changed nothing. The caller holds the session lock.
+fn end_calls_with_contacts_no_longer_approved(
+    storage: &Storage,
+    transport: Option<&TransportManager>,
+    entries: &[omni_types::ContactSyncEntryV1],
+) {
+    let own = storage.get_local_account().ok().flatten().map(|account| account.descriptor.account_id);
+    for entry in entries.iter().filter(|e| own.as_ref().is_none_or(|own| own.0 != e.account_id)) {
+        let account = AccountId(entry.account_id.clone());
+        let approved = match storage.find_contact_by_remote_account_id(&account) {
+            Ok(contact) => contact.is_some_and(|c| c.relationship_state == ContactRelationshipState::Approved && !c.is_blocked),
+            Err(_) => continue,
+        };
+        if !approved {
+            if let Err(error) = end_call_with_account_under_lock(storage, transport, &account) {
+                omni_app_trace_log("own_devices/contacts_in", &format!("account={} call not ended: {error}", account.0));
+            }
+        }
+    }
+}
+
 fn apply_contact_sync_entry(
     storage: &Storage,
     entry: &omni_types::ContactSyncEntryV1,

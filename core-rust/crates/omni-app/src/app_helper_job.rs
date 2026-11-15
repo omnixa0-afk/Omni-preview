@@ -4,7 +4,7 @@
 // а статики в Rust при завершении процесса НЕ дропаются; плюс у оболочки есть жёсткий backstop,
 // который добивает процесс, если окно не закрылось (`MainWindow.xaml.cs`, ShutdownExitGraceMs).
 // Любой из этих путей оставлял живого курьера: наблюдалось 2026-08-13 — приложение закрыто, а
-// `Omni.Windows.App.exe --run-helper rendezvous` держит exe и продолжает публиковать маяки на
+// `Omni.exe --run-helper rendezvous` держит exe и продолжает публиковать маяки на
 // инстанс, которого больше нет (docs/bugs/rendezvous-helper-outlives-the-app.md). Мы же потом по
 // этим маякам разбираем `NoPeerBeacon`.
 //

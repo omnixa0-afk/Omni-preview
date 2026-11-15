@@ -15,6 +15,11 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Most destinations the table holds. A neighbour that announces or answers for endless made-up
+/// destinations would otherwise grow it without bound (V-07); when full, expired entries go first,
+/// then the one heard from longest ago.
+pub const MAX_PATH_ENTRIES: usize = 4096;
+
 /// Cached path entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathEntry {
@@ -44,6 +49,24 @@ pub struct PathTable {
     entries: Mutex<HashMap<NodeAddress, PathEntry>>,
 }
 
+/// Make room for a new `destination` in a full table: expired entries first, then the one heard
+/// from longest ago. See `MAX_PATH_ENTRIES`.
+fn make_room(entries: &mut HashMap<NodeAddress, PathEntry>, destination: &NodeAddress, now: Instant) {
+    if entries.contains_key(destination) || entries.len() < MAX_PATH_ENTRIES {
+        return;
+    }
+    entries.retain(|_, entry| !entry.is_expired(now));
+    if entries.len() >= MAX_PATH_ENTRIES {
+        let stalest = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen)
+            .map(|(dest, _)| *dest);
+        if let Some(dest) = stalest {
+            entries.remove(&dest);
+        }
+    }
+}
+
 impl PathTable {
     pub fn new() -> Self {
         Self::default()
@@ -61,6 +84,7 @@ impl PathTable {
         now: Instant,
     ) -> bool {
         let mut entries = self.entries.lock();
+        make_room(&mut entries, &destination, now);
         let new = PathEntry {
             next_hop_interface,
             next_hop_neighbor,
@@ -107,6 +131,7 @@ impl PathTable {
         now: Instant,
     ) -> bool {
         let mut entries = self.entries.lock();
+        make_room(&mut entries, &destination, now);
         let new = PathEntry {
             next_hop_interface,
             next_hop_neighbor,
@@ -197,6 +222,29 @@ mod tests {
 
     fn iface() -> InterfaceId {
         InterfaceId("test-iface".to_string())
+    }
+
+    /// V-07: the table stops at `MAX_PATH_ENTRIES`; a new destination pushes out the one heard
+    /// from longest ago.
+    #[test]
+    fn table_is_capped_and_drops_the_stalest() {
+        let table = PathTable::new();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(300);
+        let first = NodeAddress::from_bytes([0u8; 20]);
+        table.update(first, iface(), NeighborId("n".into()), 1, ttl, t0);
+        for i in 1..MAX_PATH_ENTRIES as u32 {
+            let mut bytes = [0u8; 20];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            let at = t0 + Duration::from_millis(1);
+            table.update(NodeAddress::from_bytes(bytes), iface(), NeighborId("n".into()), 1, ttl, at);
+        }
+        assert_eq!(table.len(), MAX_PATH_ENTRIES);
+        let newcomer = fresh_addr();
+        table.update(newcomer, iface(), NeighborId("n".into()), 1, ttl, t0 + Duration::from_millis(2));
+        assert_eq!(table.len(), MAX_PATH_ENTRIES);
+        assert!(table.lookup(&newcomer, t0 + Duration::from_millis(2)).is_some());
+        assert!(table.lookup(&first, t0 + Duration::from_millis(2)).is_none(), "the stalest went");
     }
 
     fn neighbor(name: &str) -> NeighborId {

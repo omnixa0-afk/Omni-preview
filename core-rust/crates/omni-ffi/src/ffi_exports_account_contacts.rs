@@ -714,30 +714,13 @@ pub extern "C" fn omni_contacts_get_screen_snapshot(handle: *mut OmniAppHandle) 
     }
 }
 
+/// Let us meet contacts through a server one of their devices named (V-13).
 #[no_mangle]
-pub extern "C" fn omni_contacts_add_by_identifier(
+pub extern "C" fn omni_contacts_allow_courier(
     handle: *mut OmniAppHandle,
     request_json: *const c_char,
 ) -> *mut c_char {
-    match catch_unwind(AssertUnwindSafe(|| {
-        contacts_add_by_identifier_impl(handle, request_json)
-    })) {
-        Ok(payload) => payload,
-        Err(_) => to_c_string_payload(&ErrorEnvelope {
-            ok: false,
-            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
-        }),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn omni_contacts_request_by_identifier(
-    handle: *mut OmniAppHandle,
-    request_json: *const c_char,
-) -> *mut c_char {
-    match catch_unwind(AssertUnwindSafe(|| {
-        contacts_request_by_identifier_impl(handle, request_json)
-    })) {
+    match catch_unwind(AssertUnwindSafe(|| contacts_allow_courier_impl(handle, request_json))) {
         Ok(payload) => payload,
         Err(_) => to_c_string_payload(&ErrorEnvelope {
             ok: false,

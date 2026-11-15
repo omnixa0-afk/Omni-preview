@@ -12,7 +12,6 @@
   mc:Ignorable="d">
 
   <UserControl.Resources>
-    <chats:ChatBubbleBrushConverter x:Key="BubbleBrushConverter" />
 
     <!-- One call tile, shared by the focused (big) tile and the grid/filmstrip tiles. Size comes
          from TileWidth/TileHeight (RefreshCallTiles); initials show until the sender's video covers
@@ -139,6 +138,7 @@
           </StackPanel>
         </shared:ConversationHeader.Actions>
       </shared:ConversationHeader>
+      <shared:SelectionBar x:Name="GroupSelectionBar" Grid.Row="0" />
 
       <!-- Status line (errors, "приглашения отправлены"). -->
       <TextBlock
@@ -218,140 +218,58 @@
       <Border Grid.Row="3" AllowDrop="True" Background="{ThemeResource OmniBgAppBrush}" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,1,0,0" DragOver="OnThreadDragOver" Drop="OnThreadDrop">
         <Grid RowSpacing="10">
           <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
           </Grid.RowDefinitions>
-        <ScrollViewer x:Name="GroupMessagesScroll" Margin="0,0,8,0" VerticalScrollBarVisibility="Auto">
-          <!-- As in the 1:1 chat: the list stands 8 off the edge and the bubbles 20 inside it, so
-               the overlaid 12-wide bar sits in the middle of the gap, not over the bubbles. -->
-          <ItemsControl x:Name="GroupMessagesList" Margin="16,12,20,8">
-            <ItemsControl.ItemTemplate>
+        <StackPanel>
+          <shared:PinnedBar x:Name="GroupPinnedBar" />
+        </StackPanel>
+          <!-- As in the 1:1 chat: virtualized, and the list stands 8 off the edge and the bubbles 20
+               inside it, so the overlaid 12-wide bar sits in the middle of the gap, not over the bubbles. -->
+          <ListView
+            x:Name="GroupMessagesList"
+            Grid.Row="1"
+            Margin="0,0,8,0"
+            Padding="0,12,0,6"
+            SelectionMode="None"
+            ShowsScrollingPlaceholders="False">
+            <ListView.ItemsPanel>
+              <ItemsPanelTemplate>
+                <ItemsStackPanel CacheLength="2" ItemsUpdatingScrollMode="KeepScrollOffset" />
+              </ItemsPanelTemplate>
+            </ListView.ItemsPanel>
+            <ListView.ItemContainerTransitions>
+              <TransitionCollection />
+            </ListView.ItemContainerTransitions>
+            <ListView.ItemContainerStyle>
+              <Style TargetType="ListViewItem">
+                <Setter Property="Padding" Value="16,0,20,0" />
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+              </Style>
+            </ListView.ItemContainerStyle>
+            <ListView.ItemTemplate>
               <DataTemplate x:DataType="local:GroupMessageItem">
-                <Grid Margin="0,3">
-                  <Border
-                    Padding="10,4"
-                    HorizontalAlignment="Center"
-                    Background="{ThemeResource OmniBgElevatedBrush}"
-                    CornerRadius="10"
-                    Visibility="{x:Bind SystemVisibility}">
-                    <TextBlock FontSize="12" Opacity="0.75" Text="{x:Bind Body}" TextWrapping="Wrap" />
-                  </Border>
-                  <Grid ColumnSpacing="8" Visibility="{x:Bind BubbleVisibility}">
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="Auto" />
-                      <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <!-- The author's avatar at the foot of each incoming run, as in the 1:1 chat. -->
-                    <shared:AvatarView
-                      VerticalAlignment="Bottom"
-                      Fill="{x:Bind AvatarBrush}"
-                      Opacity="{x:Bind AvatarOpacity}"
-                      Picture="{x:Bind Picture}"
-                      PictureTitle="{x:Bind SenderName}"
-                      Size="34"
-                      Text="{x:Bind Initials}"
-                      Visibility="{x:Bind AvatarSlotVisibility}" />
-                  <Border
-                    Grid.Column="1"
-                    MaxWidth="560"
-                    Padding="12,8"
-                    HorizontalAlignment="{x:Bind Alignment}"
-                    Background="{x:Bind IsMine, Converter={StaticResource BubbleBrushConverter}}"
-                    BorderBrush="{ThemeResource OmniBubbleStrokeBrush}"
-                    BorderThickness="1"
-                    CornerRadius="12">
-                    <StackPanel Spacing="2">
-                      <TextBlock
-                        FontSize="12"
-                        FontWeight="SemiBold"
-                        Foreground="{ThemeResource OmniAccentBrush}"
-                        Text="{x:Bind SenderName}"
-                        Visibility="{x:Bind SenderVisibility}" />
-                      <!-- A photo and a file as in the 1:1 bubble (ChatsSectionControl.xaml). -->
-                      <Button
-                        Margin="-8,2,-8,2"
-                        Padding="0"
-                        AutomationProperties.Name="Фото"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Click="OnPhotoClicked"
-                        Tag="{x:Bind MessageId}"
-                        Visibility="{x:Bind PhotoVisibility}">
-                        <Button.ContextFlyout>
-                          <MenuFlyout Opening="OnPhotoMenuOpening">
-                            <MenuFlyoutItem Click="OnPhotoClicked" Text="Открыть">
-                              <MenuFlyoutItem.Icon>
-                                <FontIcon Glyph="&#xE8A7;" />
-                              </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Click="OnPhotoSaveClicked" Text="Сохранить как…">
-                              <MenuFlyoutItem.Icon>
-                                <FontIcon Glyph="&#xE896;" />
-                              </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                          </MenuFlyout>
-                        </Button.ContextFlyout>
-                        <shared:PhotoView
-                          Width="{x:Bind PhotoDisplayWidth}"
-                          Height="{x:Bind PhotoDisplayHeight}"
-                          DecodeWidth="{x:Bind PhotoDecodeWidth}"
-                          LocalPath="{x:Bind PhotoLocalPath}"
-                          PreviewBase64="{x:Bind PhotoPreviewBase64}" />
-                      </Button>
-                      <Button
-                        Padding="0"
-                        HorizontalAlignment="Stretch"
-                        HorizontalContentAlignment="Stretch"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Click="OnFileClicked"
-                        Tag="{x:Bind MessageId}"
-                        Visibility="{x:Bind FileVisibility}">
-                        <Grid Padding="0,4" ColumnSpacing="10">
-                          <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                          </Grid.ColumnDefinitions>
-                          <Border
-                            Width="44"
-                            Height="44"
-                            VerticalAlignment="Top"
-                            Background="{ThemeResource AccentFillColorSecondaryBrush}"
-                            CornerRadius="22">
-                            <FontIcon HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="18" Glyph="&#xE130;" />
-                          </Border>
-                          <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
-                            <TextBlock FontWeight="SemiBold" Text="{x:Bind FileName}" TextWrapping="Wrap" />
-                            <TextBlock FontSize="12" Opacity="0.76" Text="{x:Bind FileSizeText}" />
-                            <TextBlock FontSize="12" Opacity="0.86" Text="{x:Bind FileStatusText}" TextWrapping="Wrap" Visibility="{x:Bind FileStatusVisibility}" />
-                            <ProgressBar
-                              Height="4"
-                              Maximum="100"
-                              Minimum="0"
-                              Value="{x:Bind FileProgressValue}"
-                              Visibility="{x:Bind FileProgressVisibility}" />
-                          </StackPanel>
-                        </Grid>
-                      </Button>
-                      <TextBlock
-                        Foreground="{ThemeResource OmniTextBrush}"
-                        IsTextSelectionEnabled="True"
-                        Text="{x:Bind Body}"
-                        TextWrapping="Wrap"
-                        Visibility="{x:Bind BodyVisibility}" />
-                      <TextBlock HorizontalAlignment="Right" FontSize="10" Opacity="0.6" Text="{x:Bind TimeText}" />
-                    </StackPanel>
-                  </Border>
-                  </Grid>
-                </Grid>
+                <shared:MessageBubble
+                  DeleteRequested="OnMessageDeleteRequested"
+                  FileClicked="OnFileClicked"
+                  ForwardRequested="OnMessageForwardRequested"
+                  PhotoClicked="OnPhotoClicked"
+                  PhotoSaveClicked="OnPhotoSaveClicked"
+                  PinRequested="OnMessagePinRequested"
+                  QuoteOpened="OnMessageQuoteOpened"
+                  ReactionChosen="OnMessageReactionChosen"
+                  ReplyRequested="OnMessageReplyRequested"
+                  SelectRequested="OnMessageSelectRequested"
+                  SelectionToggled="OnMessageSelectionToggled"
+                  Row="{x:Bind}" />
               </DataTemplate>
-            </ItemsControl.ItemTemplate>
-          </ItemsControl>
-        </ScrollViewer>
+            </ListView.ItemTemplate>
+          </ListView>
         <!-- Alone in the group: say so and offer the way out, right where the eye is. -->
         <Border
           x:Name="GroupAloneNudge"
-          Grid.Row="1"
+          Grid.Row="2"
           Margin="0,0,0,12"
           Padding="14,10"
           HorizontalAlignment="Center"
@@ -584,6 +502,18 @@
               <StackPanel Spacing="4">
                 <FontIcon FontSize="18" Glyph="&#xE8FA;" />
                 <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Пригласить" />
+              </StackPanel>
+            </Button>
+            <!-- The group's code in the Workspaces section; a group without code yet gets it there. -->
+            <Button
+              x:Name="GroupInfoWorkspaceTile"
+              AutomationProperties.Name="Код группы"
+              Click="OnWorkspaceTileClicked"
+              Style="{StaticResource ActionTileButtonStyle}"
+              ToolTipService.ToolTip="Код группы в разделе Workspaces: папка с git-репозиторием, ветки, общий main">
+              <StackPanel Spacing="4">
+                <FontIcon FontSize="18" Glyph="&#xE821;" />
+                <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Код" />
               </StackPanel>
             </Button>
             <!-- Admins only: the name and the picture, for everyone. -->

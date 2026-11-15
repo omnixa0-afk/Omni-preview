@@ -8,16 +8,20 @@ internal static class ChatPresentationText
     // Empty-state heading (the big line above the prompt). Two variants: no dialog is
     // selected vs. a dialog is open but has no messages yet. Keeps the single empty-state
     // block from showing one fixed heading that only fits one of the two situations.
-    public static string BuildTranscriptSelectionHeading(bool hasChats)
-        => hasChats ? "Выберите чат" : "Здесь появятся ваши чаты";
+    // Three cases: chats to choose from; contacts but no conversation yet (Chats lists conversations
+    // only, docs/decisions/omni-app-ux.md R1); nobody at all.
+    public static string BuildTranscriptSelectionHeading(bool hasChats, bool hasContacts = false)
+        => hasChats ? "Выберите чат" : hasContacts ? "Начните разговор" : "Здесь появятся ваши чаты";
 
     public static string BuildTranscriptEmptyHeading()
         => "Пока тихо";
 
-    public static string BuildTranscriptChatSelectionPrompt(bool hasChats)
+    public static string BuildTranscriptChatSelectionPrompt(bool hasChats, bool hasContacts = false)
         => hasChats
             ? "Переписка откроется здесь."
-            : "Добавьте первый контакт — по приглашению, коду связи или Omni-ID.";
+            : hasContacts
+                ? "Выберите человека в Контактах и нажмите «Написать» — разговор появится здесь."
+                : "Добавьте первый контакт — по приглашению или Omni-ID.";
 
     public static string BuildTranscriptUnavailableText()
         => "История переписки недоступна.";
@@ -47,9 +51,13 @@ internal static class ChatPresentationText
         }
         if (string.IsNullOrWhiteSpace(body) && lastMessage.Attachment is not null)
         {
-            body = lastMessage.Attachment.Presentation is { IsPhoto: true }
-                ? "Фото"
-                : $"Файл: {lastMessage.Attachment.FileName}";
+            body = lastMessage.Attachment.Presentation switch
+            {
+                { IsPhoto: true } => "Фото",
+                { IsVoice: true } => "Голосовое сообщение",
+                { IsVideoNote: true } => "Видеосообщение",
+                _ => $"Файл: {lastMessage.Attachment.FileName}",
+            };
         }
         if (body.Length > 96)
         {

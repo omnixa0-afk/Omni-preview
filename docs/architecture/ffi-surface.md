@@ -9,34 +9,34 @@ tags: [architecture, ffi, auto-generated]
 Every `pub extern "C" fn omni_*` export from `omni-ffi`. C# side imports
 these via `[DllImport]` in `windows-app/src/Omni.Windows.App/Core/NativeMethods.*.cs`.
 
-Total: **215 exports** across 26 domain prefixes.
+Total: **240 exports** across 30 domain prefixes.
 
 ## `omni_account_*` (5 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_account_device_revoke` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:933 |
-| `omni_account_devices_acknowledge` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:904 |
-| `omni_account_devices_hide_revoked` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:917 |
-| `omni_account_devices_list` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:877 |
-| `omni_account_move_working_key` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:889 |
+| `omni_account_device_revoke` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:916 |
+| `omni_account_devices_acknowledge` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:887 |
+| `omni_account_devices_hide_revoked` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:900 |
+| `omni_account_devices_list` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:860 |
+| `omni_account_move_working_key` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:872 |
 
 ## `omni_app_*` (10 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_app_database_lock_state` | `(config_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:93 |
-| `omni_app_export_database_backup_bundle` | `(config_json: *const c_char, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:133 |
-| `omni_app_free` | `(handle: *mut OmniAppHandle)` | core-rust/crates/omni-ffi/src/lib.rs:168 |
-| `omni_app_import_database_backup_bundle` | `(config_json: *const c_char, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:149 |
-| `omni_app_init` | `(config_json: *const c_char) -> *mut OmniAppHandle` | core-rust/crates/omni-ffi/src/lib.rs:31 |
-| `omni_app_inspect_database_bootstrap` | `(config_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:78 |
-| `omni_app_last_init_error` | `() -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:55 |
-| `omni_app_ping` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:202 |
-| `omni_app_reset_local_data` | `(config_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:122 |
-| `omni_app_unlock_database_with_mnemonic` | `(config_json: *const c_char, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:106 |
+| `omni_app_database_lock_state` | `(config_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:101 |
+| `omni_app_export_database_backup_bundle` | `(config_json: *const c_char, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:141 |
+| `omni_app_free` | `(handle: *mut OmniAppHandle)` | core-rust/crates/omni-ffi/src/lib.rs:176 |
+| `omni_app_import_database_backup_bundle` | `(config_json: *const c_char, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:157 |
+| `omni_app_init` | `(config_json: *const c_char) -> *mut OmniAppHandle` | core-rust/crates/omni-ffi/src/lib.rs:35 |
+| `omni_app_inspect_database_bootstrap` | `(config_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:86 |
+| `omni_app_last_init_error` | `() -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:63 |
+| `omni_app_ping` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:225 |
+| `omni_app_reset_local_data` | `(config_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:130 |
+| `omni_app_unlock_database_with_mnemonic` | `(config_json: *const c_char, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:114 |
 
-## `omni_calls_*` (13 exports)
+## `omni_calls_*` (14 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
@@ -47,75 +47,75 @@ Total: **215 exports** across 26 domain prefixes.
 | `omni_calls_get_realtime_media_negotiation` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:105 |
 | `omni_calls_get_screen_control_state` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_screen_control.rs:49 |
 | `omni_calls_hang_up_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:18 |
+| `omni_calls_media_unopened_total` | `() -> u64` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:156 |
 | `omni_calls_place_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:34 |
 | `omni_calls_publish_realtime_media_capabilities` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:89 |
 | `omni_calls_request_remote_control` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:139 |
 | `omni_calls_set_local_mic_muted` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:62 |
 | `omni_calls_set_screen_control` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_screen_control.rs:37 |
-| `omni_calls_wait_change` | `(since: u64, timeout_ms: u32) -> u64` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:156 |
+| `omni_calls_wait_change` | `(since: u64, timeout_ms: u32) -> u64` | core-rust/crates/omni-ffi/src/ffi_exports_calls.rs:164 |
 
 ## `omni_chat_*` (18 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_chat_end_session` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1139 |
-| `omni_chat_get_header_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1074 |
-| `omni_chat_get_message_delta` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1213 |
-| `omni_chat_get_message_refresh_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1197 |
-| `omni_chat_get_message_security_details` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1229 |
-| `omni_chat_get_message_security_details_batch` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1245 |
-| `omni_chat_get_screen_snapshot` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1090 |
-| `omni_chat_get_security_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1181 |
-| `omni_chat_get_thread_list_refresh_summary` | `(handle: *mut OmniAppHandle,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1166 |
-| `omni_chat_list_messages` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:88 |
-| `omni_chat_list_messages_page` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:104 |
-| `omni_chat_list_thread_projections` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1155 |
-| `omni_chat_mark_read` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1123 |
-| `omni_chat_open_session_lease` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1106 |
-| `omni_chat_request_attachment_download` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:56 |
-| `omni_chat_revoke_attachment_access` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:72 |
-| `omni_chat_send_attachment` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:40 |
+| `omni_chat_end_session` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1122 |
+| `omni_chat_get_header_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1057 |
+| `omni_chat_get_message_delta` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1196 |
+| `omni_chat_get_message_refresh_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1180 |
+| `omni_chat_get_message_security_details` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1212 |
+| `omni_chat_get_message_security_details_batch` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1228 |
+| `omni_chat_get_screen_snapshot` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1073 |
+| `omni_chat_get_security_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1164 |
+| `omni_chat_get_thread_list_refresh_summary` | `(handle: *mut OmniAppHandle,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1149 |
+| `omni_chat_list_messages` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:152 |
+| `omni_chat_list_messages_page` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:168 |
+| `omni_chat_list_thread_projections` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1138 |
+| `omni_chat_mark_read` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1106 |
+| `omni_chat_open_session_lease` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1089 |
+| `omni_chat_request_attachment_download` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:120 |
+| `omni_chat_revoke_attachment_access` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:136 |
+| `omni_chat_send_attachment` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:104 |
 | `omni_chat_send_text` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:24 |
 
 ## `omni_configure_*` (1 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_configure_platform_secret_wrap_key_hex` | `(key_hex: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:213 |
+| `omni_configure_platform_secret_wrap_key_hex` | `(key_hex: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:236 |
 
-## `omni_contacts_*` (23 exports)
+## `omni_contacts_*` (22 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_contacts_add_by_identifier` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:718 |
-| `omni_contacts_add_from_payload` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:750 |
-| `omni_contacts_approve` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:798 |
-| `omni_contacts_attach_dialog_to_contact` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1293 |
-| `omni_contacts_block` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:782 |
-| `omni_contacts_confirm_verification` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1058 |
-| `omni_contacts_decline` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:947 |
-| `omni_contacts_forget` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:963 |
-| `omni_contacts_forget_and_reset_peer` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:979 |
-| `omni_contacts_get_card` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:995 |
-| `omni_contacts_get_card_revision` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1011 |
+| `omni_contacts_add_from_payload` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:733 |
+| `omni_contacts_allow_courier` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:719 |
+| `omni_contacts_approve` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:781 |
+| `omni_contacts_attach_dialog_to_contact` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1276 |
+| `omni_contacts_block` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:765 |
+| `omni_contacts_confirm_verification` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1041 |
+| `omni_contacts_decline` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:930 |
+| `omni_contacts_forget` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:946 |
+| `omni_contacts_forget_and_reset_peer` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:962 |
+| `omni_contacts_get_card` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:978 |
+| `omni_contacts_get_card_revision` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:994 |
 | `omni_contacts_get_refresh_summary` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:696 |
-| `omni_contacts_get_remote_access` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:834 |
+| `omni_contacts_get_remote_access` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:817 |
 | `omni_contacts_get_screen_snapshot` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:707 |
-| `omni_contacts_get_verification_state` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1042 |
+| `omni_contacts_get_verification_state` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1025 |
 | `omni_contacts_list` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:685 |
-| `omni_contacts_list_remote_access` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:849 |
-| `omni_contacts_quick_add_from_dialog` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1277 |
-| `omni_contacts_rename` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:766 |
-| `omni_contacts_request_by_identifier` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:734 |
-| `omni_contacts_set_friend_relay_consent` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:816 |
-| `omni_contacts_set_remote_access_granted` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:862 |
-| `omni_contacts_start_chat` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1261 |
+| `omni_contacts_list_remote_access` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:832 |
+| `omni_contacts_quick_add_from_dialog` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1260 |
+| `omni_contacts_rename` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:749 |
+| `omni_contacts_set_friend_relay_consent` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:799 |
+| `omni_contacts_set_remote_access_granted` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:845 |
+| `omni_contacts_start_chat` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1244 |
 
 ## `omni_daemon_*` (1 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_daemon_start` | `(handle: *mut OmniAppHandle, endpoint: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:188 |
+| `omni_daemon_start` | `(handle: *mut OmniAppHandle, endpoint: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:211 |
 
 ## `omni_dht_*` (9 exports)
 
@@ -143,38 +143,40 @@ Total: **215 exports** across 26 domain prefixes.
 | `omni_discoverability_set_mode` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_discoverability.rs:26 |
 | `omni_discoverability_set_name_findable` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_discoverability.rs:71 |
 
-## `omni_groups_*` (28 exports)
+## `omni_groups_*` (30 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_groups_accept_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:177 |
-| `omni_groups_call_inbox` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:318 |
-| `omni_groups_call_snapshot` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:120 |
-| `omni_groups_cancel_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:359 |
+| `omni_groups_accept_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:210 |
+| `omni_groups_call_inbox` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:351 |
+| `omni_groups_call_snapshot` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:136 |
+| `omni_groups_cancel_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:392 |
 | `omni_groups_create` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:5 |
-| `omni_groups_decline_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:191 |
-| `omni_groups_delete_for_everyone` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:219 |
-| `omni_groups_dismiss_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:373 |
-| `omni_groups_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:78 |
-| `omni_groups_join_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:329 |
-| `omni_groups_leave` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:205 |
-| `omni_groups_leave_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:106 |
+| `omni_groups_decline_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:224 |
+| `omni_groups_delete_for_everyone` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:252 |
+| `omni_groups_dismiss_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:406 |
+| `omni_groups_invite` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:94 |
+| `omni_groups_join_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:362 |
+| `omni_groups_leave` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:238 |
+| `omni_groups_leave_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:122 |
+| `omni_groups_leave_notice` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:30 |
 | `omni_groups_list` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:19 |
-| `omni_groups_list_invites` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:166 |
-| `omni_groups_list_members` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:30 |
-| `omni_groups_list_messages` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:304 |
-| `omni_groups_list_sent_invites` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:344 |
-| `omni_groups_publish_media_capabilities` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:150 |
-| `omni_groups_remove_member` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:247 |
-| `omni_groups_rename` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:261 |
-| `omni_groups_send_attachment` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:46 |
-| `omni_groups_send_text` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:62 |
-| `omni_groups_set_admin` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:290 |
-| `omni_groups_set_avatar` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:233 |
-| `omni_groups_set_call_media_state` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:134 |
+| `omni_groups_list_invites` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:199 |
+| `omni_groups_list_members` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:46 |
+| `omni_groups_list_messages` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:337 |
+| `omni_groups_list_sent_invites` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:377 |
+| `omni_groups_publish_media_capabilities` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:183 |
+| `omni_groups_remove_member` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:280 |
+| `omni_groups_rename` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:294 |
+| `omni_groups_send_attachment` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:62 |
+| `omni_groups_send_text` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:78 |
+| `omni_groups_set_admin` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:323 |
+| `omni_groups_set_avatar` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:266 |
+| `omni_groups_set_call_audio_level` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:167 |
+| `omni_groups_set_call_media_state` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:150 |
 | `omni_groups_set_call_screen_control` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_screen_control.rs:62 |
-| `omni_groups_set_newcomer_history` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:276 |
-| `omni_groups_start_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:92 |
+| `omni_groups_set_newcomer_history` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:309 |
+| `omni_groups_start_call` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_groups.rs:108 |
 
 ## `omni_identity_*` (46 exports)
 
@@ -200,7 +202,7 @@ Total: **215 exports** across 26 domain prefixes.
 | `omni_identity_get_local_prekey_bundle` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:166 |
 | `omni_identity_get_local_profile_footprint_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:558 |
 | `omni_identity_get_local_profile_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:258 |
-| `omni_identity_get_my_verification_payload` | `(handle: *mut OmniAppHandle,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1027 |
+| `omni_identity_get_my_verification_payload` | `(handle: *mut OmniAppHandle,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:1010 |
 | `omni_identity_get_password_protection_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:542 |
 | `omni_identity_get_profile_gate_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:274 |
 | `omni_identity_get_profile_lifecycle_summary` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_account_contacts.rs:305 |
@@ -237,8 +239,8 @@ Total: **215 exports** across 26 domain prefixes.
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_media_open_copy` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:157 |
-| `omni_media_read_file` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:144 |
+| `omni_media_open_copy` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:258 |
+| `omni_media_read_file` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:208 |
 
 ## `omni_mesh_*` (15 exports)
 
@@ -259,6 +261,15 @@ Total: **215 exports** across 26 domain prefixes.
 | `omni_mesh_rendezvous_reach_contact` | `(handle: *mut OmniAppHandle, account_id: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_mesh.rs:236 |
 | `omni_mesh_start` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_mesh.rs:11 |
 | `omni_mesh_stop` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_mesh.rs:23 |
+
+## `omni_message_*` (4 exports)
+
+| Export | Signature | File:Line |
+|---|---|---|
+| `omni_message_actions` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:72 |
+| `omni_message_delete` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:40 |
+| `omni_message_pin` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:56 |
+| `omni_message_react` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:88 |
 
 ## `omni_network_*` (5 exports)
 
@@ -289,8 +300,8 @@ Total: **215 exports** across 26 domain prefixes.
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_queue_diagnostics` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:131 |
-| `omni_queue_snapshot` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:120 |
+| `omni_queue_diagnostics` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:195 |
+| `omni_queue_snapshot` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:184 |
 
 ## `omni_realtime_media_*` (5 exports)
 
@@ -337,22 +348,56 @@ Total: **215 exports** across 26 domain prefixes.
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_string_free` | `(ptr: *mut c_char)` | core-rust/crates/omni-ffi/src/lib.rs:285 |
+| `omni_string_free` | `(ptr: *mut c_char)` | core-rust/crates/omni-ffi/src/lib.rs:310 |
 
-## `omni_trace_*` (1 exports)
+## `omni_trace_*` (2 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
+| `omni_trace_set_file` | `(path: *const c_char)` | core-rust/crates/omni-ffi/src/ffi_exports_trace.rs:35 |
 | `omni_trace_write` | `(category: *const c_char, message: *const c_char)` | core-rust/crates/omni-ffi/src/ffi_exports_trace.rs:14 |
 
 ## `omni_transport_*` (6 exports)
 
 | Export | Signature | File:Line |
 |---|---|---|
-| `omni_transport_apply_congestion_control_now` | `(handle: *mut OmniAppHandle,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:244 |
+| `omni_transport_apply_congestion_control_now` | `(handle: *mut OmniAppHandle,) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:267 |
 | `omni_transport_discovery_refresh` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:13 |
-| `omni_transport_effective_congestion_control` | `() -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:255 |
-| `omni_transport_set_congestion_control` | `(mode: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:235 |
-| `omni_transport_set_link_cost` | `(cost: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:226 |
+| `omni_transport_effective_congestion_control` | `() -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:278 |
+| `omni_transport_set_congestion_control` | `(mode: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:258 |
+| `omni_transport_set_link_cost` | `(cost: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/lib.rs:249 |
 | `omni_transport_snapshot` | `(handle: *mut OmniAppHandle) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:2 |
+
+## `omni_video_*` (1 exports)
+
+| Export | Signature | File:Line |
+|---|---|---|
+| `omni_video_note_stage` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:233 |
+
+## `omni_voice_*` (2 exports)
+
+| Export | Signature | File:Line |
+|---|---|---|
+| `omni_voice_read` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:245 |
+| `omni_voice_stage` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_transport.rs:220 |
+
+## `omni_workspace_*` (15 exports)
+
+| Export | Signature | File:Line |
+|---|---|---|
+| `omni_workspace_add_repo` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:23 |
+| `omni_workspace_agents` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:15 |
+| `omni_workspace_approve` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:93 |
+| `omni_workspace_branches` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:51 |
+| `omni_workspace_files` | `(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:6 |
+| `omni_workspace_main` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:65 |
+| `omni_workspace_publish_branch` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:135 |
+| `omni_workspace_pull` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:121 |
+| `omni_workspace_repos` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:37 |
+| `omni_workspace_save_version` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:192 |
+| `omni_workspace_send_to_my_devices` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:163 |
+| `omni_workspace_set_main_rule` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:79 |
+| `omni_workspace_take_from_device` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:177 |
+| `omni_workspace_take_repo` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:149 |
+| `omni_workspace_view` | `(handle: *mut OmniAppHandle, request_json: *const c_char,) -> *mut c_char` | core-rust/crates/omni-ffi/src/ffi_exports_workspace.rs:107 |
 

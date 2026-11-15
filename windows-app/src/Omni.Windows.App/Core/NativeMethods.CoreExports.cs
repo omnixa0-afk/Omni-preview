@@ -17,6 +17,7 @@ internal static partial class NativeMethods
     private static OmniImportDatabaseBackupBundleDelegate? omniAppImportDatabaseBackupBundle;
     private static OmniRunHelperDelegate? omniRunHelper;
     private static OmniTraceWriteDelegate? omniTraceWrite;
+    private static OmniTraceSetFileDelegate? omniTraceSetFile;
 
     private static void LoadCoreAppExports()
     {
@@ -33,6 +34,7 @@ internal static partial class NativeMethods
         LoadExport(ref omniAppImportDatabaseBackupBundle, nameof(omni_app_import_database_backup_bundle));
         LoadExport(ref omniRunHelper, nameof(omni_run_helper));
         LoadExport(ref omniTraceWrite, nameof(omni_trace_write));
+        LoadExport(ref omniTraceSetFile, nameof(omni_trace_set_file));
     }
 
     internal static IntPtr omni_app_init(string configJson)
@@ -133,6 +135,16 @@ internal static partial class NativeMethods
         EnsureLoaded();
         omniTraceWrite!(category, message);
     }
+
+    /// Point the trace sink at `path`, or turn it off (null) — the settings switch. Next line on.
+    internal static void omni_trace_set_file(string? path)
+    {
+        EnsureLoaded();
+        omniTraceSetFile!(path);
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void OmniTraceSetFileDelegate([MarshalAs(UnmanagedType.LPUTF8Str)] string? path);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void OmniTraceWriteDelegate(

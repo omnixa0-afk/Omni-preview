@@ -90,13 +90,12 @@ public sealed partial class MainWindow
 
     // What a transcript row spends besides the bubble: the list's 8 off the edge, the row's 16 + 20
     // padding (ChatsSectionControl.xaml) and the 34 + 8 avatar column.
-    private const double TranscriptRowChromeWidth = 8 + 16 + 20 + 34 + 8;
-
+    
     private void UpdateCurrentTranscriptBubbleMaxWidth(double hostWidth)
     {
         currentTranscriptBubbleMaxWidth = MainWindowPresentation.CalculateTranscriptBubbleMaxWidth(
             hostWidth,
-            TranscriptRowChromeWidth);
+            MainWindowPresentation.TranscriptRowChromeWidth);
     }
 
     private void RefreshTranscriptBubbleMaxWidth()

@@ -33,6 +33,18 @@ internal static class MediaFiles
         return File.Exists(path) ? File.ReadAllBytes(path) : null;
     }
 
+    /// <summary>A voice message's packets and length; the core checks the file on the way.</summary>
+    internal static (byte[] Packets, int DurationMs) ReadVoice(string path)
+        => bridge is { IsInitialized: true } core
+            ? core.ReadVoiceFile(path)
+            : throw new InvalidOperationException("the core is not up");
+
+    /// <summary>A video message's recording into a file; the core checks it on the way.</summary>
+    internal static string StageVideoNote(byte[] video, byte[] preview)
+        => bridge is { IsInitialized: true } core
+            ? core.StageVideoNote(video, preview)
+            : throw new InvalidOperationException("the core is not up");
+
     /// <summary>A path an outside program can open the file at.</summary>
     internal static string OpenablePath(string path, string fileName)
         => bridge is { IsInitialized: true } core ? core.OpenMediaFileCopy(path, fileName) : path;

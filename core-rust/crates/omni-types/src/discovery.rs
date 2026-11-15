@@ -37,6 +37,13 @@ pub struct MeshPairingInviteV1 {
     /// See docs/decisions/invite-bootstrap-rendezvous.md.
     #[serde(default)]
     pub bootstrap_nonce_hex: String,
+    /// Hex-encoded X25519 public key the importer seals its beacon on the bootstrap topic to
+    /// (`omni_crypto::derive_invite_reply_key`): an invite given to several people seats them all on
+    /// one topic, and without it each would read the others' addresses there. Empty — the importer does
+    /// not publish on the topic (it still reads the inviter's beacon and dials).
+    /// See docs/bugs/an-invite-importer-dialed-another-importer.md.
+    #[serde(default)]
+    pub reply_key_hex: String,
     /// The inviter's current rendezvous courier set (provider URLs, e.g. `https://ntfy.sh`,
     /// `wss://offchain.pub`) — so a friend on a restrictive network bootstraps first contact on a WORKING,
     /// SHARED provider set out of the box, not just whatever default was compiled into their build (which

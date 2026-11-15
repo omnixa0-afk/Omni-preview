@@ -16,6 +16,12 @@ namespace Omni.Windows.App;
 // Groups run on MLS in the core — docs/decisions/group-crypto-mls.md.
 public sealed partial class MainWindow
 {
+    private async Task InitializeWorkspaceFoldersAsync()
+    {
+        try { await WorkspaceFolderPreferences.EnsureAsync(rustBridge); }
+        catch (Exception ex) { AppTrace.Write("workspace/root", $"Cannot initialize workspace folder: {ex.Message}"); }
+    }
+
     // The chat-list key of the open group row (its dialog key), or null when a 1:1 dialog / nothing
     // is open. Keeps the group row selected across list refreshes.
     private string? currentGroupRowKey;
@@ -30,9 +36,37 @@ public sealed partial class MainWindow
     // The group whose call is ringing in GroupCallRingBar, or null.
     private string? ringingGroupId;
 
+    /// The Workspaces section on one group (from «Код» on a group's page, the test channel).
+    private void ShowWorkspace(string groupId)
+    {
+        AuthenticatedNavigationView.SelectedItem = WorkspacesNavigationItem;
+        WorkspacesSectionHost.Select(groupId);
+    }
+
+    private async Task<string?> PickFolderAsync()
+    {
+        global::Windows.Storage.Pickers.FolderPicker picker = new();
+        picker.FileTypeFilter.Add("*");
+        InitializePicker(picker);
+        return (await picker.PickSingleFolderAsync())?.Path;
+    }
+
     private void WireGroupConversation()
     {
-        NewGroupButton.Click += OnNewGroupClicked;
+        // «Новый»: a conversation with someone (they are in Контакты — Chats list conversations only,
+        // docs/decisions/omni-app-ux.md R1) or a new group.
+        MenuFlyout startMenu = new() { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.BottomEdgeAlignedRight };
+        MenuFlyoutItem toContact = new() { Text = "Написать контакту…", Icon = new FontIcon { Glyph = "\uE8BD" } };
+        toContact.Click += (_, _) =>
+        {
+            AuthenticatedNavigationView.SelectedItem = ContactsNavigationItem;
+            ApplyContactsWorkspaceMode(ContactsWorkspaceMode.Directory);
+        };
+        MenuFlyoutItem newGroup = new() { Text = "Новая группа…", Icon = new FontIcon { Glyph = "\uE902" } };
+        newGroup.Click += OnNewGroupClicked;
+        startMenu.Items.Add(toContact);
+        startMenu.Items.Add(newGroup);
+        NewGroupButton.Flyout = startMenu;
         GroupCallRingJoinButton.Click += OnGroupCallRingJoinClicked;
         GroupCallRingDeclineButton.Click += (_, _) => DismissRingingGroupCall();
         GroupCallRingBar.CloseButtonClick += (_, _) => DismissRingingGroupCall();
@@ -42,6 +76,15 @@ public sealed partial class MainWindow
         group.ResolveMember = ResolveMember;
         group.NoteMemberCards = NoteGroupMemberCards;
         group.GroupListChanged += () => RefreshChatsList();
+        group.WorkspaceRequested += ShowWorkspace;
+        WorkspacesSectionHost.Attach(rustBridge);
+        WorkspacesSectionHost.PickPeople = PickPeopleForGroupAsync;
+        WorkspacesSectionHost.PickFolder = PickFolderAsync;
+        WorkspacesSectionHost.PickSaveFile = name => ShowDesktopSaveFileDialog("Скачать файл проекта", name,
+            [new DesktopFileDialogFilter("Все файлы", "*.*")]);
+        SettingsSectionHost.ConfigureWorkspaceFolders(rustBridge, PickFolderAsync);
+        WorkspacesSectionHost.WorkspacesChanged += () => RefreshChatsList(force: true);
+        WorkspacesSectionHost.OpenChatRequested += groupId => OpenGroupInChats(groupId);
         GroupInvite.Attach(rustBridge);
         // Joined from the card: the invitation row turns into the group row — open it.
         GroupInvite.Joined += groupId =>
@@ -60,18 +103,31 @@ public sealed partial class MainWindow
             CloseGroupConversation(clearSelection: true);
             RefreshChatsList(force: true);
         };
-        group.PickImageFile = () => ShowDesktopOpenFileDialog(
-            "Аватарка группы",
-            [
-                new DesktopFileDialogFilter("Изображения (*.jpg;*.jpeg;*.png;*.bmp)", "*.jpg;*.jpeg;*.png;*.bmp"),
-                new DesktopFileDialogFilter("Все файлы (*.*)", "*.*"),
-            ],
-            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
+        group.PickImageFile = async () =>
+        {
+            string? picked = ShowDesktopOpenFileDialog(
+                "Аватарка группы",
+                [
+                    new DesktopFileDialogFilter("Изображения (*.jpg;*.jpeg;*.png;*.bmp)", "*.jpg;*.jpeg;*.png;*.bmp"),
+                    new DesktopFileDialogFilter("Все файлы (*.*)", "*.*"),
+                ],
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
+            if (string.IsNullOrWhiteSpace(picked))
+            {
+                return null;
+            }
+
+            string cropped = GetUiTempFilePath($"omni-group-avatar-{Guid.NewGuid():N}.png");
+            return await Features.Shared.PhotoCropDialog.ShowAsync(
+                Content.XamlRoot, Presentation.MainWindowPresentation.ActiveTheme, "Фото группы", picked, cropped)
+                ? cropped
+                : null;
+        };
         group.PickAnyFile = () => ShowDesktopOpenFileDialog(
             "Выберите файл",
             [new DesktopFileDialogFilter("Все файлы (*.*)", "*.*")],
             Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
-        group.PhotoOpenRequested += (path, caption, fileName) => OpenImageViewer(path, caption, fileName);
+        group.PhotoOpenRequested +=(path, caption, fileName) => OpenImageViewer(path, caption, fileName);
         group.PhotoSaveRequested += (path, fileName) => SaveViewedImageAs(path, fileName);
         group.FileActionsRequested += (anchor, messageId, attachment) => ShowAttachmentActions(anchor, messageId, attachment);
         group.GroupLeft += _ =>
@@ -140,7 +196,7 @@ public sealed partial class MainWindow
             {
                 sortUnixMs = Math.Max(sortUnixMs, call.StartedAtUnixMs);
             }
-            ChatThreadListItem item = new(group.DialogKey, group.GroupId);
+            ChatThreadListItem item = new(group.DialogKey, group.GroupId) { IsWorkspace = group.IsWorkspace };
             var groupAvatar = MainWindowPresentation.BuildAvatarImage(group.AvatarPath, 96, group.AvatarPath);
             item.ApplyFrom(
                 null,
@@ -154,7 +210,7 @@ public sealed partial class MainWindow
                 callText,
                 sortUnixMs > 0 ? MainWindowPresentation.FormatMessageTime(sortUnixMs) : string.Empty,
                 sortUnixMs,
-                $"group:{group.GroupId}:{group.Name}:{group.ActiveMemberCount}:{group.LastActivityUnixMs}:{group.LastMessagePreview}:{callText}:{group.AvatarPath}:{group.UnreadCount}",
+                $"group:{group.GroupId}:{group.Name}:{group.ActiveMemberCount}:{group.LastActivityUnixMs}:{group.LastMessagePreview}:{callText}:{group.AvatarPath}:{group.UnreadCount}:{group.IsWorkspace}",
                 nextUnreadCount: group.UnreadCount);
             yield return item;
         }
@@ -284,7 +340,7 @@ public sealed partial class MainWindow
         RefreshChatsList(force: true);
     }
 
-    // "+ Группа" — two steps, like Telegram: people first (optional), then the name.
+    // «Новый» → «Новая группа…» — two steps, like Telegram: people first (optional), then the name.
     private async void OnNewGroupClicked(object sender, RoutedEventArgs e)
     {
         GroupPeoplePickerModel model = new(BuildGroupPickCandidates(groupId: null));
@@ -299,6 +355,7 @@ public sealed partial class MainWindow
         ContentDialog dialog = new()
         {
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
             Title = "Новая группа",
             Content = picker,
             PrimaryButtonText = GroupPeoplePickerModel.NextButtonText(0),
@@ -386,6 +443,7 @@ public sealed partial class MainWindow
         ContentDialog dialog = new()
         {
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
             Title = $"Добавить в «{groupName}»",
             Content = new GroupPeoplePicker(model),
             PrimaryButtonText = GroupPeoplePickerModel.InviteButtonText(0),
@@ -442,6 +500,7 @@ public sealed partial class MainWindow
                 AvatarImageVisibility = row?.AvatarImageVisibility ?? Visibility.Collapsed,
                 PresenceDotVisibility = row?.PresenceDotVisibility ?? Visibility.Collapsed,
                 PresenceDotBrush = row?.PresenceDotBrush,
+                AvatarBrush = row?.AvatarBrush ?? Presentation.AvatarPalette.BrushFor(dialogKey),
             });
         }
         return candidates;
@@ -452,6 +511,7 @@ public sealed partial class MainWindow
         ContentDialog dialog = new()
         {
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
             Title = what,
             Content = NormalizeUserError(ex),
             CloseButtonText = "Закрыть",

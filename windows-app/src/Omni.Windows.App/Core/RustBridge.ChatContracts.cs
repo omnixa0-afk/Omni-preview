@@ -15,7 +15,30 @@ internal sealed record ChatMessageRecord(
     [property: JsonPropertyName("attachment")] AttachmentRecord? Attachment,
     [property: JsonPropertyName("call_history_event")] CallHistoryEvent? CallHistoryEvent = null,
     // The line came back from the contact's copy of the chat after a restore («со слов собеседника»).
-    [property: JsonPropertyName("told_by_contact")] bool ToldByContact = false);
+    [property: JsonPropertyName("told_by_contact")] bool ToldByContact = false,
+    // The message this one answers, as its quote shows it.
+    [property: JsonPropertyName("reply")] MessageReplyPreview? Reply = null,
+    [property: JsonPropertyName("reactions")] List<MessageReactionView>? Reactions = null,
+    [property: JsonPropertyName("pinned")] bool Pinned = false);
+
+/// One emoji on a message: who put it are names in a group, nothing to show in a 1:1 chat.
+internal sealed record MessageReactionView(
+    [property: JsonPropertyName("emoji")] string Emoji,
+    [property: JsonPropertyName("count")] int Count,
+    [property: JsonPropertyName("mine")] bool Mine,
+    [property: JsonPropertyName("who")] List<string>? Who = null);
+
+/// A conversation's pins and recent deletions; `Mark` grows with every one of them.
+internal sealed record MessageActionsView(
+    [property: JsonPropertyName("mark")] long Mark,
+    [property: JsonPropertyName("pinned")] List<MessageReplyPreview> Pinned,
+    [property: JsonPropertyName("deleted")] List<string> Deleted);
+
+internal sealed record MessageReplyPreview(
+    [property: JsonPropertyName("message_id")] string MessageId,
+    [property: JsonPropertyName("from_me")] bool FromMe,
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("author")] string Author = "");
 
 internal sealed record AttachmentRecord(
     [property: JsonPropertyName("message_id")] string MessageId,
@@ -35,16 +58,24 @@ internal sealed record AttachmentRecord(
     [property: JsonPropertyName("local_copy_path")] string? LocalCopyPath = null,
     // Members a group file is coming from right now (several at once, attachment-content-tree.md
     // stage 3); 0 — not counted (a 1:1 download has its one sender).
-    [property: JsonPropertyName("source_count")] int SourceCount = 0);
+    [property: JsonPropertyName("source_count")] int SourceCount = 0,
+    // Opening it starts a program or a script — the core judges by the name; we ask first (V-18).
+    [property: JsonPropertyName("opens_as_program")] bool OpensAsProgram = false);
 
 /// How the chat shows a file — only what the core checked and accepted (media-messages.md §1).
 internal sealed record AttachmentPresentation(
     [property: JsonPropertyName("kind")] string Kind,
     [property: JsonPropertyName("width")] int Width,
     [property: JsonPropertyName("height")] int Height,
-    [property: JsonPropertyName("preview_jpeg_b64")] string? PreviewJpegBase64)
+    [property: JsonPropertyName("preview_jpeg_b64")] string? PreviewJpegBase64,
+    [property: JsonPropertyName("duration_ms")] int? DurationMs = null,
+    [property: JsonPropertyName("waveform_b64")] string? WaveformBase64 = null)
 {
     public bool IsPhoto => string.Equals(Kind, "photo", StringComparison.Ordinal);
+
+    public bool IsVoice => string.Equals(Kind, "voice", StringComparison.Ordinal);
+
+    public bool IsVideoNote => string.Equals(Kind, "video_note", StringComparison.Ordinal);
 }
 
 internal sealed record ListMessagesResponse(
@@ -174,9 +205,25 @@ internal sealed record ContactChatTarget(
 
 internal sealed partial class RustBridge
 {
+    internal sealed record MessageDeleteRequest(
+        [property: JsonPropertyName("message_id")] string MessageId,
+        [property: JsonPropertyName("for_everyone")] bool ForEveryone);
+
+    internal sealed record MessagePinRequest(
+        [property: JsonPropertyName("message_id")] string MessageId,
+        [property: JsonPropertyName("pinned")] bool Pinned);
+
+    internal sealed record MessageActionsRequest(
+        [property: JsonPropertyName("dialog_key")] string DialogKey);
+
+    internal sealed record MessageReactRequest(
+        [property: JsonPropertyName("message_id")] string MessageId,
+        [property: JsonPropertyName("emoji")] string Emoji);
+
     internal sealed record SendTextRequest(
         [property: JsonPropertyName("peer_addr")] string PeerAddr,
-        [property: JsonPropertyName("body")] string Body);
+        [property: JsonPropertyName("body")] string Body,
+        [property: JsonPropertyName("reply_to")] string? ReplyTo = null);
 
     internal sealed record SendAttachmentRequest(
         [property: JsonPropertyName("peer_addr")] string PeerAddr,
@@ -184,7 +231,10 @@ internal sealed partial class RustBridge
         [property: JsonPropertyName("source_file_path")] string SourceFilePath,
         [property: JsonPropertyName("display_file_name")] string? DisplayFileName,
         [property: JsonPropertyName("media_protection_mode")] string MediaProtectionMode,
-        [property: JsonPropertyName("as_photo")] bool AsPhoto);
+        [property: JsonPropertyName("as_photo")] bool AsPhoto,
+        [property: JsonPropertyName("reply_to")] string? ReplyTo = null,
+        [property: JsonPropertyName("as_voice")] bool AsVoice = false,
+        [property: JsonPropertyName("as_video_note")] bool AsVideoNote = false);
 
     internal sealed record AttachmentDownloadRequest(
         [property: JsonPropertyName("message_id")] string MessageId,

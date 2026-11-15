@@ -18,6 +18,7 @@ public sealed partial class MainWindow
     private bool publicRelaysWired;
     private IReadOnlyList<Core.PublicRelay> foundPublicRelays = Array.Empty<Core.PublicRelay>();
     private bool publicRelayRoleLoading;
+    private bool pinnedRelayReading;
     private Core.PinnedRelayState? pinnedRelayState;
     private bool pinnedRelayLoading;
     private DispatcherTimer? pinnedRelayTimer;
@@ -54,28 +55,34 @@ public sealed partial class MainWindow
             SettingsPinnedRelayHiddenCheckBox.Unchecked += (_, _) => ApplyPinnedRelayHidden();
             // Whether the relay holds changes on its own: re-read while the settings are on screen.
             pinnedRelayTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-            pinnedRelayTimer.Tick += (_, _) => LoadPinnedRelay();
-            SettingsSectionRoot.RegisterPropertyChangedCallback(UIElement.VisibilityProperty, (_, _) =>
-            {
-                if (SettingsSectionRoot.Visibility == Visibility.Visible)
-                {
-                    DispatcherQueue.TryEnqueue(LoadPublicRelayRole);
-                    DispatcherQueue.TryEnqueue(LoadPinnedRelay);
-                    pinnedRelayTimer.Start();
-                }
-                else
-                {
-                    pinnedRelayTimer.Stop();
-                }
-            });
+            pinnedRelayTimer.Tick += (_, _) => LoadPinnedRelayAsync();
             publicRelaysWired = true;
         }
 
         LoadPublicRelayRole();
         LoadPinnedRelay();
-        if (SettingsSectionRoot.Visibility == Visibility.Visible)
+    }
+
+    // The page on screen and its two-second tick: a read waiting on the core must not hold the window.
+    private async void LoadPinnedRelayAsync()
+    {
+        if (pinnedRelayReading)
         {
-            pinnedRelayTimer?.Start();
+            return;
+        }
+
+        pinnedRelayReading = true;
+        try
+        {
+            ApplyPinnedRelay(await Task.Run(() => rustBridge.GetPinnedRelay()));
+        }
+        catch (Exception)
+        {
+            // Before sign-in there is no profile; the page re-reads when shown.
+        }
+        finally
+        {
+            pinnedRelayReading = false;
         }
     }
 
@@ -92,6 +99,11 @@ public sealed partial class MainWindow
             return;
         }
 
+        ApplyPinnedRelay(state);
+    }
+
+    private void ApplyPinnedRelay(Core.PinnedRelayState state)
+    {
         bool pinChanged = pinnedRelayState?.Relay?.NodeId != state.Relay?.NodeId;
         pinnedRelayState = state;
         RenderPinnedRelay(state);
@@ -215,13 +227,13 @@ public sealed partial class MainWindow
     {
         if (!on)
         {
-            return "Выключено.";
+            return string.Empty;
         }
 
         bool reachable;
         try
         {
-            reachable = rustBridge.MeshConnectionState().Node.Kind == "online_reachable";
+            reachable = MeshStateForScreen().Node.Kind == "online_reachable";
         }
         catch (Exception)
         {

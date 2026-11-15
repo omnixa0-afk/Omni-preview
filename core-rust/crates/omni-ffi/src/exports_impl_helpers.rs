@@ -34,8 +34,11 @@ fn run_helper_kind(kind: &str, args: Vec<String>) -> i32 {
     match kind {
         "rendezvous" => omni_rendezvous_helper::run(args),
         "dht" => omni_dht_helper::run(args),
+        "git" => omni_git_helper::run(args),
+        // An agent's Omni over MCP (docs/decisions/omni-workspace-git.md section 5).
+        "mcp" => omni_mcp::run(args),
         other => {
-            eprintln!("omni_run_helper: unknown helper kind {other:?} (want rendezvous|dht)");
+            eprintln!("omni_run_helper: unknown helper kind {other:?} (want rendezvous|dht|git|mcp)");
             HELPER_USAGE_EXIT_CODE
         }
     }

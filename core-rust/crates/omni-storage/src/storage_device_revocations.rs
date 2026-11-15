@@ -45,44 +45,63 @@ impl Storage {
         };
         let revocation_json =
             serde_json::to_string(revocation).map_err(map_serde_error_to_storage)?;
-        let inserted = self
-            .connection
-            .execute(
-                "
-                INSERT OR IGNORE INTO device_revocations (
-                    account_id,
-                    device_id,
-                    revocation_json,
-                    working_key_version,
-                    revoked_at_unix_ms,
-                    received_at_unix_ms
+        // A signed revocation takes the place of a key move's `superseded` mark for the same device: the
+        // mark holds no document, and kept, it swallowed the revocation — nothing was left to hand the
+        // device or the contacts when it came back (blind audit 2026-11-11, I3). An earlier signed one
+        // stays.
+        // The signed revocation and the device's mark, as one: apart, a failure between them left a
+        // device refused on 1:1 yet still taken for ours where only the mark is read (the git of our
+        // own devices) — blind audit 2026-11-13, pass 18.
+        let inserted = self.with_immediate_transaction("apply_device_revocation", |storage| {
+            let inserted = storage
+                .connection
+                .execute(
+                    "
+                    INSERT INTO device_revocations (
+                        account_id,
+                        device_id,
+                        revocation_json,
+                        working_key_version,
+                        revoked_at_unix_ms,
+                        received_at_unix_ms,
+                        kind
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'revoked')
+                    ON CONFLICT (account_id, device_id) DO UPDATE SET
+                        revocation_json = excluded.revocation_json,
+                        working_key_version = excluded.working_key_version,
+                        revoked_at_unix_ms = excluded.revoked_at_unix_ms,
+                        received_at_unix_ms = excluded.received_at_unix_ms,
+                        kind = 'revoked'
+                    WHERE device_revocations.kind = 'superseded'
+                    ",
+                    params![
+                        account_id.0.as_str(),
+                        revocation.device_id.0.as_str(),
+                        revocation_json,
+                        revocation.working.version as i64,
+                        revocation.revoked_at_unix_ms,
+                        now_unix_ms,
+                    ],
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params![
-                    account_id.0.as_str(),
-                    revocation.device_id.0.as_str(),
-                    revocation_json,
-                    revocation.working.version as i64,
-                    revocation.revoked_at_unix_ms,
-                    now_unix_ms,
-                ],
-            )
-            .map_err(map_sqlite_error)?;
-        self.connection
-            .execute(
-                "
-                UPDATE account_devices
-                SET revoked_at_unix_ms = COALESCE(revoked_at_unix_ms, ?3)
-                WHERE account_id = ?1 AND device_id = ?2
-                ",
-                params![
-                    account_id.0.as_str(),
-                    revocation.device_id.0.as_str(),
-                    revocation.revoked_at_unix_ms,
-                ],
-            )
-            .map_err(map_sqlite_error)?;
+                .map_err(map_sqlite_error)?;
+            storage
+                .connection
+                .execute(
+                    "
+                    UPDATE account_devices
+                    SET revoked_at_unix_ms = COALESCE(revoked_at_unix_ms, ?3)
+                    WHERE account_id = ?1 AND device_id = ?2
+                    ",
+                    params![
+                        account_id.0.as_str(),
+                        revocation.device_id.0.as_str(),
+                        revocation.revoked_at_unix_ms,
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            Ok(inserted)
+        })?;
         Ok(DeviceRevocationOutcome {
             newly_applied: inserted > 0,
             targets_local_device,

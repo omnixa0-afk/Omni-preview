@@ -173,6 +173,8 @@ public sealed partial class MainWindow
     private Border RemoteScreenControlSurface => ResolveSectionElement<Border>(CallOverlayHost, nameof(RemoteScreenControlSurface));
     private Button HangUpCurrentCallButton => ResolveSectionElement<Button>(CallOverlayHost, nameof(HangUpCurrentCallButton));
     private Border MessagesHostBorder => ResolveSectionElement<Border>(ChatsSectionHost, nameof(MessagesHostBorder));
+    private Features.Shared.PinnedBar ChatPinnedBar => ResolveSectionElement<Features.Shared.PinnedBar>(ChatsSectionHost, nameof(ChatPinnedBar));
+    private Features.Shared.SelectionBar ChatSelectionBar => ResolveSectionElement<Features.Shared.SelectionBar>(ChatsSectionHost, nameof(ChatSelectionBar));
     private ListView MessagesListView => ResolveSectionElement<ListView>(ChatsSectionHost, nameof(MessagesListView));
     private Border MessagesEmptyStateBorder => ResolveSectionElement<Border>(ChatsSectionHost, nameof(MessagesEmptyStateBorder));
     private TextBlock MessagesEmptyStateTitleTextBlock => ResolveSectionElement<TextBlock>(ChatsSectionHost, nameof(MessagesEmptyStateTitleTextBlock));
@@ -195,13 +197,13 @@ public sealed partial class MainWindow
     private TextBlock ContactsAddToggleText => ResolveSectionElement<TextBlock>(ContactsSectionHost, nameof(ContactsAddToggleText));
     private StackPanel ContactsFilterRow => ResolveSectionElement<StackPanel>(ContactsSectionHost, nameof(ContactsFilterRow));
     private Border ContactsDirectoryPanel => ResolveSectionElement<Border>(ContactsSectionHost, nameof(ContactsDirectoryPanel));
-    private Button ContactsFilterAllButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(ContactsFilterAllButton));
     private Button ContactsFilterPendingButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(ContactsFilterPendingButton));
     private Button ContactsFilterApprovedButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(ContactsFilterApprovedButton));
     private Button ContactsFilterDeclinedButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(ContactsFilterDeclinedButton));
     private ListView FilteredContactsListView => ResolveSectionElement<ListView>(ContactsSectionHost, nameof(FilteredContactsListView));
     private Border ContactsEmptyStateBorder => ResolveSectionElement<Border>(ContactsSectionHost, nameof(ContactsEmptyStateBorder));
     private TextBlock ContactsEmptyStateTextBlock => ResolveSectionElement<TextBlock>(ContactsSectionHost, nameof(ContactsEmptyStateTextBlock));
+    private Expander ContactsReachCodesExpander => ResolveSectionElement<Expander>(ContactsSectionHost, nameof(ContactsReachCodesExpander));
     private Border ContactsAddPanel => ResolveSectionElement<Border>(ContactsSectionHost, nameof(ContactsAddPanel));
     private ScrollViewer ContactsDetailScroll => ResolveSectionElement<ScrollViewer>(ContactsSectionHost, nameof(ContactsDetailScroll));
     private Button GenerateMeshInviteButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(GenerateMeshInviteButton));
@@ -218,10 +220,7 @@ public sealed partial class MainWindow
     private Button CopyReachTokenButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(CopyReachTokenButton));
     private TextBox QuickAddContactPetnameTextBox => ResolveSectionElement<TextBox>(ContactsSectionHost, nameof(QuickAddContactPetnameTextBox));
     private Button QuickAddContactButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(QuickAddContactButton));
-    private TextBox AddContactIdentifierTextBox => ResolveSectionElement<TextBox>(ContactsSectionHost, nameof(AddContactIdentifierTextBox));
     private TextBox AddContactPetnameTextBox => ResolveSectionElement<TextBox>(ContactsSectionHost, nameof(AddContactPetnameTextBox));
-    private TextBox AddContactDisplayNameTextBox => ResolveSectionElement<TextBox>(ContactsSectionHost, nameof(AddContactDisplayNameTextBox));
-    private Button AddContactByIdentifierButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(AddContactByIdentifierButton));
     private TextBox AddContactPayloadTextBox => ResolveSectionElement<TextBox>(ContactsSectionHost, nameof(AddContactPayloadTextBox));
     private Button AddContactFromPayloadButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(AddContactFromPayloadButton));
     private TextBlock ContactsStatusTextBlock => ResolveSectionElement<TextBlock>(ContactsSectionHost, nameof(ContactsStatusTextBlock));
@@ -242,6 +241,7 @@ public sealed partial class MainWindow
     private Button StartSelectedContactCallButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(StartSelectedContactCallButton));
     private Button StartSelectedContactRemoteControlButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(StartSelectedContactRemoteControlButton));
     private Button ContactActionsButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(ContactActionsButton));
+    private Button SelectedContactAllowCourierButton => ResolveSectionElement<Button>(ContactsSectionHost, nameof(SelectedContactAllowCourierButton));
     private Grid SelectedContactConnectionRow => ResolveSectionElement<Grid>(ContactsSectionHost, nameof(SelectedContactConnectionRow));
     private TextBlock ContactRemoteAccessTitleTextBlock => ResolveSectionElement<TextBlock>(ContactsSectionHost, nameof(ContactRemoteAccessTitleTextBlock));
     private ToggleSwitch ContactRemoteAccessToggle => ResolveSectionElement<ToggleSwitch>(ContactsSectionHost, nameof(ContactRemoteAccessToggle));
@@ -309,6 +309,8 @@ public sealed partial class MainWindow
     private ComboBox SettingsMicrophoneComboBox => ResolveSectionElement<ComboBox>(SettingsSectionHost, nameof(SettingsMicrophoneComboBox));
     private ComboBox SettingsSpeakerComboBox => ResolveSectionElement<ComboBox>(SettingsSectionHost, nameof(SettingsSpeakerComboBox));
     private TextBlock SettingsAudioDevicesSummaryTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsAudioDevicesSummaryTextBlock));
+    private ComboBox SettingsEmojiStyleComboBox => ResolveSectionElement<ComboBox>(SettingsSectionHost, nameof(SettingsEmojiStyleComboBox));
+    private TextBlock SettingsEmojiPreviewTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsEmojiPreviewTextBlock));
     private ComboBox SettingsThemeComboBox => ResolveSectionElement<ComboBox>(SettingsSectionHost, nameof(SettingsThemeComboBox));
     private TextBlock SettingsRemoteAccessSummaryTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsRemoteAccessSummaryTextBlock));
     private Border SettingsDevicesCard => ResolveSectionElement<Border>(SettingsSectionHost, nameof(SettingsDevicesCard));
@@ -328,6 +330,8 @@ public sealed partial class MainWindow
     private Button SettingsRevokeAllRemoteAccessButton => ResolveSectionElement<Button>(SettingsSectionHost, nameof(SettingsRevokeAllRemoteAccessButton));
     private TextBlock SettingsRemoteAccessStatusTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsRemoteAccessStatusTextBlock));
     private ToggleSwitch SettingsRunInBackgroundToggle => ResolveSectionElement<ToggleSwitch>(SettingsSectionHost, nameof(SettingsRunInBackgroundToggle));
+    private ToggleSwitch SettingsTraceLogToggle => ResolveSectionElement<ToggleSwitch>(SettingsSectionHost, nameof(SettingsTraceLogToggle));
+    private TextBlock SettingsTraceLogStatusTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsTraceLogStatusTextBlock));
     private ComboBox SettingsCongestionComboBox => ResolveSectionElement<ComboBox>(SettingsSectionHost, nameof(SettingsCongestionComboBox));
     private TextBlock SettingsCongestionStatusTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsCongestionStatusTextBlock));
     private TextBlock SettingsCameraSummaryTextBlock => ResolveSectionElement<TextBlock>(SettingsSectionHost, nameof(SettingsCameraSummaryTextBlock));

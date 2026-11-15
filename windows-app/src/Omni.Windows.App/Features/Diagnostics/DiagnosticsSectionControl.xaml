@@ -26,12 +26,19 @@
       <ColumnDefinition x:Name="DiagnosticsNavColumn" Width="275" />
       <ColumnDefinition Width="*" />
     </Grid.ColumnDefinitions>
+    <!-- The list column's edge: its width is one for every section (Features/Shared/SectionRail.cs). -->
+    <shared:RailSplitter Grid.Column="0" Grid.RowSpan="10" />
     <Border Padding="8,3,8,12" Background="{ThemeResource OmniBgPanelBrush}" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,0,1,0">
       <StackPanel Spacing="12">
         <Grid MinHeight="40">
-          <TextBlock VerticalAlignment="Center" Style="{StaticResource CardTitleTextStyle}" Text="Диагностика" />
+          <TextBlock VerticalAlignment="Center" Style="{StaticResource CardTitleTextStyle}" Text="Помощь" />
         </Grid>
         <ListView x:Name="DiagnosticsNavList" SelectionMode="Single" AutomationProperties.AutomationId="DiagnosticsNavList">
+          <ListViewItem Content="Что случилось" Tag="help" />
+          <!-- A caption of the group below, not a page: nothing to hover, press or reach by keyboard. -->
+          <ListViewItem IsEnabled="False" IsHitTestVisible="False" IsTabStop="False" MinHeight="0" Padding="16,16,12,4">
+            <TextBlock FontSize="12" Foreground="{ThemeResource OmniMutedTextBrush}" Text="Технические сведения" />
+          </ListViewItem>
           <ListViewItem Content="Сеть" Tag="network" />
           <ListViewItem Content="Доставка" Tag="delivery" />
           <ListViewItem Content="Безопасность" Tag="security" />
@@ -54,26 +61,54 @@
     </StackPanel>
 
     <ScrollViewer x:Name="DiagnosticsContentScroll" Grid.Column="1" VerticalScrollBarVisibility="Auto" HorizontalScrollMode="Disabled">
-      <!-- One page width whatever the content: up to 884 with the padding, left; narrower with the window. -->
-      <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*" MaxWidth="884" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <Grid>
       <Border x:Name="DiagnosticsContentBorder" Padding="32,16,32,40">
         <Grid>
-          <StackPanel x:Name="DiagnosticsSection_network" Visibility="Collapsed">
+          <!-- The answer first, then what usually helps; each row leads to the place that does it. -->
+          <shared:PageColumns x:Name="DiagnosticsSection_help" Visibility="Collapsed">
+            <TextBlock x:Name="HelpStatusTitleTextBlock" Style="{StaticResource PageTitleTextStyle}" />
+            <TextBlock x:Name="HelpStatusDetailTextBlock" Margin="0,8,0,0" TextWrapping="Wrap" />
+            <TextBlock x:Name="HelpStatusPeopleTextBlock" Margin="0,4,0,0" Style="{StaticResource SettingCaptionTextStyle}" />
+
+            <StackPanel x:Name="HelpWaitingPanel" Tag="page-group" Visibility="Collapsed">
+              <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Кого ждут сообщения" />
+              <StackPanel x:Name="HelpWaitingRows" />
+            </StackPanel>
+
+            <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Частые проблемы" />
+            <shared:SettingRow Header="Друг не находится" Description="Попросите друга открыть Omni. Если связь так и не появилась, обменяйтесь кодами связи любым другим способом.">
+              <Button Content="Коды связи" Tag="codes" Click="OnHelpActionClicked" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Сообщение не доходит" Description="Пока собеседник не в сети, сообщение ждёт и уйдёт само. Что с собеседником, написано в шапке чата.">
+              <Button Content="К чатам" Tag="chats" Click="OnHelpActionClicked" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="В звонке не слышно или не видно" Description="Проверьте, какие микрофон, динамики и камера выбраны.">
+              <Button Content="Звонки" Tag="calls" Click="OnHelpActionClicked" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Новый компьютер или потерян профиль" Description="На новом компьютере выберите на первом экране фразу восстановления или резервную копию. Пока профиль с вами, сделайте копию заранее.">
+              <Button Content="Резервная копия" Tag="profile" Click="OnHelpActionClicked" />
+            </shared:SettingRow>
+            <shared:SettingRow Header="Не помогло" Description="Включите журнал для разработчика, повторите проблему и отправьте файл разработчику.">
+              <Button Content="Журнал" Tag="advanced" Click="OnHelpActionClicked" />
+            </shared:SettingRow>
+          </shared:PageColumns>
+
+          <shared:PageColumns x:Name="DiagnosticsSection_network" Visibility="Collapsed">
             <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Сеть" />
             <StackPanel x:Name="TransportFactsPanel" Margin="0,12,0,0" />
-          </StackPanel>
+          </shared:PageColumns>
 
-          <StackPanel x:Name="DiagnosticsSection_delivery" Visibility="Collapsed">
+          <shared:PageColumns x:Name="DiagnosticsSection_delivery" Visibility="Collapsed">
             <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Доставка" />
             <StackPanel x:Name="QueueFactsPanel" Margin="0,12,0,0" />
-          </StackPanel>
+          </shared:PageColumns>
 
-          <StackPanel x:Name="DiagnosticsSection_security" Visibility="Collapsed">
+          <shared:PageColumns x:Name="DiagnosticsSection_security" Visibility="Collapsed">
             <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Безопасность" />
             <StackPanel x:Name="SecurityFactsPanel" Margin="0,12,0,0" />
             <!-- The open chat's session (state / ping / network / endpoint), moved here from the chat
                  header 2026-10-10. -->
-            <Border x:Name="ChatSessionInfoBorder" Visibility="Collapsed">
+            <Border x:Name="ChatSessionInfoBorder" Tag="page-group" Visibility="Collapsed">
               <StackPanel>
                 <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Открытый чат" />
                 <StackPanel x:Name="ChatSessionStateFactsPanel" />
@@ -81,15 +116,15 @@
                 <StackPanel x:Name="ChatSessionNetworkFactsPanel" />
               </StackPanel>
             </Border>
-          </StackPanel>
+          </shared:PageColumns>
 
-          <StackPanel x:Name="DiagnosticsSection_video" Visibility="Collapsed">
+          <shared:PageColumns x:Name="DiagnosticsSection_video" Visibility="Collapsed">
             <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Медиа" />
             <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Margin="0,8,0,0" Text="Что делает звонок прямо сейчас: устройства, кодек, задержка, эхоподавление." />
             <StackPanel x:Name="CallVideoFactsPanel" Margin="0,8,0,0" />
-          </StackPanel>
+          </shared:PageColumns>
 
-          <StackPanel x:Name="DiagnosticsSection_tools" Visibility="Collapsed">
+          <shared:PageColumns x:Name="DiagnosticsSection_tools" Visibility="Collapsed">
             <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Инструменты" />
             <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Сверка с собеседником" />
             <shared:SettingRow Header="Ваши данные для ручной сверки" Description="Аккаунт, устройства и отпечаток ключа — сравните с тем, что видит собеседник.">
@@ -111,7 +146,7 @@
                 <TextBlock x:Name="DiagnosticsPingStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
               </shared:SettingRow.Details>
             </shared:SettingRow>
-          </StackPanel>
+          </shared:PageColumns>
         </Grid>
       </Border>
       </Grid>

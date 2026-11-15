@@ -205,7 +205,7 @@ namespace {
 
 #if !defined(OMNI_WEBRTC_MEDIA_WITH_LIBWEBRTC)
 constexpr std::string_view kProbeJson =
-    R"({"abi_version":23,"available":false,"backend":"none","transport":"omni_quic_datagram_control","supports_peer_connection":false,"supports_rtp_over_omni_quic":false,"supports_rtcp_feedback":false,"hardware_codecs":[],"software_codecs":[],"reason":"libwebrtc backend is not linked yet"})";
+    R"({"abi_version":24,"available":false,"backend":"none","transport":"omni_quic_datagram_control","supports_peer_connection":false,"supports_rtp_over_omni_quic":false,"supports_rtcp_feedback":false,"hardware_codecs":[],"software_codecs":[],"reason":"libwebrtc backend is not linked yet"})";
 
 constexpr std::string_view kNoBackendSessionNotImplemented =
     "omni_webrtc_media native ABI is present, but no libwebrtc media backend is linked yet.";
@@ -1290,18 +1290,55 @@ public:
     }
 
     /// Отдать кадр подписчику. Возвращает false, если подписчика нет.
+    ///
+    /// ВЫРАВНИВАНИЕ СТОРОН — ДЕЛО ИСТОЧНИКА, КАК У АПСТРИМА.
+    ///
+    /// Кодировщик объявляет `requested_resolution_alignment` (аппаратным MFT нужны стороны, кратные
+    /// 16 — docs/bugs/hw-encoder-odd-frame-sizes.md), оркестратор передаёт его источнику в
+    /// `wants.resolution_alignment`, а источник обрезает кадр — так делает VideoAdapter апстрима.
+    /// Раньше наш источник это пожелание не читал, и кадр обрезал сам кодировщик: снизу и справа,
+    /// молча, за спиной у оркестратора. Теперь обрезка одна, здесь, по центру; дальше по конвейеру
+    /// каждый видит настоящий размер кадра. Цена — до 15 строк и столбцов (у 1080p — 8 строк).
     bool PushFrame(const webrtc::VideoFrame& frame)
     {
         webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink = nullptr;
+        int alignment = 1;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             sink = sink_;
+            alignment = std::max(1, wants_.resolution_alignment);
         }
         if (sink == nullptr) {
             return false;
         }
-        sink->OnFrame(frame);
+        const int width = frame.width();
+        const int height = frame.height();
+        const int aligned_width = std::max(alignment, width - (width % alignment));
+        const int aligned_height = std::max(alignment, height - (height % alignment));
+        if (alignment == 1 || (aligned_width == width && aligned_height == height) ||
+            aligned_width > width || aligned_height > height) {
+            sink->OnFrame(frame);
+            return true;
+        }
+        // Смещение чётное: у NV12 и I420 цветность на сетке 2x2.
+        const int offset_x = ((width - aligned_width) / 2) & ~1;
+        const int offset_y = ((height - aligned_height) / 2) & ~1;
+        webrtc::VideoFrame aligned = frame;
+        aligned.set_video_frame_buffer(frame.video_frame_buffer()->CropAndScale(
+            offset_x, offset_y, aligned_width, aligned_height, aligned_width, aligned_height));
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++frames_cropped_to_alignment_;
+        }
+        sink->OnFrame(aligned);
         return true;
+    }
+
+    /// Сколько кадров источник обрезал до выравнивания, которого просит кодировщик.
+    uint64_t frames_cropped_to_alignment() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return frames_cropped_to_alignment_;
     }
 
     /// Пожелания оркестратора: сколько точек и сколько кадров в секунду он готов принять.
@@ -1337,6 +1374,7 @@ private:
     uint64_t wants_updates_ = 0;
     uint64_t wants_narrowed_ = 0;
     uint64_t wants_widened_ = 0;
+    uint64_t frames_cropped_to_alignment_ = 0;
 };
 
 // НАШ ОБЪЕДИНЁННЫЙ НАБЛЮДАТЕЛЬ АДАПТАЦИИ УБРАН (#61, шаг D3).
@@ -2973,6 +3011,9 @@ struct OmniEncoderIoStats
     /// Сколько раз мы попросили апстрим уйти на программный кодировщик. Без этого числа откат
     /// посреди звонка невидим: он молчаливый по устройству.
     std::atomic<uint64_t> fallback_requests{0};
+    /// Кадры меньше кодируемого размера, растянутые до него перед кодированием. Растущее число
+    /// значит, что кадры приходят не того размера, под который настроен кодировщик.
+    std::atomic<uint64_t> frames_resized_to_coded_size{0};
     std::atomic<int64_t> max_encode_ms{0};
     std::atomic<int64_t> last_encode_ms{0};
     // Сумма длительностей — чтобы СРЕДНЕЕ считалось делением суммы на число вызовов, а не
@@ -3007,6 +3048,53 @@ std::string VerifiedHardwareEncoder(NativeVideoCodec codec)
     std::lock_guard<std::mutex> lock(g_verified_hardware_encoders_mutex);
     const auto found = g_verified_hardware_encoders.find(static_cast<int>(codec));
     return found == g_verified_hardware_encoders.end() ? std::string() : found->second;
+}
+
+// Best-effort PCI vendor id from a HW encoder MFT's friendly name. MF does not expose a
+// reliable per-MFT vendor attribute across versions, but the friendly name is vendor-stamped
+// ("NVIDIA H.264 Encoder MFT", "Intel(R) Quick Sync ...", "AMD H.264 Encoder"). Routes an encoder
+// to a chosen adapter and tells the shell whose card the verified encoder of a codec is; 0 = unknown.
+UINT VendorIdFromFriendlyName(const std::string& name)
+{
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower.find("nvidia") != std::string::npos) {
+        return 0x10DEu;
+    }
+    if (lower.find("intel") != std::string::npos || lower.find("quick sync") != std::string::npos) {
+        return 0x8086u;
+    }
+    if (lower.find("amd") != std::string::npos || lower.find("radeon") != std::string::npos) {
+        return 0x1002u;
+    }
+    return 0u;
+}
+
+// ЧЬЯ КАРТА КОДИРУЕТ КАЖДЫЙ КОДЕК — ДЛЯ ЯВНОГО ВЫБОРА В НАСТРОЙКАХ (2026-10-30).
+//
+// Проба H.264 идёт по каждому адаптеру (`video_devices`), а HEVC и AV1 — одним прогоном без
+// фильтра: проверяется тот MFT, что настроился первым. Оболочка, где человек явно выбрал карту,
+// должна знать, умеет ли ЭТА карта кодек, иначе паспорт обещает HEVC, а кодирует другая карта
+// (живьём: выбран Intel UHD, звонок AV1 шёл на RTX 4060). Вендор — проверенного кодировщика.
+std::string HardwareEncoderVendorsJson(const std::set<std::string>& hardware_codecs)
+{
+    std::ostringstream json;
+    json << '{';
+    bool first = true;
+    for (const NativeVideoCodec codec : {NativeVideoCodec::H264, NativeVideoCodec::H265, NativeVideoCodec::Av1}) {
+        const std::string name(NativeVideoCodecName(codec));
+        const std::string verified = VerifiedHardwareEncoder(codec);
+        if (hardware_codecs.count(name) == 0 || verified.empty()) {
+            continue;
+        }
+        json << (first ? "" : ",") << '"' << name << "\":" << VendorIdFromFriendlyName(verified);
+        first = false;
+    }
+    json << '}';
+    return json.str();
 }
 
 class MediaFoundationH264Encoder {
@@ -3270,8 +3358,8 @@ private:
         std::string& error,
         UINT required_vendor_id = 0)
     {
-        width_ = width;
-        height_ = height;
+        width_ = AlignCodedDimension(width);
+        height_ = AlignCodedDimension(height);
         fps_ = std::max(1, fps);
         bitrate_bps_ = std::max(1, bitrate_bps);
 
@@ -3346,6 +3434,9 @@ private:
         // Intel HEVC MFT, который у нас встаёт (стенд, 2026-10-14: «tried Intel ... (of 3)»).
         // Фильтр вендора для кодека, отличного от H.264, действует, только если у этого вендора
         // и есть проверенный кодировщик этого кодека; иначе — проверенный.
+        //
+        // Явный выбор карты сюда с чужим кодеком не доходит: оболочка заявляет в паспорте только
+        // кодеки выбранной карты (`hardware_encoder_vendors` в пробе, CallVideoDeviceSelection).
         if (required_vendor_id != 0 && codec_ != NativeVideoCodec::H264 && !verified.empty() &&
             VendorIdFromFriendlyName(verified) != required_vendor_id) {
             required_vendor_id = 0;
@@ -3550,6 +3641,8 @@ public:
             error = "invalid resolution for reconfigure";
             return false;
         }
+        width = AlignCodedDimension(width);
+        height = AlignCodedDimension(height);
         if (width == width_ && height == height_) {
             return true;
         }
@@ -3585,6 +3678,30 @@ public:
     uint64_t ResolutionChanges() const
     {
         return resolution_changes_;
+    }
+
+    /// Размер, который кодировщик реально кодирует: запрошенный, выровненный вниз до 16.
+    int CodedWidth() const { return width_; }
+    int CodedHeight() const { return height_; }
+
+    /// ВЫРАВНИВАНИЕ ДО 16 — ДЛЯ ВСЕХ ПРОИЗВОДИТЕЛЕЙ, А НЕ ТОЛЬКО ДЛЯ ТЕРПЕЛИВЫХ.
+    ///
+    /// Аппаратные MFT получают от нас плотный NV12 (шаг = ширина, цветность сразу за `height`
+    /// строками). NVIDIA принимает его при любом чётном размере, а MFT Intel и AMD на размерах,
+    /// не кратных 16, читают буфер по своей раскладке: строки съезжают и двоятся, низ кадра
+    /// остаётся незаполненным, то есть зелёным. Живьём 2026-10-18: камера 5 Мп (4:3) на третьем
+    /// ноутбуке, у собеседника — зелёная нижняя четверть и «экзотическое» разрешение после
+    /// уменьшения ABR. Кратные 16 стороны — то, что любой кодировщик берёт без догадок; цена —
+    /// до 15 строк и столбцов по краю (у 1080p — 8 строк).
+    ///
+    /// Кадр выравнивает ИСТОЧНИК (OmniPushVideoSource::PushFrame, по `requested_resolution_alignment`
+    /// из GetEncoderInfo), и до кодировщика доходят уже кратные 16 стороны. Здесь — страховка:
+    /// конфигурация MFT кратна 16 всегда, даже если кадр пришёл раньше пожелания оркестратора
+    /// (первый кадр сессии, пока кодировщик не создан) — такой кадр считается в
+    /// `mft_frames_resized_to_coded_size` и виден в диагностике.
+    static int AlignCodedDimension(int value)
+    {
+        return std::max(16, value - (value % 16));
     }
 
 private:
@@ -3705,6 +3822,12 @@ private:
             return hr;
         }
         hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, static_cast<UINT32>(width_), static_cast<UINT32>(height_));
+        if (FAILED(hr)) {
+            return hr;
+        }
+        // Раскладку буфера говорим явно (CopyNv12Planes пишет плотно, шаг = ширина), а не оставляем
+        // MFT угадывать её по производителю.
+        hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(width_));
         if (FAILED(hr)) {
             return hr;
         }
@@ -4080,29 +4203,6 @@ private:
         }
 
         return "Media Foundation hardware H.264 encoder";
-    }
-
-    // Best-effort PCI vendor id from a HW encoder MFT's friendly name. MF does not expose a
-    // reliable per-MFT vendor attribute across versions, but the friendly name is vendor-stamped
-    // ("NVIDIA H.264 Encoder MFT", "Intel(R) Quick Sync ...", "AMD H.264 Encoder"). Used only to
-    // route the capability probe's functional encode test to a specific adapter; 0 = unknown.
-    static UINT VendorIdFromFriendlyName(const std::string& name)
-    {
-        std::string lower;
-        lower.reserve(name.size());
-        for (char c : name) {
-            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-        if (lower.find("nvidia") != std::string::npos) {
-            return 0x10DEu;
-        }
-        if (lower.find("intel") != std::string::npos || lower.find("quick sync") != std::string::npos) {
-            return 0x8086u;
-        }
-        if (lower.find("amd") != std::string::npos || lower.find("radeon") != std::string::npos) {
-            return 0x1002u;
-        }
-        return 0u;
     }
 
     std::string FriendlyNameForDiagnostics() const
@@ -4584,6 +4684,39 @@ public:
             uv_stride = converted->StrideUV();
         }
 
+        // КАДР НЕ МЕНЬШЕ ТОГО, ЧТО КОДИРУЕТСЯ.
+        //
+        // Кодировщик берёт из кадра ровно CodedWidth x CodedHeight (выровненный размер, см.
+        // AlignCodedDimension), и раньше никто не сверял, что кадр не меньше: строки ниже его края
+        // читались из чужой памяти, а под MFT это и есть съехавший и незаполненный низ. Больше —
+        // обрежется на копировании (до 15 пикселей справа и снизу). Меньше — растягиваем до
+        // кодируемого размера здесь же.
+        webrtc::scoped_refptr<webrtc::NV12Buffer> resized;
+        const int coded_width = impl_->CodedWidth();
+        const int coded_height = impl_->CodedHeight();
+        if (buffer->width() < coded_width || buffer->height() < coded_height) {
+            resized = webrtc::NV12Buffer::Create(coded_width, coded_height);
+            if (!resized ||
+                libyuv::NV12Scale(
+                    y_plane, y_stride, uv_plane, uv_stride, buffer->width(), buffer->height(),
+                    resized->MutableDataY(), resized->StrideY(),
+                    resized->MutableDataUV(), resized->StrideUV(),
+                    coded_width, coded_height, libyuv::kFilterBox) != 0) {
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            y_plane = resized->DataY();
+            y_stride = resized->StrideY();
+            uv_plane = resized->DataUV();
+            uv_stride = resized->StrideUV();
+            if (io_stats_) {
+                io_stats_->frames_resized_to_coded_size.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if ((buffer->width() != coded_width || buffer->height() != coded_height) && io_stats_) {
+            // Больше кодируемого: обрежется на копировании. Источник выравнивает сам, так что
+            // это кадр мимо его выравнивания — считаем тем же счётчиком, чтобы его было видно.
+            io_stats_->frames_resized_to_coded_size.fetch_add(1, std::memory_order_relaxed);
+        }
+
         const bool keyframe = frame_types != nullptr && !frame_types->empty() &&
                               (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
 
@@ -4676,8 +4809,9 @@ public:
             encoded.data.data(), encoded.data.size()));
         image.SetRtpTimestamp(encoded.rtp_timestamp);
         image._frameType = encoded.frame_type;
-        image._encodedWidth = static_cast<uint32_t>(width_);
-        image._encodedHeight = static_cast<uint32_t>(height_);
+        // Тот размер, что реально в битстриме (выровненный), а не запрошенный.
+        image._encodedWidth = static_cast<uint32_t>(impl_->CodedWidth());
+        image._encodedHeight = static_cast<uint32_t>(impl_->CodedHeight());
         image.capture_time_ms_ = frame.timestamp_us() / 1000;
         image.SetSimulcastIndex(0);
         if (encoded.qp.has_value()) {
@@ -4725,6 +4859,11 @@ public:
             : "MediaFoundation " + std::string(NativeVideoCodecName(codec_));
         info.is_hardware_accelerated = true;
         info.supports_native_handle = false;
+        // Стороны кадра кратны 16 (MediaFoundationH264Encoder::AlignCodedDimension): оркестратор
+        // сам режет и масштабирует кадр под это, и кодировщику не приходят «экзотические» размеры
+        // ни от ABR, ни от QualityScaler.
+        info.requested_resolution_alignment = 16;
+        info.apply_alignment_to_all_simulcast_layers = true;
         // См. большой комментарий у класса: аппаратный H.264 переливает через запрошенный
         // битрейт, и признать это — единственный способ получить апстримовскую поправку.
         info.has_trusted_rate_controller = false;
@@ -4873,7 +5012,7 @@ private:
 };
 
 // HW H.264 decoder — Media Foundation / DXVA in D3D11 mode (task #84,
-// docs/notes/hw-decode-CONTINUE.md). Mirrors MediaFoundationH264Encoder. Decodes H.264
+// docs/decisions/media-hw-efficiency-and-device-codec-selection.md). Mirrors MediaFoundationH264Encoder. Decodes H.264
 // Annex-B access units into NV12 ID3D11Texture2D's ON THE CALLER'S D3D11 device, so the
 // decoded frame stays a GPU surface and feeds D3D11VideoRenderer with no CPU round-trip
 // (pairs with the GPU render path to make receive fully zero-copy). Vendor-neutral:
@@ -5158,25 +5297,41 @@ private:
             return OMNI_WEBRTC_MEDIA_STATUS_OK;  // no output ready — caller should feed more input
         }
 
+        // ПОСЛЕ СМЕНЫ ФОРМАТА КАДР ЗАБИРАЕТСЯ СРАЗУ, А НЕ СО СЛЕДУЮЩИМ ВХОДОМ.
+        //
+        // STREAM_CHANGE приходит, когда декодер разобрал SPS: на первом кадре потока и на каждой
+        // смене разрешения (шаг ABR, демонстрация другого окна). Кадр при этом уже декодирован и
+        // ждёт внутри MFT, пока ему назначат выходной тип. Раньше мы назначали тип и уходили —
+        // кадр выходил только со следующим входом, а если входа больше не было (одиночный
+        // ключевой кадр, неподвижный экран), не выходил вовсе. Повтор один: второй STREAM_CHANGE
+        // подряд на одном кадре — уже не наш случай, отдаём как «нет кадра».
         MFT_OUTPUT_DATA_BUFFER output_data{};
-        output_data.dwStreamID = 0;
-        DWORD process_status = 0;
-        HRESULT hr = transform_->ProcessOutput(0, 1, &output_data, &process_status);
-        if (output_data.pEvents != nullptr) {
-            output_data.pEvents->Release();
-            output_data.pEvents = nullptr;
-        }
-
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            return OMNI_WEBRTC_MEDIA_STATUS_OK;
-        }
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            // Decoder learned the real output format — (re)negotiate NV12; no frame this call.
+        HRESULT hr = S_OK;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            output_data = MFT_OUTPUT_DATA_BUFFER{};
+            output_data.dwStreamID = 0;
+            DWORD process_status = 0;
+            hr = transform_->ProcessOutput(0, 1, &output_data, &process_status);
+            if (output_data.pEvents != nullptr) {
+                output_data.pEvents->Release();
+                output_data.pEvents = nullptr;
+            }
+            if (hr != MF_E_TRANSFORM_STREAM_CHANGE) {
+                break;
+            }
+            // Decoder learned the real output format — (re)negotiate NV12, then take the frame.
             std::string err;
             if (!ConfigureOutputNv12(err)) {
                 last_error_ = "decoder STREAM_CHANGE renegotiation failed: " + err;
                 return OMNI_WEBRTC_MEDIA_STATUS_INTERNAL_ERROR;
             }
+            // An async MFT may be asked for output only after it signals it has some.
+            if (async_ && !WaitForAsyncEvent(METransformHaveOutput, std::chrono::milliseconds(200))) {
+                return OMNI_WEBRTC_MEDIA_STATUS_OK;
+            }
+        }
+
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT || hr == MF_E_TRANSFORM_STREAM_CHANGE) {
             return OMNI_WEBRTC_MEDIA_STATUS_OK;
         }
         if (FAILED(hr) || output_data.pSample == nullptr) {
@@ -7425,6 +7580,8 @@ public:
             << (encoder_io_stats_ ? encoder_io_stats_->encode_empty.load() : 0)
             << R"(,"mft_encode_fallback_requests":)"
             << (encoder_io_stats_ ? encoder_io_stats_->fallback_requests.load() : 0)
+            << R"(,"mft_frames_resized_to_coded_size":)"
+            << (encoder_io_stats_ ? encoder_io_stats_->frames_resized_to_coded_size.load() : 0)
             << R"(,"mft_encode_errors":)"
             << (encoder_io_stats_ ? encoder_io_stats_->encode_errors.load() : 0)
             << R"(,"mft_encode_max_ms":)"
@@ -7470,6 +7627,8 @@ public:
             << (push_video_source_ ? push_video_source_->wants_narrowed() : 0)
             << R"(,"encoder_wants_widened":)"
             << (push_video_source_ ? push_video_source_->wants_widened() : 0)
+            << R"(,"source_frames_cropped_to_alignment":)"
+            << (push_video_source_ ? push_video_source_->frames_cropped_to_alignment() : 0)
             << R"(,"adapt_overuse_ticks":)" << (cpu_overuse_metrics_observer_ ? cpu_overuse_metrics_observer_->ticks() : 0)
             // Отдано в ядро / выпущено без получателя (см. OmniPacketSink). Очереди, глубину
             // которой здесь показывали, больше нет.
@@ -8480,9 +8639,11 @@ private:
                 static_cast<double>(max_pixels) / static_cast<double>(ceiling_pixels));
             const int scaled_width = static_cast<int>(negotiated_width_ * scale);
             const int scaled_height = static_cast<int>(negotiated_height_ * scale);
-            // Чётные размеры: I420/NV12 несут цветность вдвое реже, нечётная сторона незаконна.
-            width = std::max(2, scaled_width - (scaled_width % 2));
-            height = std::max(2, scaled_height - (scaled_height % 2));
+            // Кратные 16: аппаратные кодировщики Intel и AMD на других размерах портят кадр
+            // (см. MediaFoundationH264Encoder::AlignCodedDimension); 16 к тому же чётно, как
+            // требуют I420/NV12.
+            width = std::max(16, scaled_width - (scaled_width % 16));
+            height = std::max(16, scaled_height - (scaled_height % 16));
         }
 
         if (width != abr_target_width_ || height != abr_target_height_) {
@@ -11333,7 +11494,7 @@ std::string BuildLibWebRtcProbeJson()
         webrtc::CreateBuiltinVideoDecoderFactory();
 
     if (!encoder_factory || !decoder_factory) {
-        return R"({"abi_version":23,"available":false,"backend":"libwebrtc","codec_factory_probe_available":false,"transport":"omni_quic_datagram_control","supports_peer_connection":false,"supports_rtp_over_omni_quic":false,"supports_rtcp_feedback":false,"hardware_codecs":[],"software_codecs":[],"reason":"libwebrtc codec factory creation failed"})";
+        return R"({"abi_version":24,"available":false,"backend":"libwebrtc","codec_factory_probe_available":false,"transport":"omni_quic_datagram_control","supports_peer_connection":false,"supports_rtp_over_omni_quic":false,"supports_rtcp_feedback":false,"hardware_codecs":[],"software_codecs":[],"reason":"libwebrtc codec factory creation failed"})";
     }
 
     const std::set<std::string> encoder_codecs =
@@ -11406,6 +11567,9 @@ std::string BuildLibWebRtcProbeJson()
         hardware_codecs.insert("h265");
         native_session_codecs.insert("h265");
     }
+    const std::string hardware_encoder_vendors = HardwareEncoderVendorsJson(hardware_codecs);
+#else
+    const std::string hardware_encoder_vendors = "{}";
 #endif
     const bool native_session_scaffold = !native_session_codecs.empty();
     const std::string smoke_diagnostics =
@@ -11433,6 +11597,7 @@ std::string BuildLibWebRtcProbeJson()
         << R"(,"codec_roundtrip_smoke":)" << (h264_smoke.ok ? "true" : "false")
         << R"(,"hardware_codecs":)" << JsonArray(hardware_codecs)
         << R"(,"hardware_decode_codecs":)" << JsonArray(hardware_decode_codecs)
+        << R"(,"hardware_encoder_vendors":)" << hardware_encoder_vendors
         << R"(,"hardware_h264_probe":)" << HardwareH264ProbeJson(hardware_h264_probe)
         << R"(,"video_devices":)" << VideoDevicesJson(video_devices)
         << R"(,"software_codecs":)" << JsonArray(software_codecs)
@@ -12183,7 +12348,7 @@ extern "C" OmniWebRtcMediaStatus omni_webrtc_media_smoke_audio_roundtrip(void)
 // D3D11 texture (the zero-copy target for the renderer), reads back the Y plane and asserts the
 // color-bar luma pattern survived (middle > left > right). NOT_IMPLEMENTED (skip) when the
 // machine has no HW H.264 encoder/decoder MFT — such a machine does not offer H.264 at all (no
-// software H.264 in the build; AV1 in software instead). See docs/notes/hw-decode-CONTINUE.md.
+// software H.264 in the build; AV1 in software instead). See docs/decisions/media-hw-efficiency-and-device-codec-selection.md.
 extern "C" OmniWebRtcMediaStatus omni_webrtc_media_smoke_mf_h264_hw_decode(void)
 {
 #if defined(_WIN32) && defined(OMNI_WEBRTC_MEDIA_WITH_LIBWEBRTC)
@@ -12445,7 +12610,7 @@ extern "C" OmniWebRtcMediaStatus omni_webrtc_media_smoke_d3d11_nv12_matches_liby
 
 // #5 increment 1a (2026-06-01): D3D11 offscreen render-target + staging readback.
 // Headless GPU plumbing for the SwapChainPanel video renderer
-// (docs/notes/video-gpu-render-swapchainpanel.md). Clears a small BGRA target to a
+// (docs/decisions/video-render-architecture.md). Clears a small BGRA target to a
 // known color and reads it back, asserting the round-trip — proves device + RTV +
 // staging map without a display. NOT_IMPLEMENTED off-Windows.
 extern "C" OmniWebRtcMediaStatus omni_webrtc_media_smoke_d3d11_solid_readback(void)
@@ -14371,4 +14536,120 @@ extern "C" void omni_webrtc_media_router_deliver(void* context, const uint8_t* p
     }
     std::lock_guard<std::mutex> lock(router->mutex);
     router->DeliverUnsafe(packet, packet_len);
+}
+
+
+// Voice messages (ABI 24, docs/decisions/media-messages.md section 4): the recording is the call's own
+// capture and sender, its packets kept instead of sent; the file itself is written and checked by the
+// core. These two only turn packets into sound and, for a tone in tests, sound into packets.
+// Packets: each with its length ahead of it, 2 bytes, little-endian.
+extern "C" OmniWebRtcMediaStatus omni_webrtc_media_opus_decode_packets(
+    const uint8_t* packets,
+    size_t packets_len,
+    int32_t sample_rate_hz,
+    int16_t* out_pcm,
+    size_t out_capacity_samples,
+    size_t* out_samples)
+{
+    if (packets == nullptr || out_pcm == nullptr || out_samples == nullptr) {
+        return OMNI_WEBRTC_MEDIA_STATUS_INVALID_ARGUMENT;
+    }
+    *out_samples = 0;
+    if (sample_rate_hz != 8000 && sample_rate_hz != 12000 && sample_rate_hz != 16000 &&
+        sample_rate_hz != 24000 && sample_rate_hz != 48000) {
+        return OMNI_WEBRTC_MEDIA_STATUS_INVALID_ARGUMENT;
+    }
+#if defined(_WIN32) && defined(OMNI_WEBRTC_MEDIA_WITH_LIBWEBRTC)
+    int error = 0;
+    OpusDecoder* decoder = opus_decoder_create(sample_rate_hz, 1, &error);
+    if (decoder == nullptr || error != OPUS_OK) {
+        return OMNI_WEBRTC_MEDIA_STATUS_INTERNAL_ERROR;
+    }
+    // A packet is at most 120 ms.
+    const int max_frame = sample_rate_hz * 120 / 1000;
+    std::vector<opus_int16> frame(static_cast<size_t>(max_frame));
+    size_t written = 0;
+    size_t at = 0;
+    OmniWebRtcMediaStatus status = OMNI_WEBRTC_MEDIA_STATUS_OK;
+    while (at + 2 <= packets_len) {
+        const size_t len = static_cast<size_t>(packets[at]) | (static_cast<size_t>(packets[at + 1]) << 8);
+        at += 2;
+        if (len > packets_len - at) {
+            status = OMNI_WEBRTC_MEDIA_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        int decoded = opus_decode(decoder, packets + at, static_cast<opus_int32>(len), frame.data(), max_frame, 0);
+        at += len;
+        if (decoded < 0) {
+            // A broken packet costs its moment, not the message: the decoder conceals it.
+            decoded = opus_decode(decoder, nullptr, 0, frame.data(), sample_rate_hz / 50, 0);
+        }
+        if (decoded <= 0) {
+            continue;
+        }
+        if (static_cast<size_t>(decoded) > out_capacity_samples - written) {
+            status = OMNI_WEBRTC_MEDIA_STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        std::memcpy(out_pcm + written, frame.data(), static_cast<size_t>(decoded) * sizeof(int16_t));
+        written += static_cast<size_t>(decoded);
+    }
+    opus_decoder_destroy(decoder);
+    *out_samples = written;
+    return status;
+#else
+    (void)packets_len;
+    (void)out_capacity_samples;
+    return OMNI_WEBRTC_MEDIA_STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+extern "C" OmniWebRtcMediaStatus omni_webrtc_media_opus_encode_pcm(
+    const int16_t* pcm,
+    size_t sample_count,
+    int32_t bitrate_bps,
+    uint8_t* out_packets,
+    size_t out_capacity,
+    size_t* out_len)
+{
+    if (pcm == nullptr || out_packets == nullptr || out_len == nullptr) {
+        return OMNI_WEBRTC_MEDIA_STATUS_INVALID_ARGUMENT;
+    }
+    *out_len = 0;
+#if defined(_WIN32) && defined(OMNI_WEBRTC_MEDIA_WITH_LIBWEBRTC)
+    constexpr int kFrameSamples = 960;
+    constexpr int kMaxPacketBytes = 1275;
+    int error = 0;
+    OpusEncoder* encoder = opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP, &error);
+    if (encoder == nullptr || error != OPUS_OK) {
+        return OMNI_WEBRTC_MEDIA_STATUS_INTERNAL_ERROR;
+    }
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(ClampInt(bitrate_bps, 6000, 510000)));
+    size_t written = 0;
+    OmniWebRtcMediaStatus status = OMNI_WEBRTC_MEDIA_STATUS_OK;
+    std::array<unsigned char, kMaxPacketBytes> packet{};
+    for (size_t at = 0; at + kFrameSamples <= sample_count; at += kFrameSamples) {
+        const int encoded = opus_encode(encoder, pcm + at, kFrameSamples, packet.data(), kMaxPacketBytes);
+        if (encoded < 0) {
+            status = OMNI_WEBRTC_MEDIA_STATUS_INTERNAL_ERROR;
+            break;
+        }
+        if (out_capacity - written < static_cast<size_t>(encoded) + 2) {
+            status = OMNI_WEBRTC_MEDIA_STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        out_packets[written++] = static_cast<uint8_t>(encoded & 0xFF);
+        out_packets[written++] = static_cast<uint8_t>((encoded >> 8) & 0xFF);
+        std::memcpy(out_packets + written, packet.data(), static_cast<size_t>(encoded));
+        written += static_cast<size_t>(encoded);
+    }
+    opus_encoder_destroy(encoder);
+    *out_len = written;
+    return status;
+#else
+    (void)sample_count;
+    (void)bitrate_bps;
+    (void)out_capacity;
+    return OMNI_WEBRTC_MEDIA_STATUS_NOT_IMPLEMENTED;
+#endif
 }

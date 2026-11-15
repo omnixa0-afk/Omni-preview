@@ -50,6 +50,22 @@ public sealed partial class ContactsSectionControl : UserControl
         }
     }
 
+    // The contact's header in one row when there is room; narrow (the page beside a chat) the actions
+    // go under the name, so the name is not squeezed to an ellipsis by four buttons.
+    private void ReflowContactHeader(object sender, SizeChangedEventArgs e)
+    {
+        bool narrow = e.NewSize.Width < 520;
+        if (Grid.GetRow(SelectedContactActionPanel) == (narrow ? 1 : 0))
+        {
+            return;
+        }
+
+        Grid.SetRow(SelectedContactActionPanel, narrow ? 1 : 0);
+        Grid.SetColumn(SelectedContactActionPanel, narrow ? 0 : 2);
+        Grid.SetColumnSpan(SelectedContactActionPanel, narrow ? 3 : 1);
+        SelectedContactActionPanel.HorizontalAlignment = narrow ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+    }
+
     private void OnContactsSectionLoaded(object sender, RoutedEventArgs e)
         => ApplyResponsiveLayout(ActualWidth, force: true);
 
@@ -67,9 +83,9 @@ public sealed partial class ContactsSectionControl : UserControl
     }
 
     // Drive list/detail layout off THIS control's width, not the window width: the
-    // section is hosted inside NavigationView.Content (pane eats up to 228px), so an
-    // AdaptiveTrigger on MinWindowWidth over-reports available space and keeps the
-    // 392px primary column too wide at half-screen (см. docs/architecture/ui-audit.md §D).
+    // section sits beside the sections' rail (Shared.ShellRail), so an AdaptiveTrigger
+    // on MinWindowWidth over-reports available space and keeps the primary column too
+    // wide at half-screen (см. docs/architecture/ui-audit.md §D).
     private void ApplyResponsiveLayout(double width, bool force = false)
     {
         // Two columns from the same width as the chats screen, and then the list is as wide as

@@ -17,7 +17,9 @@ members = [
     "crates/omni-rendezvous-providers",
     "crates/omni-rendezvous-helper",
     "crates/omni-dht-helper",
+    "crates/omni-git-helper",
     "crates/omni-node",
+    "crates/omni-mcp",
     "crates/omni-group-mls",
 ]
 resolver = "2"
@@ -41,6 +43,7 @@ chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hkdf = "0.12"
+zeroize = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp"] }
 parking_lot = "0.12"
 rand_core = { version = "0.6", features = ["getrandom"] }

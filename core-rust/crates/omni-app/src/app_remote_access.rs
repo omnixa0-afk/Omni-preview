@@ -104,6 +104,9 @@ impl OmniApp {
 
 /// A contact told us whether it lets us control its computer (inbound `RemoteAccessGrantV1`). Stored
 /// so we can show the "Управлять" affordance; the contact's own core still decides each session.
+/// How far ahead of our clock a contact's remote-access word may be dated; later counts as this.
+const GRANT_CLOCK_AHEAD_MS: i64 = 5 * 60 * 1000;
+
 pub(crate) fn handle_incoming_remote_access_grant(
     storage: &omni_storage::Storage,
     dialog_key: &str,
@@ -112,6 +115,25 @@ pub(crate) fn handle_incoming_remote_access_grant(
     let Some(contact) = storage.resolve_contact_for_dialog(dialog_key)? else {
         return Ok(()); // a grant from someone who is not a contact we track changes nothing
     };
-    storage.set_contact_remote_access_received(&contact.contact_id, grant.mode, grant.sent_at_unix_ms)?;
+    // Not ahead of our clock: the newer word wins, and a grant dated i64::MAX stood over the
+    // revocation that came after it (blind audit 2026-11-12, pass 16).
+    let said_at = grant.sent_at_unix_ms.min(crate::current_unix_ms() + GRANT_CLOCK_AHEAD_MS);
+    storage.set_contact_remote_access_received(&contact.contact_id, grant.mode, said_at)?;
+    if grant.mode.is_none() {
+        // Withdrawn while we control their computer: our side of the session ends now (A04, audit
+        // 2026-11-09 #6). Their core ended it and refuses our input already; this one no longer
+        // shows a session that is not there, nor sends into it.
+        let db_path = storage.db_path().to_string_lossy().to_string();
+        let controlling = crate::current_call_runtime(&db_path)?.is_some_and(|runtime| {
+            runtime.summary.contact_id.as_deref() == Some(contact.contact_id.0.as_str())
+                && runtime
+                    .summary
+                    .remote_control
+                    .is_some_and(|session| session.role == omni_types::RemoteControlRole::Controller)
+        });
+        if controlling {
+            crate::end_runtime_call(storage, &db_path, omni_types::CallOutcome::Completed, None, crate::current_unix_ms())?;
+        }
+    }
     Ok(())
 }

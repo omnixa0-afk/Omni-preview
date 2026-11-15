@@ -20,6 +20,7 @@ impl Node {
                 member_pub: base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes()),
                 account_id: format!("acct-{name}"),
                 display_name: name.to_string(),
+                device_chain: proof(&format!("acct-{name}"), &key.verifying_key().to_bytes()),
             },
         }
     }
@@ -27,6 +28,30 @@ impl Node {
     fn engine(&self) -> Engine<'_, JsonCodec> {
         Engine::new(&self.conn, self.seed, self.card.clone())
     }
+
+    /// The engine as the app runs it: every new card's device chain checked ([`stand_in_check`]).
+    fn checked(&self) -> Engine<'_, JsonCodec> {
+        self.engine().with_card_check(stand_in_check)
+    }
+
+    /// Another device of `other`'s account: its own key, the same account.
+    fn device_of(other: &Node, name: &str) -> Self {
+        let mut node = Node::new(name);
+        node.card.account_id = other.card.account_id.clone();
+        let key = base64::engine::general_purpose::STANDARD.decode(&node.card.member_pub).unwrap();
+        node.card.device_chain = proof(&node.card.account_id, &key);
+        node
+    }
+}
+
+/// A stand-in for the app's device chain: this crate holds no account keys, so the test's "chain"
+/// is a token only the account and key it names pass.
+fn proof(account: &str, key: &[u8]) -> String {
+    format!("chain:{account}:{}", base64::engine::general_purpose::STANDARD.encode(key))
+}
+
+fn stand_in_check(card: &MemberCard, signature_key: &[u8]) -> std::result::Result<(), String> {
+    (card.device_chain == proof(&card.account_id, signature_key)).then_some(()).ok_or_else(|| "bad chain".to_string())
 }
 
 const GID: &[u8] = b"omni-test-group-0001";
@@ -187,18 +212,23 @@ fn late_and_early_messages_around_a_commit() {
 }
 
 /// Two members change the group in the same epoch; whatever order each member sees the Commits in,
-/// all end on the SAME branch (the smaller rank), and the loser learns its Commit was lost.
+/// all end on the SAME branch (the smaller rank), and the loser learns its Commit was lost. Both
+/// committers are admins, so neither wins by class: which one wins is the rank's own business.
 #[test]
 fn concurrent_commits_converge_on_one_winner_in_any_arrival_order() {
     let g = group_of(&["alice", "bob", "carol"]);
+    let bob_admin = g[0].engine().update_meta(GID, |m| m.admins.push(g[1].card.member_pub.clone())).unwrap();
+    for n in &g[1..] {
+        assert_eq!(outcome(n.engine().receive(GID, &bob_admin).unwrap()), CommitOutcome::Merged);
+    }
     let start = g[0].engine().view(GID).unwrap().epoch;
     let dave = Node::new("dave");
     let erin = Node::new("erin");
     let a = g[0].engine().add_members(GID, &[dave.engine().key_package().unwrap()]).unwrap();
     let b = g[1].engine().add_members(GID, &[erin.engine().key_package().unwrap()]).unwrap();
-    let a_wins = commit_rank(&a.commit) < commit_rank(&b.commit);
 
     let alice_saw = outcome(g[0].engine().receive(GID, &b.commit).unwrap());
+    let a_wins = alice_saw == CommitOutcome::LostIgnored;
     let bob_saw = outcome(g[1].engine().receive(GID, &a.commit).unwrap());
     assert_eq!(outcome(g[2].engine().receive(GID, &b.commit).unwrap()), CommitOutcome::Merged);
     let carol_second = outcome(g[2].engine().receive(GID, &a.commit).unwrap());
@@ -239,6 +269,86 @@ fn concurrent_commits_converge_on_one_winner_in_any_arrival_order() {
     }
     assert_eq!(text(winner_new.engine().receive(GID, &hello).unwrap()).1, "all five?");
     assert_eq!(text(loser_new.engine().receive(GID, &hello).unwrap()).1, "all five?");
+}
+
+/// V-04: an admin's removal beats any Commit of the member it removes, whichever arrives first —
+/// the member cannot pick its Commit's rank. Before, the rank was the hash of the Commit's bytes,
+/// and the member made Commits until one ranked lower and undid its removal.
+#[test]
+fn an_admins_removal_beats_the_removed_members_commit_in_any_order() {
+    let g = group_of(&["alice", "bob", "carol"]);
+    let start = g[0].engine().view(GID).unwrap().epoch;
+    let remove = g[0].engine().remove_members(GID, &[g[2].card.member_pub.clone()]).unwrap();
+    let dave = Node::new("dave");
+    let grab = g[2].engine().add_members(GID, &[dave.engine().key_package().unwrap()]).unwrap();
+
+    // Bob gets carol's Commit first, merges it, and the removal then replaces it.
+    assert_eq!(outcome(g[1].engine().receive(GID, &grab.commit).unwrap()), CommitOutcome::Merged);
+    assert_eq!(
+        outcome(g[1].engine().receive(GID, &remove).unwrap()),
+        CommitOutcome::ReplacedLoser { our_commit_lost: false }
+    );
+    assert_eq!(outcome(g[0].engine().receive(GID, &grab.commit).unwrap()), CommitOutcome::LostIgnored);
+    assert_eq!(
+        outcome(g[2].engine().receive(GID, &remove).unwrap()),
+        CommitOutcome::ReplacedLoser { our_commit_lost: true }
+    );
+    for n in &g[..2] {
+        let view = n.engine().view(GID).unwrap();
+        assert_eq!(view.epoch, start + 1);
+        assert!(!view.members.iter().any(|m| m.card.member_pub == g[2].card.member_pub), "carol is out");
+        assert!(!view.members.iter().any(|m| m.card.member_pub == dave.card.member_pub), "dave never came in");
+    }
+}
+
+/// V-04: the same member holding its Commit back until the group moved on does not win by the
+/// fork rule either — a late Commit is ranked on the state of its epoch, by the same rule.
+#[test]
+fn a_withheld_commit_does_not_undo_a_removal_after_the_group_moved_on() {
+    let g = group_of(&["alice", "bob", "carol"]);
+    let split = g[0].engine().view(GID).unwrap().epoch;
+    let remove = g[0].engine().remove_members(GID, &[g[2].card.member_pub.clone()]).unwrap();
+    let dave = Node::new("dave");
+    let grab = g[2].engine().add_members(GID, &[dave.engine().key_package().unwrap()]).unwrap();
+    assert_eq!(outcome(g[1].engine().receive(GID, &remove).unwrap()), CommitOutcome::Merged);
+    let rename = g[0].engine().update_meta(GID, |m| m.name = "Дальше".into()).unwrap();
+    assert_eq!(outcome(g[1].engine().receive(GID, &rename).unwrap()), CommitOutcome::Merged);
+
+    for n in &g[..2] {
+        match n.engine().receive(GID, &grab.commit).unwrap() {
+            Inbound::ForkSeen { epoch, ours_wins } => {
+                assert_eq!(epoch, split);
+                assert!(ours_wins, "the removal's branch wins");
+            }
+            other => panic!("a fork, got {other:?}"),
+        }
+        assert_eq!(n.engine().view(GID).unwrap().name, "Дальше", "nothing rolled back");
+    }
+}
+
+/// The snapshots keyed by the bare group id are dropped for the ones keyed by the codec's key.
+#[test]
+fn migrate_drops_the_snapshots_keyed_by_the_bare_group_id() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE omni_mls_snapshots (
+            group_id BLOB NOT NULL, epoch INTEGER NOT NULL, merged_rank BLOB NOT NULL,
+            ours INTEGER NOT NULL, rows TEXT NOT NULL, PRIMARY KEY (group_id, epoch));
+         INSERT INTO omni_mls_snapshots VALUES (x'01', 3, x'00', 0, '[]');
+         CREATE TABLE omni_mls_commit_log (group_id BLOB NOT NULL, epoch INTEGER NOT NULL, rank BLOB NOT NULL);",
+    )
+    .unwrap();
+    Engine::<JsonCodec>::migrate(&mut conn).unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'omni_mls%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(!tables.contains(&"omni_mls_snapshots".to_string()) && !tables.contains(&"omni_mls_commit_log".to_string()));
+    assert!(tables.contains(&"omni_mls_group_snapshots".to_string()) && tables.contains(&"omni_mls_group_commit_log".to_string()));
+    Engine::<JsonCodec>::migrate(&mut conn).unwrap(); // idempotent
 }
 
 /// A KeyPackage whose card claims someone else's account key is refused — a leaf cannot pose as
@@ -310,7 +420,11 @@ fn a_group_that_went_on_in_two_branches_comes_back_to_one() {
         assert_eq!(outcome(g[1].engine().receive(GID, &y1).unwrap()), CommitOutcome::Merged);
         let y2 = g[2].engine().update_meta(GID, |m| m.name = "Игрек-2".into()).unwrap();
         assert_eq!(outcome(g[1].engine().receive(GID, &y2).unwrap()), CommitOutcome::Merged);
-        let x_wins = commit_rank(&x1) < commit_rank(&y1);
+        // Who wins is the rank's business (both are admins); alice's side tells, the rest must agree.
+        let x_wins = match g[0].engine().receive(GID, &y1).unwrap() {
+            Inbound::ForkSeen { ours_wins, .. } => ours_wins,
+            other => panic!("a fork, got {other:?}"),
+        };
 
         // They meet: everyone gets everything the other side wrote.
         let mut lost: Vec<usize> = Vec::new();
@@ -382,4 +496,111 @@ fn a_rejoin_from_a_stranger_or_a_welcome_for_someone_else_changes_nothing() {
     let out = g[0].engine().add_members(GID, &[carol.engine().key_package().unwrap()]).unwrap();
     assert!(g[1].engine().rejoin(&out.welcome).is_err(), "not for bob");
     assert_eq!(g[1].engine().view(GID).unwrap(), before, "bob's group is as it was");
+}
+
+
+/// A newcomer whose card names an account its device chain does not prove is refused — by the one who
+/// adds it and, for a patched adder, by every member that takes the Commit (audit 2026-11-09, F01).
+#[test]
+fn a_card_naming_an_account_its_chain_does_not_prove_is_refused() {
+    let g = group_of(&["alice", "bob"]);
+    let mut mallory = Node::new("mallory");
+    mallory.card.account_id = g[0].card.account_id.clone(); // "I am Alice"
+    let forged = mallory.engine().key_package().unwrap();
+    assert!(matches!(g[0].checked().add_members(GID, std::slice::from_ref(&forged)), Err(GroupError::Invalid(_))));
+    assert!(g[0].checked().key_package_card(&forged).is_err());
+
+    let mut bare = Node::new("bare");
+    bare.card.device_chain.clear();
+    assert!(g[0].checked().add_members(GID, &[bare.engine().key_package().unwrap()]).is_err(), "a card without a chain");
+
+    // An adder without the check: the others refuse its Commit.
+    let out = g[0].engine().add_members(GID, &[forged]).unwrap();
+    assert!(matches!(outcome(g[1].checked().receive(GID, &out.commit).unwrap()), CommitOutcome::Rejected(_)));
+
+    let honest = Node::new("carol");
+    assert!(g[1].checked().add_members(GID, &[honest.checked().key_package().unwrap()]).is_ok());
+}
+
+/// A device the account revoked is taken out by another device of the same account, admin or not;
+/// a member of another account may not do that, and the members check it (audit 2026-11-09, F02).
+#[test]
+fn a_device_removes_another_device_of_its_own_account_only() {
+    let alice = Node::new("alice");
+    let alice_desktop = Node::device_of(&alice, "alice-desktop");
+    let bob = Node::new("bob");
+    alice_desktop.checked().create_group(GID, "Свои").unwrap(); // the desktop is the only admin
+    let kps = vec![alice.checked().key_package().unwrap(), bob.checked().key_package().unwrap()];
+    let out = alice_desktop.checked().add_members(GID, &kps).unwrap();
+    alice.checked().join(&out.welcome).unwrap();
+    bob.checked().join(&out.welcome).unwrap();
+
+    assert!(matches!(
+        bob.checked().remove_members(GID, std::slice::from_ref(&alice_desktop.card.member_pub)),
+        Err(GroupError::NotAllowed(_))
+    ), "another account's member may not");
+    let commit = alice.checked().remove_members(GID, std::slice::from_ref(&alice_desktop.card.member_pub)).unwrap();
+    assert_eq!(outcome(bob.checked().receive(GID, &commit).unwrap()), CommitOutcome::Merged);
+    assert!(bob.checked().view(GID).unwrap().members.iter().all(|m| m.card.member_pub != alice_desktop.card.member_pub));
+    assert_eq!(outcome(alice_desktop.checked().receive(GID, &commit).unwrap()), CommitOutcome::Merged);
+    assert!(!alice_desktop.checked().view(GID).unwrap().active, "the revoked device is out");
+    let (_, after) = alice.checked().encrypt(GID, b"after").unwrap();
+    assert!(matches!(alice_desktop.checked().receive(GID, &after).unwrap(), Inbound::Ignored(_)), "and reads nothing new");
+    // The desktop was the only admin: the laptop took its place in the same Commit.
+    let view = bob.checked().view(GID).unwrap();
+    assert!(view.members.iter().any(|m| m.card.member_pub == alice.card.member_pub && m.is_admin), "the laptop is the admin now");
+    assert!(bob.checked().update_meta(GID, |m| m.name = "Bob's".into()).is_err(), "bob still is not");
+}
+
+/// A member's own Commit may not swap its card for one naming another account without a chain that
+/// proves it — the path of any Commit carries the committer's leaf, card and all.
+#[test]
+fn a_member_cannot_rename_its_account_through_its_own_commit() {
+    let alice = Node::new("alice");
+    let bob = Node::new("bob");
+    alice.checked().create_group(GID, "Друзья").unwrap();
+    let out = alice.checked().add_members(GID, &[bob.checked().key_package().unwrap()]).unwrap();
+    bob.checked().join(&out.welcome).unwrap();
+    let engine = bob.checked();
+    let mut group = engine.load(GID).unwrap();
+    let mut forged = bob.card.clone();
+    forged.account_id = alice.card.account_id.clone();
+    forged.device_chain.clear();
+    let credential = CredentialWithKey {
+        credential: BasicCredential::new(serde_json::to_vec(&forged).unwrap()).into(),
+        signature_key: engine.signer.public().into(),
+    };
+    let bundle = group
+        .self_update(&engine.provider, &engine.signer, LeafNodeParameters::builder().with_credential_with_key(credential).build())
+        .unwrap();
+    let commit = wire(bundle.commit()).unwrap();
+    assert!(matches!(outcome(alice.checked().receive(GID, &commit).unwrap()), CommitOutcome::Rejected(_)));
+    assert!(alice.checked().view(GID).unwrap().members.iter().all(|m| m.card.account_id != alice.card.account_id || m.is_me));
+}
+
+/// A member that joined before cards carried device chains puts its chain in with a Commit of its
+/// own; from then on its account counts as proven (another device of the account may take it out).
+#[test]
+fn a_member_from_before_chains_puts_its_chain_in() {
+    let alice = Node::new("alice");
+    let mut laptop = Node::device_of(&alice, "laptop");
+    let chain = std::mem::take(&mut laptop.card.device_chain); // a card from before chains
+    alice.engine().create_group(GID, "Свои").unwrap();
+    let out = alice.engine().add_members(GID, &[laptop.engine().key_package().unwrap()]).unwrap();
+    laptop.checked().join(&out.welcome).expect("a chainless leaf already in the group is taken");
+
+    // Not proven yet: Alice's own device may not take it out as one of hers (she is the admin here,
+    // so check the rule on a non-admin device of hers).
+    let phone = Node::device_of(&alice, "phone");
+    let added = alice.checked().add_members(GID, &[phone.checked().key_package().unwrap()]).unwrap();
+    laptop.checked().receive(GID, &added.commit).unwrap();
+    phone.checked().join(&added.welcome).unwrap();
+    assert!(phone.checked().remove_members(GID, std::slice::from_ref(&laptop.card.member_pub)).is_err(), "unproven account");
+
+    laptop.card.device_chain = chain;
+    let refresh = laptop.checked().refresh_own_card(GID).unwrap().expect("a Commit that puts the chain in");
+    assert_eq!(outcome(alice.checked().receive(GID, &refresh).unwrap()), CommitOutcome::Merged);
+    assert_eq!(outcome(phone.checked().receive(GID, &refresh).unwrap()), CommitOutcome::Merged);
+    assert!(laptop.checked().refresh_own_card(GID).unwrap().is_none(), "once is enough");
+    assert!(phone.checked().remove_members(GID, std::slice::from_ref(&laptop.card.member_pub)).is_ok(), "proven now");
 }

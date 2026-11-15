@@ -234,7 +234,7 @@ public sealed class ShellRegressionTests
             ResolveRepoPath("src", "Omni.Windows.App", "MainWindow.SectionEvents.cs"));
 
         // The om3mesh pairing UI replaced the legacy om3 signaling block; guard
-        // that it stays declared + wired (see docs/notes/legacy-signaling-ui-removal.md).
+        // that it stays declared + wired (see docs/decisions/signaling-target-model-adoption.md).
         foreach (string id in new[]
         {
             "GenerateMeshInviteButton", "GeneratedMeshInviteTextBox",

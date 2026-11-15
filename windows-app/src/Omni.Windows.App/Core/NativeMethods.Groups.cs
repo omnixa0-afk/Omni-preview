@@ -8,6 +8,7 @@ internal static partial class NativeMethods
     private static OmniGroupsCreateDelegate? omniGroupsCreate;
     private static OmniGroupsListDelegate? omniGroupsList;
     private static OmniGroupsListMembersDelegate? omniGroupsListMembers;
+    private static OmniGroupsLeaveNoticeDelegate? omniGroupsLeaveNotice;
     private static OmniGroupsSendTextDelegate? omniGroupsSendText;
     private static OmniGroupsJsonDelegate? omniGroupsSendAttachment;
     private static OmniGroupsInviteDelegate? omniGroupsInvite;
@@ -15,6 +16,7 @@ internal static partial class NativeMethods
     private static OmniGroupsLeaveCallDelegate? omniGroupsLeaveCall;
     private static OmniGroupsCallSnapshotDelegate? omniGroupsCallSnapshot;
     private static OmniGroupsSetCallMediaStateDelegate? omniGroupsSetCallMediaState;
+    private static OmniGroupsSetCallAudioLevelDelegate? omniGroupsSetCallAudioLevel;
     private static OmniGroupsPublishMediaCapabilitiesDelegate? omniGroupsPublishMediaCapabilities;
     // Groups on MLS (docs/decisions/group-crypto-mls.md): invitations, membership, the thread.
     private static OmniGroupsHandleOnlyDelegate? omniGroupsListInvites;
@@ -39,6 +41,7 @@ internal static partial class NativeMethods
         LoadExport(ref omniGroupsCreate, nameof(omni_groups_create));
         LoadExport(ref omniGroupsList, nameof(omni_groups_list));
         LoadExport(ref omniGroupsListMembers, nameof(omni_groups_list_members));
+        LoadExport(ref omniGroupsLeaveNotice, nameof(omni_groups_leave_notice));
         LoadExport(ref omniGroupsSendText, nameof(omni_groups_send_text));
         LoadExport(ref omniGroupsSendAttachment, nameof(omni_groups_send_attachment));
         LoadExport(ref omniGroupsInvite, nameof(omni_groups_invite));
@@ -46,6 +49,7 @@ internal static partial class NativeMethods
         LoadExport(ref omniGroupsLeaveCall, nameof(omni_groups_leave_call));
         LoadExport(ref omniGroupsCallSnapshot, nameof(omni_groups_call_snapshot));
         LoadExport(ref omniGroupsSetCallMediaState, nameof(omni_groups_set_call_media_state));
+        LoadExport(ref omniGroupsSetCallAudioLevel, nameof(omni_groups_set_call_audio_level));
         LoadExport(ref omniGroupsPublishMediaCapabilities, nameof(omni_groups_publish_media_capabilities));
         LoadExport(ref omniGroupsListInvites, nameof(omni_groups_list_invites));
         LoadExport(ref omniGroupsCallInbox, nameof(omni_groups_call_inbox));
@@ -95,6 +99,12 @@ internal static partial class NativeMethods
         return omniGroupsSetCallMediaState!(handle, requestJson);
     }
 
+    internal static IntPtr omni_groups_set_call_audio_level(IntPtr handle, string requestJson)
+    {
+        EnsureLoaded();
+        return omniGroupsSetCallAudioLevel!(handle, requestJson);
+    }
+
     internal static IntPtr omni_groups_create(IntPtr handle, string requestJson)
     {
         EnsureLoaded();
@@ -111,6 +121,12 @@ internal static partial class NativeMethods
     {
         EnsureLoaded();
         return omniGroupsListMembers!(handle, requestJson);
+    }
+
+    internal static IntPtr omni_groups_leave_notice(IntPtr handle, string requestJson)
+    {
+        EnsureLoaded();
+        return omniGroupsLeaveNotice!(handle, requestJson);
     }
 
     internal static IntPtr omni_groups_send_attachment(IntPtr handle, string requestJson)
@@ -249,6 +265,11 @@ internal static partial class NativeMethods
         [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr OmniGroupsLeaveNoticeDelegate(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr OmniGroupsSendTextDelegate(
         IntPtr handle,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
@@ -275,6 +296,11 @@ internal static partial class NativeMethods
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr OmniGroupsSetCallMediaStateDelegate(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr OmniGroupsSetCallAudioLevelDelegate(
         IntPtr handle,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
 

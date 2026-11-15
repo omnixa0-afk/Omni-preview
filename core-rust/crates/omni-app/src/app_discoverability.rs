@@ -39,29 +39,31 @@ impl DiscoverabilityMode {
     }
 }
 
-fn discoverability_sidecar_path(db_path: &str) -> std::path::PathBuf {
-    crate::profile_sidecar_path(db_path, "discoverability-mode.json")
+fn discoverability_sidecar_path(storage: &omni_storage::Storage) -> Option<std::path::PathBuf> {
+    crate::active_profile_sidecar_path(storage, "discoverability-mode.json")
 }
 
 /// Present while the withdrawal of our identity beacon is still to be posted ("findable by ID" was
 /// turned off; the next sweep posts it and removes this). On disk, so a restart in between does
 /// not leave the last real beacon findable.
-fn identity_withdrawal_marker_path(db_path: &str) -> std::path::PathBuf {
-    crate::profile_sidecar_path(db_path, "identity-beacon-withdrawal.json")
+fn identity_withdrawal_marker_path(storage: &omni_storage::Storage) -> Option<std::path::PathBuf> {
+    crate::active_profile_sidecar_path(storage, "identity-beacon-withdrawal.json")
 }
 
-pub(crate) fn identity_withdrawal_pending(db_path: &str) -> bool {
-    identity_withdrawal_marker_path(db_path).exists()
+pub(crate) fn identity_withdrawal_pending(storage: &omni_storage::Storage) -> bool {
+    identity_withdrawal_marker_path(storage).is_some_and(|path| path.exists())
 }
 
-pub(crate) fn clear_identity_withdrawal(db_path: &str) {
-    let _ = std::fs::remove_file(identity_withdrawal_marker_path(db_path));
+pub(crate) fn clear_identity_withdrawal(storage: &omni_storage::Storage) {
+    if let Some(path) = identity_withdrawal_marker_path(storage) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
-pub(crate) fn load_discoverability_mode(db_path: &str) -> DiscoverabilityMode {
-    match std::fs::read_to_string(discoverability_sidecar_path(db_path)) {
-        Ok(raw) => DiscoverabilityMode::from_db_value(raw.trim().trim_matches('"')),
-        Err(_) => DiscoverabilityMode::Off,
+pub(crate) fn load_discoverability_mode(storage: &omni_storage::Storage) -> DiscoverabilityMode {
+    match discoverability_sidecar_path(storage).map(std::fs::read_to_string) {
+        Some(Ok(raw)) => DiscoverabilityMode::from_db_value(raw.trim().trim_matches('"')),
+        _ => DiscoverabilityMode::Off,
     }
 }
 
@@ -206,7 +208,7 @@ impl OmniApp {
     }
 
     pub fn discoverability_mode(&self) -> DiscoverabilityMode {
-        load_discoverability_mode(&self.storage.db_path().to_string_lossy())
+        load_discoverability_mode(&self.storage)
     }
 
     /// Set whether I'm findable by my Omni-ID (Model A opt-in). Persisted in the
@@ -219,16 +221,17 @@ impl OmniApp {
     pub fn set_discoverability_mode(&self, mode: DiscoverabilityMode) -> OmniResult<()> {
         let _ = self.ensure_runtime_profile_active("set_discoverability_mode")?;
         let db_path = self.storage.db_path().to_string_lossy().to_string();
-        let was_public = load_discoverability_mode(&db_path).is_public();
-        let path = discoverability_sidecar_path(&db_path);
+        let was_public = load_discoverability_mode(&self.storage).is_public();
+        let path = discoverability_sidecar_path(&self.storage).ok_or_else(|| OmniError::InvalidInput("no active profile".into()))?;
         std::fs::write(&path, format!("\"{}\"", mode.as_db_value())).map_err(|error| {
             OmniError::Storage(format!("failed to persist discoverability mode: {error}"))
         })?;
         if mode.is_public() {
-            clear_identity_withdrawal(&db_path);
+            clear_identity_withdrawal(&self.storage);
             forget_identity_beacon_publish(&db_path);
         } else if was_public {
-            std::fs::write(identity_withdrawal_marker_path(&db_path), "{}").map_err(|error| {
+            let marker = identity_withdrawal_marker_path(&self.storage).ok_or_else(|| OmniError::InvalidInput("no active profile".into()))?;
+            std::fs::write(marker, "{}").map_err(|error| {
                 OmniError::Storage(format!("failed to persist the beacon withdrawal: {error}"))
             })?;
         }
@@ -253,8 +256,20 @@ impl OmniApp {
 ///    without this (the second-add-after-forget failure).
 /// Every outcome is traced (`find_by_id/*`) — the errors used to be swallowed, which is exactly
 /// why the live "never delivered" was undiagnosable.
+/// The addresses of a beacon we may dial: public ones only (blind audit 2026-11-11, G3). A beacon
+/// proves who wrote it, not that its addresses are safe to dial: one naming loopback or a private
+/// network had this device send packets and SYNs into its own network. A publisher puts only public
+/// ones there — what STUN saw and what its router forwards.
+pub(crate) fn dialable_beacon_endpoints(listed: &[String]) -> Vec<std::net::SocketAddr> {
+    listed
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .filter(crate::knock_target_allowed)
+        .collect()
+}
+
 fn dial_identity_beacon_target(
-    runtime: &MeshRuntime,
+    runtime: &Arc<MeshRuntime>,
     storage: &Storage,
     pairing_targets: &std::sync::Mutex<std::collections::HashSet<MeshNodeAddress>>,
     beacon: &omni_rendezvous::IdentityBeacon,
@@ -283,11 +298,20 @@ fn dial_identity_beacon_target(
     omni_app_trace_log(
         "find_by_id/beacon",
         &format!(
-            "node={node} reflexive={:?} tcp_direct={:?} relay_bundle={}",
+            "node={node} reflexive={:?} tcp_direct={:?} tcp_punch={:?} knock_key={} relay_bundle={}",
             beacon.reflexive,
             beacon.tcp_direct,
+            beacon.tcp_punch,
+            beacon.knock_key.is_some(),
             beacon.relay_bundle.is_some()
         ),
+    );
+    // What families the stranger can be reached on: an outgoing request that finds no common one
+    // with ours says so instead of "sent" (`address_family_gap`).
+    crate::app_nat_class::set_peer_address_families(
+        &storage.db_path().to_string_lossy(),
+        node.as_bytes(),
+        crate::app_nat_class::AddressFamilies::of(beacon.reflexive.iter().chain(&beacon.tcp_direct)),
     );
 
     if runtime.has_link(&node) {
@@ -297,10 +321,8 @@ fn dial_identity_beacon_target(
             &format!("node={node} already_linked hello_pushed={sent}"),
         );
     } else if allow_direct {
-        let udp_endpoints: Vec<std::net::SocketAddr> =
-            beacon.reflexive.iter().filter_map(|s| s.parse().ok()).collect();
-        let tcp_endpoints: Vec<std::net::SocketAddr> =
-            beacon.tcp_direct.iter().filter_map(|s| s.parse().ok()).collect();
+        let udp_endpoints = dialable_beacon_endpoints(&beacon.reflexive);
+        let tcp_endpoints = dialable_beacon_endpoints(&beacon.tcp_direct);
         // S3 honest failover: remember the peer's direct-TCP door so a later phantom-drop can
         // migrate this peer's connection onto it (the reliable base on a UDP-hostile carrier),
         // instead of the inert UDP demote. Learned here at pairing; refreshed each approved sweep.
@@ -344,7 +366,10 @@ fn dial_identity_beacon_target(
                 ),
             }
         }
-        if udp_endpoints.is_empty() && tcp_endpoints.is_empty() {
+        // The TCP hole punch, when the device published a punch address: start our window and knock,
+        // so it punches towards us too (app_tcp_knock.rs). A window already running is only re-aimed.
+        punch_found_device(runtime, &storage.db_path().to_string_lossy(), beacon, node);
+        if udp_endpoints.is_empty() && tcp_endpoints.is_empty() && beacon.tcp_punch.is_none() {
             omni_app_trace_log(
                 "find_by_id/dial",
                 &format!("node={node} NO direct endpoints in beacon — relying on relay/announce fallback"),

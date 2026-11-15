@@ -110,6 +110,26 @@ internal sealed class ChatThreadListItem : INotifyPropertyChanged
     /// Groups wear a "people" mark before the name, so a group never reads as a person.
     public Visibility GroupMarkVisibility => IsGroup ? Visibility.Visible : Visibility.Collapsed;
 
+    private bool isWorkspace;
+
+    /// A group with git repositories (docs/decisions/omni-workspace-ux.md: a group row with a mark).
+    public bool IsWorkspace
+    {
+        get => isWorkspace;
+        internal set
+        {
+            if (isWorkspace != value)
+            {
+                isWorkspace = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(GroupMarkGlyph));
+            }
+        }
+    }
+
+    /// The mark's glyph: people for a group, code brackets for a workspace.
+    public string GroupMarkGlyph => isWorkspace ? "" : "";
+
     public string PreviewText
     {
         get => previewText;
@@ -212,6 +232,7 @@ internal sealed class ChatThreadListItem : INotifyPropertyChanged
             source.PresenceDotBrush,
             source.avatarSeed,
             source.UnreadCount);
+        IsWorkspace = source.IsWorkspace;
     }
 
     internal void ApplyFrom(

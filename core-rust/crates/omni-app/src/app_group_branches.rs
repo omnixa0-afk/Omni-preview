@@ -22,10 +22,10 @@
 
 use omni_group_mls::MemberCard;
 use omni_storage::{GroupPendingWelcome, GroupReaddRequest, Storage};
-use omni_types::OmniResult;
+use omni_types::{OmniError, OmniResult};
 
 use crate::app_groups::{
-    apply_view, group_id_bytes, insert_system_line, local_mls_identity, own_commit_bookkeeping, reissue_change, with_engine,
+    apply_view, group_id_bytes, insert_system_line, local_mls_identity, own_commit_bookkeeping, with_engine,
     OwnChange,
 };
 use crate::omni_app_trace_log;
@@ -85,36 +85,44 @@ pub(crate) fn on_welcome(
     if state.rejoining_since_unix_ms.is_none() {
         return Ok(());
     }
-    let joined = with_engine(storage, |engine| engine.rejoin(welcome));
-    let Ok(joined) = joined else {
-        return Ok(()); // a Welcome for someone else
-    };
-    if joined != group_id_bytes(group_id)? {
-        return Ok(());
-    }
     let gid = group_id_bytes(group_id)?;
-    let view = with_engine(storage, |engine| engine.view(&gid))?;
-    apply_view(storage, group_id, &view, now)?;
-    storage.clear_group_branch_state(group_id)?;
-    // Requests we kept while out are from before we came back; a member still out asks again.
-    storage.drop_group_readd_requests(group_id)?;
-    insert_system_line(storage, group_id, "Ветки группы сведены: вы снова вместе со всеми", now)?;
+    // Back in MLS and back here, as one: apart, a failure between them left our MLS state on the
+    // winning branch and the group here still waiting to rejoin (blind audit 2026-11-13, pass 18).
+    let view = crate::app_groups::in_mls_transaction(storage, "group rejoined", |storage| {
+        let Ok(joined) = with_engine(storage, |engine| engine.rejoin(welcome)) else {
+            return Ok(None); // a Welcome for someone else
+        };
+        if joined != gid {
+            return Ok(None);
+        }
+        let view = with_engine(storage, |engine| engine.view(&gid))?;
+        apply_view(storage, group_id, &view, now)?;
+        storage.clear_group_branch_state(group_id)?;
+        // Requests we kept while out are from before we came back; a member still out asks again.
+        storage.drop_group_readd_requests(group_id)?;
+        insert_system_line(storage, group_id, "Ветки группы сведены: вы снова вместе со всеми", now)?;
+        Ok(Some(view))
+    })?;
+    let Some(view) = view else {
+        return Ok(());
+    };
     // Messages of the winning branch that came before the Welcome open now.
-    for pending in storage.take_group_pending_inbound(group_id)? {
-        let _ = crate::app_groups::receive_mls(storage, transport, group_id, &pending);
-    }
+    crate::app_groups::open_pending_inbound(storage, transport, group_id)?;
     omni_app_trace_log("group/branch", &format!("group={group_id} back on the winning branch at epoch {}", view.epoch));
     // Who we added or removed on the losing branch, made again on this one (a removal stays a
     // removal). The name, picture, admins and switches of the winning branch stand: ours were set
     // apart from what the others did since, and replaying them would undo newer changes.
-    for (_, json) in storage.take_group_own_changes_after(group_id, state.fork_epoch)? {
-        let Ok(change) = serde_json::from_str::<OwnChange>(&json) else {
+    // Each goes only once it is made again (`reissue_kept_change`): taken all at once first, one that
+    // failed on the way was lost (blind audit 2026-11-13, pass 19). One that fails stays kept.
+    for (epoch_after, json) in storage.list_group_own_changes_after(group_id, state.fork_epoch)? {
+        let wanted = serde_json::from_str::<OwnChange>(&json)
+            .is_ok_and(|change| matches!(change, OwnChange::Add { .. } | OwnChange::Remove { .. }));
+        if !wanted {
+            storage.drop_group_own_change(group_id, epoch_after, &json)?;
             continue;
-        };
-        if matches!(change, OwnChange::Add { .. } | OwnChange::Remove { .. }) {
-            if let Err(error) = reissue_change(storage, transport, group_id, change) {
-                omni_app_trace_log("group/branch", &format!("group={group_id} a change not made again: {error}"));
-            }
+        }
+        if let Err(error) = crate::app_groups::reissue_kept_change(storage, transport, group_id, epoch_after, &json) {
+            omni_app_trace_log("group/branch", &format!("group={group_id} a change not made again yet: {error}"));
         }
     }
     // What we said there, for the others (each line signed by us).
@@ -134,7 +142,12 @@ pub(crate) fn group_branch_tick(storage: &Storage, now: i64) {
     for pending in storage.list_group_pending_welcomes().unwrap_or_default() {
         if let Err(error) = welcome_round(storage, &pending, now) {
             omni_app_trace_log("group/branch", &format!("group={} welcome not sent: {error}", pending.group_id));
-            let _ = storage.drop_group_pending_welcome(&pending.group_id, &pending.member_pub);
+            // A passing failure (the database, the engine) keeps it for the next tick: dropped on
+            // any error, a moment's failure lost the only Welcome the member had (blind audit
+            // 2026-11-13, pass 20). One that can never go goes.
+            if !matches!(error, OmniError::Storage(_) | OmniError::StorageLocked(_) | OmniError::Internal(_) | OmniError::Transport(_)) {
+                let _ = storage.drop_group_pending_welcome(&pending.group_id, &pending.member_pub);
+            }
         }
     }
     for request in storage.list_group_readd_requests().unwrap_or_default() {
@@ -188,12 +201,17 @@ fn welcome_round(storage: &Storage, pending: &GroupPendingWelcome, now: i64) -> 
     }
     let gid = group_id_bytes(&pending.group_id)?;
     let merged = with_engine(storage, |engine| engine.branch_rank(&gid, pending.epoch_before))?;
-    storage.drop_group_pending_welcome(&pending.group_id, &pending.member_pub)?;
     if merged.map(|rank| rank.to_vec()) != Some(pending.commit_rank.clone()) {
+        storage.drop_group_pending_welcome(&pending.group_id, &pending.member_pub)?;
         omni_app_trace_log("group/branch", &format!("group={} our put-back lost its epoch: welcome dropped", pending.group_id));
         return Ok(());
     }
-    storage.enqueue_group_feed(&pending.group_id, &pending.welcome, now)?;
+    // Off the hold and on the queue, as one: dropped first, a queue that did not take it lost the
+    // only Welcome the member had (blind audit 2026-11-13, pass 19).
+    storage.with_immediate_transaction("put-back welcome out", |storage| {
+        storage.drop_group_pending_welcome(&pending.group_id, &pending.member_pub)?;
+        storage.enqueue_group_feed(&pending.group_id, &pending.welcome, now)
+    })?;
     omni_app_trace_log("group/branch", &format!("group={} welcome out", pending.group_id));
     // What was said on this branch, for the member coming back — after the Welcome, in an epoch it
     // will hold the keys of.
@@ -212,6 +230,16 @@ fn readd_round(storage: &Storage, request: &GroupReaddRequest, now: i64) -> Omni
     if group.my_status != "member" || rejoining {
         return Ok(());
     }
+    // One who said it leaves is not put back on its own word: its leaf stays until an admin takes it
+    // out, and a request to be put back, checked against that tree, gave it a new Welcome — new
+    // secrets of a group it had left (blind audit 2026-11-13, pass 23).
+    let left = storage
+        .list_group_members(group_id)?
+        .iter()
+        .any(|member| member.member_pub == request.member_pub && member.status != "member");
+    if left {
+        return storage.drop_group_readd_request(group_id, &request.member_pub);
+    }
     let gid = group_id_bytes(group_id)?;
     if with_engine(storage, |engine| engine.has_leaf_of(&gid, &request.key_package))? {
         return storage.drop_group_readd_request(group_id, &request.member_pub);
@@ -228,15 +256,19 @@ fn readd_round(storage: &Storage, request: &GroupReaddRequest, now: i64) -> Omni
     if now - request.seen_at_unix_ms < position as i64 * READD_TURN_MS {
         return Ok(());
     }
-    let out = with_engine(storage, |engine| engine.readd_member(&gid, &request.key_package))?;
-    own_commit_bookkeeping(storage, group_id, &out.commit, &OwnChange::PutBack { member_pub: request.member_pub.clone() })?;
+    // Our Commit and its bookkeeping as one transaction (pass 17).
+    let out = crate::app_groups::in_mls_transaction(storage, "group_own_commit", |storage| {
+        let out = with_engine(storage, |engine| engine.readd_member(&gid, &request.key_package))?;
+        own_commit_bookkeeping(storage, group_id, &out.commit, &OwnChange::PutBack { member_pub: request.member_pub.clone() })?;
+        Ok(out)
+    })?;
     // The Welcome waits until our Commit stands: two members putting the same one back at once make
     // two Commits for one epoch, and only the winner's Welcome leads into the group.
     storage.hold_group_welcome(&GroupPendingWelcome {
         group_id: group_id.clone(),
         member_pub: request.member_pub.clone(),
         epoch_before: view.epoch,
-        commit_rank: omni_group_mls::commit_rank(&out.commit).to_vec(),
+        commit_rank: out.rank.to_vec(),
         welcome: out.welcome.clone(),
         created_at_unix_ms: now,
     })?;

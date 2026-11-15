@@ -74,17 +74,28 @@ pub fn derive_cert_from_signing_key(
 ///
 /// Protocol:
 /// 1. Initiator generate'ит random nonce, sends его responder'у
-/// 2. Responder подписывает payload `(nonce || "omni-identity-v1")` своим SigningKey,
+/// 2. Responder подписывает payload `("omni-identity-v2" || nonce || binding)` своим SigningKey,
 ///    отправляет (pubkey, signature) обратно
-/// 3. Initiator verify: `signature` валидна над `(nonce || "omni-identity-v1")`
-///    под `pubkey`, AND `pubkey` соответствует expected NodeAddress (anti-impersonation)
+/// 3. Initiator verify: `signature` валидна над тем же payload под `pubkey`, AND `pubkey`
+///    соответствует expected NodeAddress (anti-impersonation)
 ///
-/// Domain separator `"omni-identity-v1"` предотвращает signature reuse в других
-/// контекстах (signature от identity challenge не может быть использована как
-/// signature над, скажем, announce'ом).
+/// `binding` is the channel binding: keying material both ends export from THEIR TLS session
+/// (`CHANNEL_BINDING_LABEL`, see `Interface::channel_binding`). A man in the middle holds two TLS
+/// sessions, one with each side, and they export different values — so a response it relays from
+/// the real peer does not verify on the other connection. Without it the challenge proved only that
+/// the peer was online, and the QUIC certificate (accept-any) proved nothing (V-03).
+///
+/// Domain separator предотвращает signature reuse в других контекстах (signature от identity
+/// challenge не может быть использована как signature над, скажем, announce'ом).
 ///
 /// Если verifyа не проходит — connection drop'ается, peer не trusted.
-pub const IDENTITY_CHALLENGE_DOMAIN: &[u8] = b"omni-identity-v1";
+pub const IDENTITY_CHALLENGE_DOMAIN: &[u8] = b"omni-identity-v2";
+
+/// TLS exporter label of the challenge's channel binding (RFC 5705 / RFC 8446 §7.5).
+pub const CHANNEL_BINDING_LABEL: &[u8] = b"EXPORTER-omni-identity-v2";
+
+/// Size of the channel binding the challenge signs.
+pub const CHANNEL_BINDING_BYTES: usize = 32;
 
 /// Generate fresh random nonce для identity challenge.
 pub fn fresh_challenge_nonce() -> [u8; CHALLENGE_NONCE_BYTES] {
@@ -93,12 +104,18 @@ pub fn fresh_challenge_nonce() -> [u8; CHALLENGE_NONCE_BYTES] {
     nonce
 }
 
-/// Build the bytes that are signed in response to a challenge.
-/// Domain separator + nonce = signed payload.
-fn challenge_signing_payload(nonce: &[u8; CHALLENGE_NONCE_BYTES]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(IDENTITY_CHALLENGE_DOMAIN.len() + CHALLENGE_NONCE_BYTES);
+/// Build the bytes that are signed in response to a challenge:
+/// domain separator + nonce + channel binding.
+fn challenge_signing_payload(
+    nonce: &[u8; CHALLENGE_NONCE_BYTES],
+    binding: &[u8; CHANNEL_BINDING_BYTES],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        IDENTITY_CHALLENGE_DOMAIN.len() + CHALLENGE_NONCE_BYTES + CHANNEL_BINDING_BYTES,
+    );
     payload.extend_from_slice(IDENTITY_CHALLENGE_DOMAIN);
     payload.extend_from_slice(nonce);
+    payload.extend_from_slice(binding);
     payload
 }
 
@@ -107,8 +124,9 @@ fn challenge_signing_payload(nonce: &[u8; CHALLENGE_NONCE_BYTES]) -> Vec<u8> {
 pub fn respond_to_challenge(
     signing_key: &SigningKey,
     nonce: &[u8; CHALLENGE_NONCE_BYTES],
+    binding: &[u8; CHANNEL_BINDING_BYTES],
 ) -> ChallengeResponse {
-    let payload = challenge_signing_payload(nonce);
+    let payload = challenge_signing_payload(nonce, binding);
     let signature = signing_key.sign(&payload);
     ChallengeResponse {
         pubkey: signing_key.verifying_key(),
@@ -117,13 +135,15 @@ pub fn respond_to_challenge(
 }
 
 /// Initiator side: verify the response.
-/// - signature над `(domain || nonce)` под claimed pubkey
+/// - signature над `(domain || nonce || binding)` под claimed pubkey, где `binding` — наш
+///   экспорт из ЭТОГО соединения
 /// - pubkey соответствует expected NodeAddress
 ///
 /// Returns the verified pubkey on success; CertError на mismatch.
 pub fn verify_challenge_response(
     response: &ChallengeResponse,
     nonce: &[u8; CHALLENGE_NONCE_BYTES],
+    binding: &[u8; CHANNEL_BINDING_BYTES],
     expected: &NodeAddress,
 ) -> Result<VerifyingKey, CertError> {
     if !expected.verify_for_pubkey(&response.pubkey) {
@@ -132,7 +152,7 @@ pub fn verify_challenge_response(
             actual: NodeAddress::from_pubkey(&response.pubkey),
         });
     }
-    let payload = challenge_signing_payload(nonce);
+    let payload = challenge_signing_payload(nonce, binding);
     response
         .pubkey
         .verify(&payload, &response.signature)
@@ -218,6 +238,9 @@ mod tests {
         SigningKey::generate(&mut OsRng)
     }
 
+    /// Channel binding of the one connection a test's challenge rides.
+    const BINDING: [u8; CHANNEL_BINDING_BYTES] = [0x5Au8; CHANNEL_BINDING_BYTES];
+
     #[test]
     fn cert_derivation_succeeds() {
         let key = fresh_key();
@@ -246,10 +269,10 @@ mod tests {
         let nonce = fresh_challenge_nonce();
 
         // Bob (responder) signs.
-        let response = respond_to_challenge(&bob_key, &nonce);
+        let response = respond_to_challenge(&bob_key, &nonce, &BINDING);
 
         // Alice verifies.
-        let verified = verify_challenge_response(&response, &nonce, &bob_address);
+        let verified = verify_challenge_response(&response, &nonce, &BINDING, &bob_address);
         assert!(verified.is_ok(), "happy-path challenge должна verify'иться: {verified:?}");
         assert_eq!(verified.unwrap(), bob_key.verifying_key());
 
@@ -266,9 +289,9 @@ mod tests {
         let charlie_address = NodeAddress::from_pubkey(&charlie_key.verifying_key());
 
         let nonce = fresh_challenge_nonce();
-        let response = respond_to_challenge(&bob_key, &nonce);
+        let response = respond_to_challenge(&bob_key, &nonce, &BINDING);
 
-        let result = verify_challenge_response(&response, &nonce, &charlie_address);
+        let result = verify_challenge_response(&response, &nonce, &BINDING, &charlie_address);
         assert!(
             matches!(result, Err(CertError::AddressMismatch { .. })),
             "expected AddressMismatch, got {result:?}"
@@ -281,14 +304,14 @@ mod tests {
         let bob_address = NodeAddress::from_pubkey(&bob_key.verifying_key());
 
         let nonce = fresh_challenge_nonce();
-        let mut response = respond_to_challenge(&bob_key, &nonce);
+        let mut response = respond_to_challenge(&bob_key, &nonce, &BINDING);
 
         // Tamper signature.
         let mut sig_bytes = response.signature.to_bytes();
         sig_bytes[0] ^= 0xFF;
         response.signature = Signature::from_bytes(&sig_bytes);
 
-        let result = verify_challenge_response(&response, &nonce, &bob_address);
+        let result = verify_challenge_response(&response, &nonce, &BINDING, &bob_address);
         assert!(
             matches!(result, Err(CertError::InvalidSignature(_))),
             "expected InvalidSignature, got {result:?}"
@@ -304,10 +327,10 @@ mod tests {
         let bob_address = NodeAddress::from_pubkey(&bob_key.verifying_key());
 
         let original_nonce = fresh_challenge_nonce();
-        let response = respond_to_challenge(&bob_key, &original_nonce);
+        let response = respond_to_challenge(&bob_key, &original_nonce, &BINDING);
 
         let different_nonce = fresh_challenge_nonce();
-        let result = verify_challenge_response(&response, &different_nonce, &bob_address);
+        let result = verify_challenge_response(&response, &different_nonce, &BINDING, &bob_address);
         assert!(
             matches!(result, Err(CertError::InvalidSignature(_))),
             "replay с другим nonce должен fail: {result:?}"
@@ -315,10 +338,30 @@ mod tests {
     }
 
     #[test]
+    fn challenge_response_relayed_onto_another_tls_session_is_rejected() {
+        // V-03: a man in the middle holds one TLS session with each side. It can forward the
+        // nonce and relay the real peer's answer, but the answer is bound to the peer's session
+        // (binding A), and the verifier checks it against its own session with the middle (B).
+        let bob_key = fresh_key();
+        let bob_address = NodeAddress::from_pubkey(&bob_key.verifying_key());
+        let nonce = fresh_challenge_nonce();
+        let session_with_bob = [0x11u8; CHANNEL_BINDING_BYTES];
+        let session_with_middle = [0x22u8; CHANNEL_BINDING_BYTES];
+
+        let relayed = respond_to_challenge(&bob_key, &nonce, &session_with_bob);
+        let result = verify_challenge_response(&relayed, &nonce, &session_with_middle, &bob_address);
+        assert!(
+            matches!(result, Err(CertError::InvalidSignature(_))),
+            "a response bound to another TLS session must fail: {result:?}"
+        );
+        assert!(verify_challenge_response(&relayed, &nonce, &session_with_bob, &bob_address).is_ok());
+    }
+
+    #[test]
     fn challenge_response_wire_round_trip() {
         let bob_key = fresh_key();
         let nonce = fresh_challenge_nonce();
-        let response = respond_to_challenge(&bob_key, &nonce);
+        let response = respond_to_challenge(&bob_key, &nonce, &BINDING);
 
         let bytes = response.encode_to_wire();
         assert_eq!(bytes.len(), ChallengeResponse::WIRE_SIZE);

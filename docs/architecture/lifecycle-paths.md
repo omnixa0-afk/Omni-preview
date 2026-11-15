@@ -15,8 +15,9 @@ survive refactors.
 
 `OmniApp::sign_out` (or `prepare_sign_out` → `confirm_sign_out`)
 → `ProfileLifecycleCoordinator::stop_runtime_context` (`app_profile_lifecycle.rs`)
-→ `transport.stop_discovery` + `transport.stop_listener` + `clear_transport_local_identity`
-→ **All static-registry clears:**
+→ `OmniApp::stop_mesh` first (`app_mesh.rs`: autoconnect, runtime, dialog maps, rendezvous helper;
+  the shell starts it again on sign-in) + `clear_transport_local_identity`
+→ **All static-registry clears**, among them:
 - `clear_runtime_chat_sessions_for_active_profile` (`runtime_chat_sessions.rs`)
 - `clear_call_runtime_for_profile` (`app_calls.rs`)
 - `clear_realtime_media_negotiation_for_profile` (`app_realtime_media.rs`)

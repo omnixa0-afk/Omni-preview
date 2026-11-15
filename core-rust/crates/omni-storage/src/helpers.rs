@@ -59,6 +59,9 @@ fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessageRecor
         attachment: None,
         call_history_event: None,
         told_by_contact: false,
+        reply: None,
+        reactions: Vec::new(),
+        pinned: false,
     })
 }
 

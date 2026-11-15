@@ -1,4 +1,4 @@
-﻿using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml;
 using Omni.Windows.App.Core;
 using Omni.Windows.App.Presentation;
 using Omni.Windows.App.ViewModels;
@@ -37,6 +37,7 @@ public sealed partial class MainWindow
     {
         windowState.Onboarding.ShellMode = AppShellMode.Authenticated;
         SetShellMode(AppShellMode.Authenticated);
+        _ = InitializeWorkspaceFoldersAsync();
         ClearDangerousActionPreview();
         RefreshCurrentLifecycleContracts();
         UpdateIdentityHeader();
@@ -73,7 +74,19 @@ public sealed partial class MainWindow
         // apply on the UI thread, mirroring StartMesh + the app's existing `await Task.Run(rustBridge.Get…)`
         // pattern. Messages already load async via RefreshMessages→StartTailRebaseTranscriptLoad.
         LoadContactsListAsync(windowState.SelectedContactId);
+        lastMeshReading = null; // another profile's, if there was one
         LoadChatsListAsync(windowState.CurrentPeerKey);
+        _ = PreloadWorkspacesAsync();
+    }
+
+    // After the boot's own work settles; a visit before that reads for itself.
+    private async Task PreloadWorkspacesAsync()
+    {
+        await Task.Delay(TimeSpan.FromSeconds(1));
+        if (windowState.Onboarding.ShellMode == AppShellMode.Authenticated)
+        {
+            await WorkspacesSectionHost.PreloadAsync();
+        }
     }
 
     /// Read the heavy contacts list snapshot OFF the UI thread (the FFI opens SQLite + queries the full
@@ -87,8 +100,12 @@ public sealed partial class MainWindow
     {
         try
         {
-            ContactsScreenSnapshot contacts = await System.Threading.Tasks.Task.Run(
-                () => rustBridge.GetContactsScreenSnapshot());
+            ContactsScreenSnapshot contacts = await System.Threading.Tasks.Task.Run(() =>
+            {
+                ContactsScreenSnapshot read = rustBridge.GetContactsScreenSnapshot();
+                ReadMeshConnectionState();
+                return read;
+            });
             if (windowState.Onboarding.ShellMode == AppShellMode.Authenticated)
             {
                 windowState.LastObservedContactRefreshSignature =
@@ -110,8 +127,12 @@ public sealed partial class MainWindow
         {
             (IReadOnlyList<RustBridge.ChatThreadProjection> projections, ChatGroupRows groupRows) =
                 await System.Threading.Tasks.Task.Run(() =>
-                    ((IReadOnlyList<RustBridge.ChatThreadProjection>)rustBridge.ListChatThreadProjections(),
-                     ChatGroupRows.Fetch(rustBridge)));
+                {
+                    var read = ((IReadOnlyList<RustBridge.ChatThreadProjection>)rustBridge.ListChatThreadProjections(),
+                        ChatGroupRows.Fetch(rustBridge));
+                    ReadMeshConnectionState();
+                    return read;
+                });
             if (windowState.Onboarding.ShellMode == AppShellMode.Authenticated)
             {
                 ApplyChatThreadProjections(projections, force: true, selectDialogKey, groupRows: groupRows);
@@ -177,6 +198,8 @@ public sealed partial class MainWindow
     private void SetShellMode(AppShellMode mode)
     {
         BootRoot.Visibility = mode == AppShellMode.Booting ? Visibility.Visible : Visibility.Collapsed;
+        // Hidden, an active ring may keep animating: stopped with the panel.
+        BootRing.IsActive = mode == AppShellMode.Booting;
         OnboardingRoot.Visibility = mode == AppShellMode.Onboarding ? Visibility.Visible : Visibility.Collapsed;
         AuthenticatedRoot.Visibility = mode == AppShellMode.Authenticated ? Visibility.Visible : Visibility.Collapsed;
 
@@ -255,7 +278,6 @@ public sealed partial class MainWindow
             IsUpdatingPublicProfile: isUpdatingPublicProfile,
             HasQuickAddContactPetname: !string.IsNullOrWhiteSpace(QuickAddContactPetnameTextBox.Text),
             HasRemotePrekeyBundle: !string.IsNullOrWhiteSpace(RemotePrekeyBundleTextBox.Text),
-            HasAddContactIdentifier: !string.IsNullOrWhiteSpace(AddContactIdentifierTextBox.Text),
             HasAddContactPetname: !string.IsNullOrWhiteSpace(AddContactPetnameTextBox.Text),
             HasAddContactPayload: !string.IsNullOrWhiteSpace(AddContactPayloadTextBox.Text),
             IsOnboarding: windowState.Onboarding.ShellMode == AppShellMode.Onboarding,
@@ -275,7 +297,6 @@ public sealed partial class MainWindow
         QuickAddContactButton.IsEnabled = controlState.IsQuickAddContactEnabled;
         ShowLocalPrekeyBundleButton.IsEnabled = controlState.IsShowLocalPrekeyBundleEnabled;
         ImportRemotePrekeyBundleButton.IsEnabled = controlState.IsImportRemotePrekeyBundleEnabled;
-        AddContactByIdentifierButton.IsEnabled = controlState.IsAddContactByIdentifierEnabled;
         AddContactFromPayloadButton.IsEnabled = controlState.IsAddContactFromPayloadEnabled;
         RenameContactButton.IsEnabled = controlState.IsRenameContactEnabled;
         RenameContactButton.Visibility = controlState.RenameContactVisibility;

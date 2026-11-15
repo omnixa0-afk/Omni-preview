@@ -10,6 +10,10 @@ internal static partial class NativeMethods
     private static readonly object SyncRoot = new();
     private static IntPtr libraryHandle = IntPtr.Zero;
     private static OmniChatSendTextDelegate? omniChatSendText;
+    private static OmniChatSendTextDelegate? omniMessageReact;
+    private static OmniChatSendTextDelegate? omniMessageDelete;
+    private static OmniChatSendTextDelegate? omniMessagePin;
+    private static OmniChatSendTextDelegate? omniMessageActions;
     private static OmniChatSendAttachmentDelegate? omniChatSendAttachment;
     private static OmniChatRequestAttachmentDownloadDelegate? omniChatRequestAttachmentDownload;
     private static OmniChatRevokeAttachmentAccessDelegate? omniChatRevokeAttachmentAccess;
@@ -58,9 +62,8 @@ internal static partial class NativeMethods
     private static OmniContactsListDelegate? omniContactsList;
     private static OmniContactsGetRefreshSummaryDelegate? omniContactsGetRefreshSummary;
     private static OmniContactsGetScreenSnapshotDelegate? omniContactsGetScreenSnapshot;
-    private static OmniContactsAddByIdentifierDelegate? omniContactsAddByIdentifier;
-    private static OmniContactsRequestByIdentifierDelegate? omniContactsRequestByIdentifier;
     private static OmniContactsAddFromPayloadDelegate? omniContactsAddFromPayload;
+    private static OmniContactsAllowCourierDelegate? omniContactsAllowCourier;
     private static OmniContactsRenameDelegate? omniContactsRename;
     private static OmniContactsBlockDelegate? omniContactsBlock;
     private static OmniContactsApproveDelegate? omniContactsApprove;
@@ -132,11 +135,36 @@ internal static partial class NativeMethods
             LoadRealtimeMediaExports();
             LoadMeshExports();
             LoadGroupExports();
+            LoadWorkspaceExports();
             LoadDiscoverabilityExports();
             LoadScreenControlExports();
             LoadMediaFileExports();
             LoadExport(ref omniStringFree, nameof(omni_string_free));
         }
+    }
+
+    internal static IntPtr omni_message_delete(IntPtr handle, string requestJson)
+    {
+        EnsureLoaded();
+        return omniMessageDelete!(handle, requestJson);
+    }
+
+    internal static IntPtr omni_message_pin(IntPtr handle, string requestJson)
+    {
+        EnsureLoaded();
+        return omniMessagePin!(handle, requestJson);
+    }
+
+    internal static IntPtr omni_message_actions(IntPtr handle, string requestJson)
+    {
+        EnsureLoaded();
+        return omniMessageActions!(handle, requestJson);
+    }
+
+    internal static IntPtr omni_message_react(IntPtr handle, string requestJson)
+    {
+        EnsureLoaded();
+        return omniMessageReact!(handle, requestJson);
     }
 
     internal static IntPtr omni_chat_send_text(IntPtr handle, string requestJson)
@@ -453,16 +481,10 @@ internal static partial class NativeMethods
         return omniContactsGetScreenSnapshot!(handle);
     }
 
-    internal static IntPtr omni_contacts_add_by_identifier(IntPtr handle, string requestJson)
+    internal static IntPtr omni_contacts_allow_courier(IntPtr handle, string requestJson)
     {
         EnsureLoaded();
-        return omniContactsAddByIdentifier!(handle, requestJson);
-    }
-
-    internal static IntPtr omni_contacts_request_by_identifier(IntPtr handle, string requestJson)
-    {
-        EnsureLoaded();
-        return omniContactsRequestByIdentifier!(handle, requestJson);
+        return omniContactsAllowCourier!(handle, requestJson);
     }
 
     internal static IntPtr omni_contacts_add_from_payload(IntPtr handle, string requestJson)
@@ -931,13 +953,10 @@ internal static partial class NativeMethods
     private delegate IntPtr OmniContactsGetScreenSnapshotDelegate(IntPtr handle);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate IntPtr OmniContactsAddByIdentifierDelegate(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate IntPtr OmniContactsRequestByIdentifierDelegate(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr OmniContactsAddFromPayloadDelegate(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr OmniContactsAllowCourierDelegate(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr OmniContactsRenameDelegate(IntPtr handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson);

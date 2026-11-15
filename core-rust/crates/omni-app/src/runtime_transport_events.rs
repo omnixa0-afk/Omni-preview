@@ -87,6 +87,54 @@ fn maybe_promote_transport_pending_contact_to_approved(
     Ok(Some(approved))
 }
 
+/// A request that answers an invite of ours — its bootstrap carries a valid claim of one of our own
+/// active invites (`omni_crypto::invite_claim`): this is the person we invited, and handing out the
+/// invite was our consent. The first valid claim approves the request and spends the invite (it
+/// stops being published, so a second importer of the same invite reaches nobody). Any other
+/// request, and one arriving after the invite's window (the row is gone), waits for «Принять».
+fn approve_request_answering_our_invite(
+    storage: &Storage,
+    message: &omni_types::SessionBootstrapMessageV1,
+    contact: Option<&ContactSnapshot>,
+    now_unix_ms: i64,
+) -> OmniResult<Option<ContactSnapshot>> {
+    let (Some(claim), Some(contact)) = (message.invite_claim_hex.as_deref(), contact) else {
+        return Ok(None);
+    };
+    if contact.relationship_state != ContactRelationshipState::Pending
+        || contact.pending_request_direction != Some(ContactRequestDirection::Incoming)
+    {
+        return Ok(None);
+    }
+    // Our own invites are the rows without a node to dial (the importer side records the inviter's).
+    for invite in storage.list_active_bootstrap_invites(now_unix_ms)? {
+        if invite.inviter_node.is_some() {
+            continue;
+        }
+        let Some(nonce) = hex::decode(invite.nonce_hex.trim()).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        else {
+            continue;
+        };
+        if !omni_crypto::invite_claim_matches(
+            &nonce,
+            &message.initiator_identity_signing_public_key,
+            &message.initiator_ephemeral_public_key,
+            claim,
+        ) {
+            continue;
+        }
+        storage.remove_bootstrap_invite(&invite.nonce_hex)?;
+        let approved = storage.approve_contact(&contact.contact_id, now_unix_ms)?;
+        omni_app_trace_log(
+            "recv/contact_request",
+            &format!("approved: answers our invite, now spent contact={}", approved.contact_id.0),
+        );
+        return Ok(Some(approved));
+    }
+    omni_app_trace_log("recv/contact_request", "invite claim matches no active invite of ours: waits for approval");
+    Ok(None)
+}
+
 fn runtime_chat_session_request_signal_sent_for_receive_context(
     db_path: &str,
     receive_context: &ReceivedChatContext,
@@ -399,6 +447,25 @@ fn attachment_requester_allowed(
     Ok(false)
 }
 
+/// Whether an event about the file of `message_id` (failed, downloaded, revoked) may change it: it
+/// comes from the contact of the file's own chat, or from a device of ours — the same rule as for a
+/// download request. Any approved contact that knew the id used to end someone else's transfer or
+/// mark a group file unavailable (security review 2026-11-09, F4).
+fn attachment_event_from_its_chat(
+    storage: &Storage,
+    message_id: &str,
+    session: &omni_crypto::SessionRecord,
+) -> OmniResult<bool> {
+    let allowed = attachment_requester_allowed(storage, message_id, &session.session_address)?;
+    if !allowed {
+        omni_app_trace_log(
+            "attachment/control",
+            &format!("message={message_id} event from another chat's contact dropped"),
+        );
+    }
+    Ok(allowed)
+}
+
 fn contact_for_receive_context_needs_verification(
     storage: &Storage,
     receive_context: &ReceivedChatContext,
@@ -460,6 +527,25 @@ fn maybe_request_session_resync(
     }
     let db_path = storage.db_path().to_string_lossy().to_string();
     let now = current_unix_ms();
+    // Our session still waits for the contact to take its bootstrap, and the contact sends on
+    // something else: it never got that bootstrap (sent before there was a link, say, and lost).
+    // Waiting out the fresh-session grace kept the pair apart for half a minute — live, a device
+    // restored from a backup that wrote before its mesh was up (2026-11-11). Sent again at once, at
+    // most once per reissue interval: the new session's `updated_at` is the clock.
+    if !counter_gap {
+        if let Ok(waiting) = stored_receive_session(storage, receive_context) {
+            if waiting.bootstrap_state == omni_crypto::SessionBootstrapState::InitiatorBootstrapCreated
+                && now - waiting.updated_at_unix_ms >= SESSION_BOOTSTRAP_REISSUE_AFTER_MS
+            {
+                omni_app_trace_log(
+                    "session/resync",
+                    &format!("cause=bootstrap_not_taken dialog_key={}", receive_context.dialog_key),
+                );
+                send_fresh_bootstrap_after_rebuild(storage, transport, receive_context, &waiting);
+                return;
+            }
+        }
+    }
     let due = if counter_gap {
         note_session_counter_gap(&db_path, &receive_context.dialog_key, now)
     } else {
@@ -577,6 +663,48 @@ fn drop_own_session_after_counter_gap(
         ),
     );
     send_fresh_bootstrap_after_rebuild(storage, transport, receive_context, session);
+}
+
+/// The contact's frame came on a session a backup brought back
+/// (`mark_ratchet_sessions_of_a_restored_copy`). That session is older than what the contact
+/// holds, so the frame is not opened on it. A fresh session starts instead: its bootstrap is sent
+/// live and held durable, as a rebuild sends one. The contact takes it (it is newer than any it saw
+/// from this device) and resends what got no answer. This happens once, since the fresh session
+/// replaces the marked one, and only for an approved contact, as with a rebuild.
+fn start_a_fresh_session_after_a_restore(
+    storage: &Storage,
+    transport: &TransportManager,
+    receive_context: &ReceivedChatContext,
+    session: &omni_crypto::SessionRecord,
+) {
+    let approved = storage
+        .resolve_contact_for_dialog(&receive_context.dialog_key)
+        .ok()
+        .flatten()
+        .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved);
+    if !approved {
+        omni_app_trace_log("session/restored", "skip=contact_not_approved");
+        return;
+    }
+    omni_app_trace_log(
+        "session/restored",
+        &format!(
+            "the copy's session meets the contact: starting a fresh one dialog_key={} session={}",
+            receive_context.dialog_key,
+            session.session_address.storage_key()
+        ),
+    );
+    send_fresh_bootstrap_after_rebuild(storage, transport, receive_context, session);
+    // The mark goes once the copy's session is replaced, not before: with no bundle to start a
+    // fresh one, the copy's session stayed — unmarked, and used again (blind audit 2026-11-10).
+    let replaced = storage
+        .get_session_record(&session.session_address)
+        .ok()
+        .flatten()
+        .is_none_or(|now| now.created_at_unix_ms != session.created_at_unix_ms);
+    if replaced {
+        let _ = storage.clear_restored_copy_mark(&session.session_address);
+    }
 }
 
 /// Снести сессию мало — надо ещё ЗАГОВОРИТЬ. «Следующая отправка пересоберёт» работает, только если
@@ -1160,6 +1288,26 @@ fn handle_incoming_wire_envelope(
             ) {
                 return Ok(());
             }
+            #[cfg(test)]
+            if answers_no_session_bootstraps(&storage.db_path().to_string_lossy()) {
+                omni_app_trace_log("recv/bootstrap", "dropped: this profile answers no bootstraps (test)");
+                return Ok(());
+            }
+            // Before anything about it is recorded: a bootstrap that does not prove its account and
+            // device, or is not signed for our prekey, touches nothing (V-01).
+            let (_profile, _account, local_device) = active_profile_context(storage)?;
+            if let Err(error) =
+                verify_inbound_session_bootstrap_message(storage, message, &local_device.device_id)
+            {
+                omni_app_trace_log(
+                    "recv/bootstrap",
+                    &format!(
+                        "dropped: bootstrap claiming account={} device={} failed verification: {error}",
+                        message.initiator_account_id, message.initiator_device_id
+                    ),
+                );
+                return Ok(());
+            }
             storage.record_remote_device_observation(
                 &AccountId(message.initiator_account_id.clone()),
                 &DeviceId(message.initiator_device_id.clone()),
@@ -1169,12 +1317,27 @@ fn handle_incoming_wire_envelope(
             if let Some(updated_contact) =
                 persist_incoming_contact_request_signal(storage, receive_context, now_unix_ms)?
             {
-                contact = Some(updated_contact);
                 let db_path = storage.db_path().to_string_lossy().to_string();
                 let _ = mark_runtime_chat_session_request_signal_observed(
                     &db_path,
                     &receive_context.dialog_key,
                 );
+                contact = Some(updated_contact);
+                if let Some(approved) =
+                    approve_request_answering_our_invite(storage, message, contact.as_ref(), now_unix_ms)?
+                {
+                    // The same telling of the requester as «Принять» does: the approval signal rides
+                    // the session as soon as it is established.
+                    let _ = mark_runtime_chat_session_approval_signal_pending(&db_path, &receive_context.dialog_key);
+                    schedule_contact_approval_signal_retry_for_active_transport(
+                        storage,
+                        Arc::clone(transport_handle),
+                        Arc::clone(session_lock),
+                        &approved.contact_id,
+                        &receive_context.dialog_key,
+                    );
+                    contact = Some(approved);
+                }
             } else {
                 contact = storage.find_contact_by_remote_account_id(&AccountId(
                     message.initiator_account_id.clone(),
@@ -1199,6 +1362,9 @@ fn handle_incoming_wire_envelope(
                 now_unix_ms,
             )?;
             let bootstrap_outcome = transport_accept_session_bootstrap(storage, message)?;
+            if bootstrap_outcome == InboundBootstrapOutcome::Stale {
+                return Ok(());
+            }
             let absorbed_as_initiator =
                 bootstrap_outcome == InboundBootstrapOutcome::AbsorbedAsInitiator;
             if absorbed_as_initiator {
@@ -1278,7 +1444,7 @@ fn handle_incoming_wire_envelope(
                     );
                 }
             }
-            process_pending_for_active_dialog(storage, &transport, &receive_context.dialog_key)?;
+            process_pending_for_dialog_whose_session_came_up(storage, &transport, &receive_context.dialog_key)?;
             Ok(())
         }
         omni_types::WirePayloadV1::EncryptedPayload(payload) => {
@@ -1307,6 +1473,12 @@ fn handle_incoming_wire_envelope(
                     false
                 };
             let mut session = load_receive_session(storage, receive_context)?;
+            if storage.is_ratchet_session_from_a_restored_copy(&session).unwrap_or(false) {
+                start_a_fresh_session_after_a_restore(storage, &transport, receive_context, &session);
+                // Not opened, so not handled: a durable frame stays with its holder, offered again
+                // (it was marked handled and dropped — blind audit 2026-11-10).
+                return Err(OmniError::Transport(MISSING_RECEIVE_SESSION.to_string()));
+            }
             let mut replay_window =
                 storage.ensure_replay_window(&session.session_address, current_unix_ms())?;
             let decrypted_payload =
@@ -1373,6 +1545,27 @@ fn handle_incoming_wire_envelope(
                 };
             storage.store_session_record(&mut session)?;
             storage.store_replay_window(&replay_window)?;
+            // The frame is the dialog's contact's, or it is not taken: a hello names its dialog by an
+            // instance id anyone can claim, while the session that opened the frame is the one of the
+            // bundle that hello carried. A stranger with a session of his own, naming an approved
+            // contact's instance, wrote into that contact's chat (blind audit 2026-11-11, F1).
+            if let Some(contact) = storage.resolve_contact_for_dialog(&receive_context.dialog_key)? {
+                if contact
+                    .remote_account_id
+                    .as_ref()
+                    .is_some_and(|account| account != &session.session_address.remote_account_id)
+                {
+                    omni_app_trace_log(
+                        "recv/foreign_session",
+                        &format!(
+                            "dialog_key={} session={} dropped: not the dialog's contact",
+                            receive_context.dialog_key,
+                            session.session_address.storage_key()
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
             // Подлинное, но непонятное (вид события из другой сборки): состояние сессии уже
             // сохранено строками выше — ради этого оно и не ошибка, — а само событие отбрасывается.
             let decrypted_payload = match decrypted_payload {
@@ -1433,8 +1626,8 @@ fn handle_incoming_wire_envelope(
                     }
                 }
             }
-            // A device the account took back is not listened to (but may still be told it was).
-            if sender_is_revoked_device(storage, &session, &decrypted_payload)? {
+            // A device the account took back is not listened to (it may still be told it was).
+            if sender_is_revoked_device(storage, &session)? {
                 omni_app_trace_log(
                     "own_devices/revocation_in",
                     &format!(
@@ -1443,6 +1636,18 @@ fn handle_incoming_wire_envelope(
                     ),
                 );
                 return Ok(());
+            }
+            #[cfg(test)]
+            {
+                let is_text = match &decrypted_payload {
+                    omni_types::WirePayloadV1::ChatText(_) => true,
+                    omni_types::WirePayloadV1::LogicalEvent(event) => matches!(event.payload, omni_types::LogicalEventPayloadV1::ChatText(_)),
+                    _ => false,
+                };
+                if is_text && take_died_after_session_store(&storage.db_path().to_string_lossy()) {
+                    omni_app_trace_log("test/died", "after the session step was stored");
+                    return Ok(());
+                }
             }
             let result = handle_application_wire_payload(
                 storage,
@@ -1657,6 +1862,7 @@ fn handle_application_wire_payload(
                 persist_attachment_download_request(
                     storage,
                     transport,
+                    session_lock,
                     request,
                     receive_context,
                     &session,
@@ -1666,7 +1872,9 @@ fn handle_application_wire_payload(
             omni_types::LogicalEventPayloadV1::AttachmentTransferFailed(failure) => {
                 let mut session = load_receive_session(storage, receive_context)?;
                 storage.store_session_record(&mut session)?;
-                if !attachment_control_event_allowed(storage, receive_context, &session)? {
+                if !attachment_control_event_allowed(storage, receive_context, &session)?
+                    || !attachment_event_from_its_chat(storage, &failure.message_id, &session)?
+                {
                     return Ok(());
                 }
                 mark_contact_activity_for_dialog(
@@ -1686,7 +1894,9 @@ fn handle_application_wire_payload(
             omni_types::LogicalEventPayloadV1::AttachmentDownloaded(downloaded) => {
                 let mut session = load_receive_session(storage, receive_context)?;
                 storage.store_session_record(&mut session)?;
-                if !attachment_control_event_allowed(storage, receive_context, &session)? {
+                if !attachment_control_event_allowed(storage, receive_context, &session)?
+                    || !attachment_event_from_its_chat(storage, &downloaded.message_id, &session)?
+                {
                     return Ok(());
                 }
                 mark_contact_activity_for_dialog(
@@ -1705,7 +1915,9 @@ fn handle_application_wire_payload(
             omni_types::LogicalEventPayloadV1::AttachmentAccessRevoked(revoked) => {
                 let mut session = load_receive_session(storage, receive_context)?;
                 storage.store_session_record(&mut session)?;
-                if !attachment_control_event_allowed(storage, receive_context, &session)? {
+                if !attachment_control_event_allowed(storage, receive_context, &session)?
+                    || !attachment_event_from_its_chat(storage, &revoked.message_id, &session)?
+                {
                     return Ok(());
                 }
                 mark_contact_activity_for_dialog(
@@ -1767,7 +1979,7 @@ fn handle_application_wire_payload(
                     omni_types::ChatSessionInteractionKind::Session,
                     current_unix_ms(),
                 );
-                handle_incoming_call_ringing(storage, ringing)
+                handle_incoming_call_ringing(storage, ringing, &session.session_address)
             }
             omni_types::LogicalEventPayloadV1::CallAccept(accept) => {
                 let mut session = load_receive_session(storage, receive_context)?;
@@ -1805,6 +2017,7 @@ fn handle_application_wire_payload(
                     CallOutcome::Declined,
                     Some(decline.reason),
                     decline.declined_at_unix_ms,
+                    &session.session_address,
                 )
             }
             omni_types::LogicalEventPayloadV1::CallBusy(busy) => {
@@ -1827,6 +2040,7 @@ fn handle_application_wire_payload(
                     CallOutcome::Busy,
                     None,
                     busy.busy_at_unix_ms,
+                    &session.session_address,
                 )
             }
             omni_types::LogicalEventPayloadV1::CallCancel(cancel) => {
@@ -1848,6 +2062,7 @@ fn handle_application_wire_payload(
                     &cancel.call_id,
                     CallOutcome::Cancelled,
                     cancel.cancelled_at_unix_ms,
+                    &session.session_address,
                 )
             }
             omni_types::LogicalEventPayloadV1::CallHangup(hangup) => {
@@ -1869,6 +2084,7 @@ fn handle_application_wire_payload(
                     &hangup.call_id,
                     CallOutcome::Completed,
                     hangup.ended_at_unix_ms,
+                    &session.session_address,
                 )
             }
             omni_types::LogicalEventPayloadV1::CallTimeout(timeout) => {
@@ -1890,6 +2106,7 @@ fn handle_application_wire_payload(
                     &timeout.call_id,
                     CallOutcome::Missed,
                     timeout.timed_out_at_unix_ms,
+                    &session.session_address,
                 )
             }
             omni_types::LogicalEventPayloadV1::CallReconnect(reconnect) => {
@@ -1906,7 +2123,7 @@ fn handle_application_wire_payload(
                     omni_types::ChatSessionInteractionKind::Session,
                     current_unix_ms(),
                 );
-                handle_incoming_call_reconnect(storage, reconnect)
+                handle_incoming_call_reconnect(storage, reconnect, &session.session_address)
             }
             omni_types::LogicalEventPayloadV1::CallScreenControl(control) => {
                 let mut session = load_receive_session(storage, receive_context)?;
@@ -1916,7 +2133,7 @@ fn handle_application_wire_payload(
                     &receive_context.dialog_key,
                     current_unix_ms(),
                 )?;
-                crate::app_screen_control::handle_incoming_call_screen_control(storage, control)
+                crate::app_screen_control::handle_incoming_call_screen_control(storage, control, &session.session_address)
             }
             omni_types::LogicalEventPayloadV1::SentTranscript(transcript) => {
                 let mut session = load_receive_session(storage, receive_context)?;
@@ -1957,6 +2174,36 @@ fn handle_application_wire_payload(
                 let mut session = load_receive_session(storage, receive_context)?;
                 storage.store_session_record(&mut session)?;
                 handle_incoming_device_revocation(storage, transport, sync, receive_context, &session)
+            }
+            omni_types::LogicalEventPayloadV1::MessageDelete(event) => {
+                let mut session = load_receive_session(storage, receive_context)?;
+                storage.store_session_record(&mut session)?;
+                if !dialog_contact_is_approved_for_logical_events(storage, &receive_context.dialog_key) {
+                    return Ok(());
+                }
+                crate::app_message_actions::receive_message_delete(storage, &receive_context.dialog_key, event)
+            }
+            omni_types::LogicalEventPayloadV1::MessagePin(event) => {
+                let mut session = load_receive_session(storage, receive_context)?;
+                storage.store_session_record(&mut session)?;
+                if !dialog_contact_is_approved_for_logical_events(storage, &receive_context.dialog_key) {
+                    return Ok(());
+                }
+                crate::app_message_actions::receive_message_pin(storage, &receive_context.dialog_key, event)
+            }
+            omni_types::LogicalEventPayloadV1::Reaction(reaction) => {
+                let mut session = load_receive_session(storage, receive_context)?;
+                storage.store_session_record(&mut session)?;
+                if !dialog_contact_is_approved_for_logical_events(storage, &receive_context.dialog_key) {
+                    return Ok(());
+                }
+                mark_contact_activity_for_dialog(storage, &receive_context.dialog_key, current_unix_ms())?;
+                crate::app_message_reactions::receive_reaction(
+                    storage,
+                    &receive_context.dialog_key,
+                    &session.session_address.remote_account_id.0,
+                    reaction,
+                )
             }
             omni_types::LogicalEventPayloadV1::RemoteAccessGrant(grant) => {
                 let mut session = load_receive_session(storage, receive_context)?;
@@ -2057,6 +2304,7 @@ fn handle_application_wire_payload(
                 );
                 persist_public_profile_descriptor_sync(
                     storage,
+                    transport_handle,
                     profile,
                     receive_context,
                     &session,
@@ -2079,6 +2327,7 @@ fn handle_application_wire_payload(
                 );
                 persist_public_profile_avatar_sync(
                     storage,
+                    transport_handle,
                     profile,
                     receive_context,
                     &session,
@@ -2131,7 +2380,50 @@ fn handle_application_wire_payload(
     }
 }
 
+const MISSING_RECEIVE_SESSION: &str = "received wire payload for a missing session";
+
+/// What a frame that may open later, but not soon, fails with ([`MeshDurableOutcome::RetryAWhile`]).
+const NOT_YET: &str = "not yet: ";
+
+/// A frame that may open later, though nothing says when: a group message of an epoch too far ahead
+/// of ours, or one the group's queue has no room for.
+pub(crate) fn not_yet(why: String) -> OmniError {
+    OmniError::Transport(format!("{NOT_YET}{why}"))
+}
+
+/// What a handled durable frame tells the mesh (V-05). Offered again only after a failure that
+/// passes: storage busy or locked, an internal fault, no session yet for the sender. Everything else
+/// is final — taken in, or rejected for good. A ratchet that will not open the frame is final above
+/// all: offering it again would count as more failures and rebuild the session for nothing
+/// (`maybe_request_session_resync`).
+fn durable_outcome_for(result: &OmniResult<()>) -> MeshDurableOutcome {
+    match result {
+        Err(OmniError::Storage(_) | OmniError::StorageLocked(_) | OmniError::Internal(_)) => {
+            MeshDurableOutcome::Retry
+        }
+        Err(OmniError::Transport(message)) if message == MISSING_RECEIVE_SESSION => MeshDurableOutcome::Retry,
+        Err(OmniError::Transport(message)) if message.starts_with(NOT_YET) => MeshDurableOutcome::RetryAWhile,
+        _ => MeshDurableOutcome::Handled,
+    }
+}
+
 fn load_receive_session(
+    storage: &Storage,
+    receive_context: &ReceivedChatContext,
+) -> OmniResult<omni_crypto::SessionRecord> {
+    let session = stored_receive_session(storage, receive_context)?;
+    let session = if session.bootstrap_state
+        == omni_crypto::SessionBootstrapState::InitiatorBootstrapCreated
+    {
+        establish_session(&session, current_unix_ms())
+    } else {
+        session
+    };
+    Ok(session)
+}
+
+/// The receive session as stored: one still waiting for its bootstrap to be taken says so here.
+fn stored_receive_session(
     storage: &Storage,
     receive_context: &ReceivedChatContext,
 ) -> OmniResult<omni_crypto::SessionRecord> {
@@ -2160,17 +2452,7 @@ fn load_receive_session(
             None => None,
         }
     };
-    let session = session.ok_or_else(|| {
-        OmniError::Transport("received wire payload for a missing session".to_string())
-    })?;
-    let session = if session.bootstrap_state
-        == omni_crypto::SessionBootstrapState::InitiatorBootstrapCreated
-    {
-        establish_session(&session, current_unix_ms())
-    } else {
-        session
-    };
-    Ok(session)
+    session.ok_or_else(|| OmniError::Transport(MISSING_RECEIVE_SESSION.to_string()))
 }
 
 fn established_session_for_receive_context(
@@ -2304,6 +2586,9 @@ fn handle_incoming_sent_transcript(
         .primary_dialog_key
         .clone()
         .unwrap_or_else(|| omni_types::dialog_key_from_account_id(&contact_account_id.0));
+    if storage.message_is_deleted(&transcript.message_id)? {
+        return Ok(());
+    }
     let stored = storage.insert_sent_copy(
         &transcript.message_id,
         &chat_dialog_key,
@@ -2311,6 +2596,7 @@ fn handle_incoming_sent_transcript(
         transcript.created_at_unix_ms,
         &from.remote_device_id,
     )?;
+    storage.remember_received_message_reply(&transcript.message_id, transcript.reply_to.as_deref())?;
     // The file stays on the device that sent it; this record says where to fetch it — that device's
     // dialog, not the contact's (`attempt_send_attachment_download_request`).
     if let Some(offer) = &transcript.attachment {
@@ -2348,9 +2634,42 @@ fn handle_incoming_sent_transcript(
         },
         current_unix_ms(),
     )?;
+    // Stored before it is sent: a frame out on a step the disk does not hold yet is a step the
+    // next frame takes again, should the store fail or the process stop in between (blind audit
+    // 2026-11-11, F2). The invariant of every ratchet send.
+    store_receipt_session(storage, &mut outgoing.updated_session)?;
     transport.send_wire_envelope_for_dialog_key(&receive_context.dialog_key, &outgoing.envelope)?;
-    storage.store_session_record(&mut outgoing.updated_session)?;
     Ok(())
+}
+
+/// The session a receipt advanced, stored — before the receipt is sent.
+fn store_receipt_session(storage: &Storage, session: &mut omni_crypto::SessionRecord) -> OmniResult<()> {
+    #[cfg(test)]
+    if take_refused_receipt_session_store(&storage.db_path().to_string_lossy()) {
+        return Err(OmniError::Storage("the receipt's session was not stored (test)".to_string()));
+    }
+    storage.store_session_record(session)
+}
+
+#[cfg(test)]
+static REFUSED_RECEIPT_SESSION_STORES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: the next receipt session store of this profile fails.
+#[cfg(test)]
+pub(crate) fn refuse_the_next_receipt_session_store(db_path: &str) {
+    REFUSED_RECEIPT_SESSION_STORES.lock().unwrap_or_else(|p| p.into_inner()).push(db_path.to_string());
+}
+
+#[cfg(test)]
+fn take_refused_receipt_session_store(db_path: &str) -> bool {
+    let mut refused = REFUSED_RECEIPT_SESSION_STORES.lock().unwrap_or_else(|p| p.into_inner());
+    match refused.iter().position(|path| path == db_path) {
+        Some(at) => {
+            refused.remove(at);
+            true
+        }
+        None => false,
+    }
 }
 
 fn handle_incoming_text(
@@ -2442,12 +2761,46 @@ fn accept_incoming_text(
     payload_kind: SecurityPayloadKind,
     on_ready_to_send_receipt: impl FnOnce(&omni_messaging::OutgoingWireEnvelope) -> OmniResult<()>,
 ) -> OmniResult<()> {
+    // Taken back before it got here; or its id is another chat's message.
+    if storage.message_is_deleted(&chat_text.message_id)?
+        || crate::app_message_actions::message_id_taken_elsewhere(storage, &chat_text.message_id, &receive_context.dialog_key)?
+    {
+        return Ok(());
+    }
+    // Written while we had its sender blocked: not shown, ever — a block means «I do not see it»
+    // (maintainers' decision 2026-11-11). It came only now, from the sender's queue, the block lifted.
+    // Answered with a receipt all the same, or the sender's queue sends it for good.
+    let written_while_blocked = storage
+        .resolve_contact_for_dialog(&receive_context.dialog_key)?
+        .is_some_and(|contact| storage.contact_was_blocked_at(&contact.contact_id, chat_text.created_at_unix_ms).unwrap_or(false));
+    if written_while_blocked {
+        omni_app_trace_log(
+            "recv/written_while_blocked",
+            &format!("message={} dialog_key={} not shown", chat_text.message_id, receive_context.dialog_key),
+        );
+        let mut outgoing = build_encrypted_delivery_receipt_envelope(
+            session,
+            &DeliveryReceiptV1 {
+                message_id: chat_text.message_id.clone(),
+                delivered_at_unix_ms: current_unix_ms(),
+            },
+            current_unix_ms(),
+        )?;
+        store_receipt_session(storage, &mut outgoing.updated_session)?;
+        on_ready_to_send_receipt(&outgoing)?;
+        return Ok(());
+    }
     storage.insert_incoming_message(
         &chat_text.message_id,
         &receive_context.dialog_key,
         &chat_text.body,
         chat_text.created_at_unix_ms,
     )?;
+    // The contact took it back before it got here: the deletion waited for it.
+    if crate::app_message_actions::apply_pending_message_deletes(storage, &chat_text.message_id)? {
+        return Ok(());
+    }
+    storage.remember_received_message_reply(&chat_text.message_id, chat_text.reply_to.as_deref())?;
     // Surface the stored message as an event for the daemon's event plane (push, not
     // poll). See docs/decisions/daemon-ipc-phase2.md §Events plane.
     record_inbound_message_event(
@@ -2493,8 +2846,9 @@ fn accept_incoming_text(
         current_unix_ms(),
     )?;
     mark_contact_activity_for_dialog(storage, &receive_context.dialog_key, current_unix_ms())?;
+    // Stored before it is sent (blind audit 2026-11-11, F2): see `store_receipt_session`.
+    store_receipt_session(storage, &mut outgoing.updated_session)?;
     on_ready_to_send_receipt(&outgoing)?;
-    storage.store_session_record(&mut outgoing.updated_session)?;
     Ok(())
 }
 
@@ -2505,7 +2859,7 @@ fn accept_received_attachment_presentation(
     storage: &Storage,
     offer: &omni_types::AttachmentOfferV1,
 ) -> OmniResult<()> {
-    let accepted = omni_storage::photo::accept_received_photo_presentation(
+    let accepted = omni_storage::photo::accept_received_presentation(
         offer.presentation.as_ref(),
         offer.file_size_bytes,
     );
@@ -2520,8 +2874,8 @@ fn accept_received_attachment_presentation(
         }
         _ => return Ok(()),
     };
-    if accepted.is_some() && busy < MAX_INBOUND_ATTACHMENTS_PER_DIALOG {
-        let save_path = storage.photo_download_path(&offer.message_id)?;
+    if let Some(shown) = accepted.as_ref().filter(|_| busy < MAX_INBOUND_ATTACHMENTS_PER_DIALOG) {
+        let save_path = storage.shown_file_download_path(&offer.message_id, shown.kind)?;
         storage.mark_attachment_download_requested(
             &offer.message_id,
             &save_path,
@@ -2540,12 +2894,21 @@ fn handle_incoming_attachment_offer(
     session: &omni_crypto::SessionRecord,
     encryption_state: MessageEncryptionState,
 ) -> OmniResult<()> {
+    if storage.message_is_deleted(&offer.message_id)?
+        || crate::app_message_actions::message_id_taken_elsewhere(storage, &offer.message_id, &receive_context.dialog_key)?
+    {
+        return Ok(());
+    }
     storage.insert_incoming_message(
         &offer.message_id,
         &receive_context.dialog_key,
         &offer.body,
         offer.created_at_unix_ms,
     )?;
+    if crate::app_message_actions::apply_pending_message_deletes(storage, &offer.message_id)? {
+        return Ok(());
+    }
+    storage.remember_received_message_reply(&offer.message_id, offer.reply_to.as_deref())?;
     storage.store_incoming_attachment_offer(
         &offer.message_id,
         &receive_context.dialog_key,
@@ -2610,6 +2973,7 @@ fn storage_attachment_dialog(storage: &Storage, message_id: &str) -> OmniResult<
 fn persist_attachment_download_request(
     storage: &Storage,
     transport: &TransportManager,
+    session_lock: &Arc<Mutex<()>>,
     request: &omni_types::AttachmentDownloadRequestV1,
     receive_context: &ReceivedChatContext,
     session: &omni_crypto::SessionRecord,
@@ -2657,7 +3021,7 @@ fn persist_attachment_download_request(
             );
             return send_attachment_not_here_notice(storage, transport, receive_context, &request.message_id);
         }
-        return spawn_attachment_transfer_sender(storage, transport, request, receive_context);
+        return spawn_attachment_transfer_sender(storage, transport, session_lock, &session.session_address, request, receive_context);
     }
     // A device of ours that holds the message as a copy (another device of ours sent it) may be
     // asked because the sending one is away (3.3): it hands on a copy it has downloaded, and stays
@@ -2674,7 +3038,7 @@ fn persist_attachment_download_request(
         );
         return Ok(());
     }
-    spawn_attachment_transfer_sender(storage, transport, request, receive_context)
+    spawn_attachment_transfer_sender(storage, transport, session_lock, &session.session_address, request, receive_context)
 }
 
 fn persist_attachment_transfer_start_frame(
@@ -2735,12 +3099,13 @@ fn persist_attachment_transfer_start_frame(
 
 fn persist_public_profile_descriptor_sync(
     storage: &Storage,
+    transport_handle: &Arc<Mutex<Option<TransportManager>>>,
     profile: &omni_types::PublicProfileDescriptorSyncV1,
     receive_context: &ReceivedChatContext,
     session: &omni_crypto::SessionRecord,
     encryption_state: MessageEncryptionState,
 ) -> OmniResult<()> {
-    if adopt_profile_from_own_device(
+    if let Some(changed) = adopt_profile_from_own_device(
         storage,
         session,
         Some(&profile.display_name),
@@ -2749,6 +3114,9 @@ fn persist_public_profile_descriptor_sync(
         None,
         profile.updated_at_unix_ms,
     )? {
+        if changed {
+            pass_on_profile_from_own_device(storage, transport_handle);
+        }
         return Ok(());
     }
     // TM-004: pending / declined peers must not push profile metadata into
@@ -2786,6 +3154,7 @@ fn persist_public_profile_descriptor_sync(
 
 fn persist_public_profile_avatar_sync(
     storage: &Storage,
+    transport_handle: &Arc<Mutex<Option<TransportManager>>>,
     profile: &omni_types::PublicProfileAvatarSyncV1,
     receive_context: &ReceivedChatContext,
     session: &omni_crypto::SessionRecord,
@@ -2808,7 +3177,7 @@ fn persist_public_profile_avatar_sync(
             })
         })
         .transpose()?;
-    if adopt_profile_from_own_device(
+    if let Some(changed) = adopt_profile_from_own_device(
         storage,
         session,
         None,
@@ -2817,6 +3186,9 @@ fn persist_public_profile_avatar_sync(
         Some(avatar_bytes.as_deref().unwrap_or_default()),
         profile.updated_at_unix_ms,
     )? {
+        if changed {
+            pass_on_profile_from_own_device(storage, transport_handle);
+        }
         return Ok(());
     }
     // TM-004: mirror of persist_public_profile_descriptor_sync — avatar
@@ -3633,6 +4005,28 @@ fn handle_session_activated(
                                 &receive_context.dialog_key,
                             );
                         }
+                        // What we reacted to while the link was down. Reloaded again: the grant above
+                        // may have advanced the session.
+                        if let Ok(Some(session)) =
+                            established_session_for_receive_context(storage, receive_context)
+                        {
+                            let _ = crate::app_message_reactions::send_unsent_reactions_for_session(
+                                storage,
+                                &transport,
+                                &session,
+                                &receive_context.dialog_key,
+                            );
+                        }
+                        if let Ok(Some(session)) =
+                            established_session_for_receive_context(storage, receive_context)
+                        {
+                            let _ = crate::app_message_actions::send_unsent_message_actions_for_session(
+                                storage,
+                                &transport,
+                                &session,
+                                &receive_context.dialog_key,
+                            );
+                        }
                     }
                 }
             }
@@ -3660,7 +4054,7 @@ fn handle_session_activated(
         now_unix_ms,
     );
     let _ = handle_call_session_activated(storage, receive_context);
-    process_pending_for_active_dialog(storage, &transport, &receive_context.dialog_key)?;
+    process_pending_for_dialog_whose_session_came_up(storage, &transport, &receive_context.dialog_key)?;
     request_downloads_on_session_up(storage, &transport, &receive_context.dialog_key);
     if let Some(device_id) = own_device.as_ref() {
         return catch_up_own_device(storage, &transport, device_id, &receive_context.dialog_key);
@@ -3679,8 +4073,13 @@ fn handle_session_activated(
 fn handle_session_closed(
     runtime_storage: &Arc<Mutex<Storage>>,
     transport_handle: &Arc<Mutex<Option<TransportManager>>>,
+    session_lock: &Arc<Mutex<()>>,
     receive_context: &ReceivedChatContext,
 ) -> OmniResult<()> {
+    // Under the session lock, taken before the storage like every other handler (B03, audit
+    // 2026-11-09 #6): the not-yet-established session it removes could otherwise be established by
+    // a bootstrap in between and removed as it was.
+    let _session_guard = lock_session(session_lock)?;
     let storage_guard = lock_runtime_storage(runtime_storage)?;
     let storage = &*storage_guard;
     if !storage.is_profile_signed_in()? {
@@ -3765,6 +4164,9 @@ enum InboundBootstrapOutcome {
     /// We are the initiator and won the collision, so the peer's bootstrap was discarded. There is
     /// nothing to ack -- what the peer needs is OUR bootstrap, again.
     AbsorbedAsInitiator,
+    /// Older than a bootstrap already accepted from this device: a replay, ignored (V-09). Also one
+    /// stamped far ahead of our clock (V-08).
+    Stale,
 }
 
 fn transport_accept_session_bootstrap(
@@ -3775,6 +4177,8 @@ fn transport_accept_session_bootstrap(
     storage.ensure_local_crypto_foundation(current_unix_ms())?;
 
     let (_profile, local_account, local_device) = active_profile_context(storage)?;
+    let (bootstrap, signed_prekey) =
+        verify_inbound_session_bootstrap_message(storage, message, &local_device.device_id)?;
     let local_identity_key = storage
         .get_local_identity_key(&local_account.descriptor.account_id)?
         .ok_or_else(|| OmniError::Storage("local identity key is missing".to_string()))?;
@@ -3788,20 +4192,34 @@ fn transport_accept_session_bootstrap(
     let has_approved_contact = storage
         .find_contact_by_remote_account_id(&AccountId(message.initiator_account_id.clone()))?
         .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved);
-    // Read the mark BEFORE recording this bootstrap, then record it either way: an echo we ignore
-    // must still count as "seen", so every later re-delivery of it is recognised too.
-    let db_path = storage.db_path().to_string_lossy().to_string();
-    let last_seen_bootstrap_created_at = last_inbound_bootstrap_created_at(
-        &db_path,
-        &message.initiator_account_id,
-        &message.initiator_device_id,
-    );
-    record_inbound_bootstrap_created_at(
-        &db_path,
-        &message.initiator_account_id,
-        &message.initiator_device_id,
-        message.created_at_unix_ms,
-    );
+    // Recorded only now that it is verified, and recorded even when absorbed below: an echo we
+    // ignore must still count as "seen", so every later re-delivery of it is recognised too.
+    let last_seen_bootstrap_created_at = match note_inbound_session_bootstrap(storage, message, current_unix_ms())? {
+        InboundBootstrapAge::AheadOfOurClock => {
+            omni_app_trace_log(
+                "recv/bootstrap",
+                &format!(
+                    "ignored a bootstrap from account={} device={}: stamped {} ms ahead of our clock (the peer's clock is wrong)",
+                    message.initiator_account_id,
+                    message.initiator_device_id,
+                    message.created_at_unix_ms - current_unix_ms()
+                ),
+            );
+            return Ok(InboundBootstrapOutcome::Stale);
+        }
+        InboundBootstrapAge::Older => {
+            omni_app_trace_log(
+                "recv/bootstrap",
+                &format!(
+                    "ignored a replayed bootstrap from account={} device={}: older than one already accepted",
+                    message.initiator_account_id, message.initiator_device_id
+                ),
+            );
+            return Ok(InboundBootstrapOutcome::Stale);
+        }
+        InboundBootstrapAge::Same => Some(message.created_at_unix_ms),
+        InboundBootstrapAge::Newer(seen) => seen,
+    };
     if let Some(existing_session) = storage.get_session_record(&session_address)? {
         if existing_session_should_absorb_incoming_bootstrap(
             &local_account.descriptor.account_id,
@@ -3823,9 +4241,6 @@ fn transport_accept_session_bootstrap(
             return Ok(InboundBootstrapOutcome::AbsorbedAsInitiator);
         }
     }
-    let signed_prekey = storage
-        .get_active_signed_prekey(&local_device.device_id)?
-        .ok_or_else(|| OmniError::Storage("active signed prekey is missing".to_string()))?;
     let one_time_prekey = match message.remote_one_time_prekey_id {
         Some(expected_id) => {
             let candidate = storage
@@ -3838,7 +4253,6 @@ fn transport_accept_session_bootstrap(
         None => None,
     };
 
-    let bootstrap = session_bootstrap_from_protocol(message)?;
     let session = bootstrap_responder_session(
         &local_account.descriptor.account_id,
         &local_identity_key,
@@ -4757,6 +5171,43 @@ fn wait_for_attachment_receive_completion(db_path: &str, transfer_id: &str) {
 
 /// Что открылось — для `recv/accepted`: вид события и id сообщения, если он есть. Только имена
 /// и id, без содержимого.
+/// Tests: the profiles whose next chat text "dies" after its session step was stored and before the
+/// message was — what a process killed at that point leaves.
+#[cfg(test)]
+static DIE_AFTER_SESSION_STORE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn die_after_session_store_once(db_path: &str) {
+    DIE_AFTER_SESSION_STORE.lock().unwrap().push(db_path.to_string());
+}
+
+#[cfg(test)]
+fn take_died_after_session_store(db_path: &str) -> bool {
+    let mut armed = DIE_AFTER_SESSION_STORE.lock().unwrap();
+    match armed.iter().position(|armed| armed == db_path) {
+        Some(at) => {
+            armed.remove(at);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Tests: the profiles that take a session bootstrap in and never answer it — a peer whose link is
+/// up but who cannot reply. (A signed-out profile no longer does this: signing out stops its mesh.)
+#[cfg(test)]
+static SILENT_TO_BOOTSTRAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn answer_no_session_bootstraps(db_path: &str) {
+    SILENT_TO_BOOTSTRAPS.lock().unwrap().push(db_path.to_string());
+}
+
+#[cfg(test)]
+fn answers_no_session_bootstraps(db_path: &str) -> bool {
+    SILENT_TO_BOOTSTRAPS.lock().unwrap().iter().any(|silent| silent == db_path)
+}
+
 fn decrypted_payload_trace_label(payload: &omni_messaging::DecryptedWirePayload) -> String {
     use omni_types::LogicalEventPayloadV1 as Event;
     let omni_messaging::DecryptedWirePayload::Payload(payload) = payload else {

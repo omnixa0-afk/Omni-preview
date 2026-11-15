@@ -7,8 +7,7 @@
 //! This is how srflx candidates are gathered everywhere else too (ICE / libjuice / pion / iroh):
 //! the binding request leaves from the socket that will carry the traffic.
 //!
-//! The wrapper sits directly on the raw UDP socket — BELOW the QUIC endpoint (STUN
-//! servers speak plain STUN) and below the `MuxRouter`. It sends binding requests itself and, on
+//! The wrapper sits directly on the raw UDP socket, below the `MuxRouter`. It sends binding requests itself and, on
 //! receive, takes out exactly the datagrams that answer a request it is waiting for (matching txid
 //! AND the server that was asked); everything else — all of QUIC — passes through untouched.
 //! See docs/bugs/every-nat-was-classified-symmetric.md.
@@ -25,13 +24,19 @@ use omni_net_primitives::stun::{
     build_binding_request, first_ipv4, fresh_txid, parse_mapped_address, reflexive_consensus,
     stun_transaction_id,
 };
-pub use omni_net_primitives::stun::Reflexive;
+pub use omni_net_primitives::stun::{Reflexive, StunProbe};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::oneshot;
 
 pub use omni_net_primitives::stun::DEFAULT_STUN_SERVERS;
+
+/// How long one binding request waits for the socket to become writable.
+const WRITABLE_WAIT: Duration = Duration::from_millis(500);
+/// How many times a request that met a not-writable socket is tried again.
+const SEND_RETRIES_WHEN_NOT_WRITABLE: usize = 3;
 
 /// A request in flight: who was asked (the answer must come from there) and who is waiting.
 #[derive(Debug)]
@@ -58,10 +63,23 @@ impl StunSocket {
     }
 
     /// Ask every server in `servers` (`host:port`) at once, from this socket, and cross-check the
-    /// answers (`reflexive_consensus`). Parallel, so a blocked operator (Google STUN does not answer
-    /// from here) costs one `timeout`, not one per server.
+    /// answers (`reflexive_consensus`). Answers are taken as they come, and the first consensus is
+    /// the result: two servers at different addresses that agree on the IP have settled it, and their
+    /// ports have settled the NAT class (a symmetric NAT already gives two destinations two ports),
+    /// so a later answer cannot change the verdict. `timeout` is spent only while there is none — a
+    /// blocked operator (Google STUN does not answer from here) used to cost the full 3 s of every
+    /// first contact, because the slowest server was awaited too.
     pub async fn reflexive(&self, servers: &[&str], timeout: Duration) -> Option<Reflexive> {
-        let mut waiting = Vec::new();
+        self.probe(servers, timeout).await.consensus()
+    }
+
+    /// [`reflexive`](Self::reflexive) with what is behind its verdict: how many requests left (a
+    /// server whose name did not resolve or whose request could not be sent is not counted) and every
+    /// answer that came back before the consensus or the timeout.
+    pub async fn probe(&self, servers: &[&str], timeout: Duration) -> StunProbe {
+        let mut asked = Vec::new();
+        let mut waiting = FuturesUnordered::new();
+        let mut writable = Arc::clone(&self.inner).create_io_poller();
         for server in servers {
             let Ok(resolved) = tokio::net::lookup_host(*server).await else {
                 continue;
@@ -69,36 +87,61 @@ impl StunSocket {
             let Ok(address) = first_ipv4(server, resolved) else {
                 continue;
             };
-            if let Ok(reply) = self.send_request(address) {
+            if let Ok((txid, reply)) = self.send_request(address, &mut writable).await {
+                asked.push(txid);
                 waiting.push(reply);
             }
         }
         let deadline = tokio::time::Instant::now() + timeout;
         let mut answers = Vec::new();
-        for (txid, reply) in waiting {
-            if let Ok(Ok(mapped)) = tokio::time::timeout_at(deadline, reply).await {
+        while let Ok(Some(answer)) = tokio::time::timeout_at(deadline, waiting.next()).await {
+            if let Ok(mapped) = answer {
                 answers.push(mapped);
+                if reflexive_consensus(&answers).is_some() {
+                    break;
+                }
             }
-            self.pending.lock().remove(&txid);
         }
-        reflexive_consensus(&answers)
+        let mut pending = self.pending.lock();
+        for txid in &asked {
+            pending.remove(txid);
+        }
+        StunProbe { asked: asked.len(), answers }
     }
 
-    fn send_request(
+    /// Send one binding request to `server`. A socket that is not writable at this instant answers
+    /// `WouldBlock` — a fresh one does until its readiness has been reported once, and under load
+    /// that is the first probe after the mesh starts — so wait for `writable` (bounded) and try again
+    /// instead of dropping the request. Dropping it lost whole probes: `asked=0` on a busy machine.
+    async fn send_request(
         &self,
         server: SocketAddr,
+        writable: &mut Pin<Box<dyn UdpPoller>>,
     ) -> io::Result<([u8; 12], oneshot::Receiver<SocketAddr>)> {
         let txid = fresh_txid();
         let (reply, answer) = oneshot::channel();
         self.pending.lock().insert(txid, Pending { server, reply });
         let request = build_binding_request(&txid);
-        let sent = self.inner.try_send(&Transmit {
+        let transmit = Transmit {
             destination: self.addressable(server),
             ecn: None,
             contents: &request,
             segment_size: None,
             src_ip: None,
-        });
+        };
+        let mut sent = self.inner.try_send(&transmit);
+        for _ in 0..SEND_RETRIES_WHEN_NOT_WRITABLE {
+            match &sent {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                _ => break,
+            }
+            let ready = std::future::poll_fn(|cx| writable.as_mut().poll_writable(cx));
+            match tokio::time::timeout(WRITABLE_WAIT, ready).await {
+                Ok(Ok(())) => sent = self.inner.try_send(&transmit),
+                Ok(Err(error)) => sent = Err(error),
+                Err(_) => break,
+            }
+        }
         if let Err(error) = sent {
             self.pending.lock().remove(&txid);
             return Err(error);
@@ -343,6 +386,90 @@ mod tests {
         let servers: Vec<&str> = servers.iter().map(String::as_str).collect();
         assert_eq!(stun.reflexive(&servers, Duration::from_millis(500)).await, None);
         assert!(stun.pending.lock().is_empty(), "timed-out requests are forgotten");
+    }
+
+    /// A server that does not answer (blocked operator) costs nothing once two others agree: the
+    /// verdict comes on their answers, not at the timeout. Live 2026-10-27 the silent Google servers
+    /// held every first contact for the full 3 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_server_does_not_hold_the_answer_once_two_agree() {
+        let (stun, _endpoint, port) = mesh_like_endpoint();
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let servers = [
+            silent.local_addr().unwrap().to_string(),
+            fake_stun_server(false).await,
+            fake_stun_server(false).await,
+        ];
+        let servers: Vec<&str> = servers.iter().map(String::as_str).collect();
+        let started = std::time::Instant::now();
+        let reflexive = stun.reflexive(&servers, Duration::from_secs(3)).await.expect("consensus");
+        assert!(started.elapsed() < Duration::from_secs(1), "answered at {:?}", started.elapsed());
+        assert_eq!(reflexive.addr, SocketAddr::from(([127, 0, 0, 1], port)));
+        assert!(reflexive.endpoint_independent);
+        assert!(stun.pending.lock().is_empty(), "the silent server's request is forgotten too");
+    }
+
+    /// One server answers, the other is silent: no consensus, but the probe still holds the answer
+    /// and counts both requests — the case that left a node with no IPv4 in its beacon (2026-11-08).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lone_answer_is_kept_by_the_probe_when_the_other_servers_are_silent() {
+        let (stun, _endpoint, port) = mesh_like_endpoint();
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let servers = [silent.local_addr().unwrap().to_string(), fake_stun_server(false).await];
+        let servers: Vec<&str> = servers.iter().map(String::as_str).collect();
+
+        let probe = stun.probe(&servers, Duration::from_millis(500)).await;
+        assert_eq!(probe.asked, 2);
+        assert_eq!(probe.consensus(), None);
+        assert_eq!(probe.lone(), Some(SocketAddr::from(([127, 0, 0, 1], port))));
+        assert!(stun.pending.lock().is_empty());
+    }
+
+    /// A socket that is not writable yet when the probe starts — a fresh one is not until its
+    /// readiness has been reported — gets the request once it is, instead of losing it (`asked=0`
+    /// on a busy machine made the STUN tests above fail at random, and the first probe of a mesh too).
+    #[tokio::test]
+    async fn a_request_that_finds_the_socket_not_writable_is_sent_when_it_is() {
+        #[derive(Debug)]
+        struct NotWritableAtFirst {
+            refusals_left: std::sync::atomic::AtomicUsize,
+            sent: std::sync::atomic::AtomicUsize,
+        }
+        #[derive(Debug)]
+        struct ReadyPoller;
+        impl UdpPoller for ReadyPoller {
+            fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncUdpSocket for NotWritableAtFirst {
+            fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+                Box::pin(ReadyPoller)
+            }
+            fn try_send(&self, _transmit: &Transmit) -> io::Result<()> {
+                use std::sync::atomic::Ordering::SeqCst;
+                if self.refusals_left.load(SeqCst) > 0 {
+                    self.refusals_left.fetch_sub(1, SeqCst);
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.sent.fetch_add(1, SeqCst);
+                Ok(())
+            }
+            fn poll_recv(&self, _cx: &mut Context, _bufs: &mut [IoSliceMut<'_>], _meta: &mut [RecvMeta]) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok(SocketAddr::from(([127, 0, 0, 1], 1)))
+            }
+        }
+        let socket = Arc::new(NotWritableAtFirst {
+            refusals_left: std::sync::atomic::AtomicUsize::new(2),
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let stun = StunSocket::new(Arc::clone(&socket) as Arc<dyn AsyncUdpSocket>).unwrap();
+        let probe = stun.probe(&["127.0.0.1:9", "127.0.0.1:10"], Duration::from_millis(50)).await;
+        assert_eq!(probe.asked, 2, "both requests left");
+        assert_eq!(socket.sent.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// Live, against the public servers from the mesh-like dual-stack socket. Needs internet.

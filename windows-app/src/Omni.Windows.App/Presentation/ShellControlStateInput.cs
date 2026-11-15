@@ -28,7 +28,6 @@ internal sealed record ShellControlStateInput(
     bool IsUpdatingPublicProfile,
     bool HasQuickAddContactPetname,
     bool HasRemotePrekeyBundle,
-    bool HasAddContactIdentifier,
     bool HasAddContactPetname,
     bool HasAddContactPayload,
     bool IsOnboarding,

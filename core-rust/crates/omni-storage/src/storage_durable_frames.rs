@@ -12,10 +12,10 @@
 
 impl Storage {
     /// Replace all persisted durable frames with `frames` — a list of
-    /// `(feed_id, seq, wire)`. Matches the network layer's snapshot seam
+    /// `(feed_id, seq, wire, handled)`. Matches the network layer's snapshot seam
     /// (`export_durable` → replace). Clear-then-insert so deleted/expired/
     /// delivered frames don't linger across restart. Returns the count stored.
-    pub fn replace_durable_frames(&self, frames: &[(Vec<u8>, i64, Vec<u8>)]) -> OmniResult<usize> {
+    pub fn replace_durable_frames(&self, frames: &[(Vec<u8>, i64, Vec<u8>, bool)]) -> OmniResult<usize> {
         // One transaction: this now runs periodically (not only on mesh stop), and thousands of
         // autocommitted inserts would each pay an fsync.
         self.with_immediate_transaction("replace_durable_frames", |storage| {
@@ -23,12 +23,12 @@ impl Storage {
                 .connection
                 .execute("DELETE FROM durable_frames", [])
                 .map_err(map_sqlite_error)?;
-            for (feed_id, seq, wire) in frames {
+            for (feed_id, seq, wire, handled) in frames {
                 storage
                     .connection
                     .execute(
-                        "INSERT INTO durable_frames (feed_id, seq, wire) VALUES (?1, ?2, ?3)",
-                        params![feed_id, seq, wire],
+                        "INSERT INTO durable_frames (feed_id, seq, wire, handled) VALUES (?1, ?2, ?3, ?4)",
+                        params![feed_id, seq, wire, handled],
                     )
                     .map_err(map_sqlite_error)?;
             }
@@ -40,7 +40,7 @@ impl Storage {
     /// (per-recipient monotone). Persisted on EVERY call so it survives restart —
     /// a reused seq would let the recipient false-dedup a post-restart message
     /// (the held frame lingers until TTL). Contiguous, so the anti-entropy
-    /// high-water stays tight. See docs/notes/durable-1to1-integration-plan.md.
+    /// high-water stays tight. See docs/decisions/mesh-durable-delivery.md.
     pub fn next_durable_seq(&self, peer: &[u8]) -> OmniResult<i64> {
         self.connection
             .execute(
@@ -60,15 +60,15 @@ impl Storage {
             .map_err(map_sqlite_error)
     }
 
-    /// Load all persisted durable-frame wire-blobs (to repopulate the in-memory
-    /// store at startup via `Network::import_durable`).
-    pub fn load_durable_frames(&self) -> OmniResult<Vec<Vec<u8>>> {
+    /// Load all persisted durable-frame wire-blobs with their handled marks (to
+    /// repopulate the in-memory store at startup via `Network::import_durable`).
+    pub fn load_durable_frames(&self) -> OmniResult<Vec<(Vec<u8>, bool)>> {
         let mut statement = self
             .connection
-            .prepare("SELECT wire FROM durable_frames ORDER BY feed_id, seq")
+            .prepare("SELECT wire, handled FROM durable_frames ORDER BY feed_id, seq")
             .map_err(map_sqlite_error)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)))
             .map_err(map_sqlite_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_error)
     }

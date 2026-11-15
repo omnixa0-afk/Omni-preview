@@ -5,6 +5,13 @@ pub fn bootstrap_initiator_session(
     now_unix_ms: i64,
 ) -> OmniResult<(SessionRecord, SessionBootstrapMessage)> {
     verify_prekey_bundle(remote_bundle)?;
+    // V-09: an expired signed prekey may already be erased at the other end; a session built on it
+    // would never open. The contact sends a fresh bundle in its next hello.
+    if remote_bundle.signed_prekey.expires_at_unix_ms.is_some_and(|expires| expires <= now_unix_ms) {
+        return Err(OmniError::InvalidInput(
+            "the contact's signed prekey has expired; waiting for a fresh prekey bundle".to_string(),
+        ));
+    }
     if local_identity_key.account_id != local_device_key.account_id {
         return Err(OmniError::InvalidInput(
             "local identity key and device key belong to different accounts".to_string(),
@@ -104,6 +111,37 @@ pub fn session_rendezvous_pair_secret(session: &SessionRecord) -> OmniResult<Opt
         .try_into()
         .map_err(|_| OmniError::Internal("rendezvous secret is not 32 bytes".to_string()))?;
     Ok(Some(secret))
+}
+
+/// Whether an inbound `bootstrap` comes from the account and device it names. The bootstrap's own
+/// signature only proves that its sender holds the keys it carries; the device certificate chain
+/// (master key → working key → device, the account id being the hash of the master key) is what ties
+/// those keys to the account. It must verify and vouch for exactly the bootstrap's account, device and
+/// keys. Without it anyone could claim a contact's account and device and take over the session with
+/// it (V-01). Runs before the bootstrap is recorded or acted on in any way.
+pub fn verify_inbound_session_bootstrap(
+    bootstrap: &SessionBootstrapMessage,
+    chain: &DeviceCertificateChainV1,
+    local_signed_prekey: &SignedPrekey,
+) -> OmniResult<()> {
+    verify_device_certificate_chain(chain)?;
+    let device = &chain.device;
+    if device.account_id != bootstrap.initiator_account_id
+        || device.device_id != bootstrap.initiator_device_id
+        || device.identity_public_key != bootstrap.initiator_identity_key
+        || device.identity_signing_public_key != bootstrap.initiator_identity_signing_key
+        || device.device_public_key != bootstrap.initiator_device_key
+    {
+        return Err(OmniError::InvalidInput(
+            "the device certificate vouches for other keys than the bootstrap carries".to_string(),
+        ));
+    }
+    if bootstrap.remote_signed_prekey_id != local_signed_prekey.prekey_id {
+        return Err(OmniError::InvalidInput(
+            "bootstrap message references an unexpected signed prekey".to_string(),
+        ));
+    }
+    verify_session_bootstrap_signature(bootstrap, local_signed_prekey)
 }
 
 pub fn bootstrap_responder_session(

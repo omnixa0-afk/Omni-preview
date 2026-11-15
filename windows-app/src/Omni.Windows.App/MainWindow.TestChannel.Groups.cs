@@ -62,7 +62,7 @@ public sealed partial class MainWindow
                 return "ok";
 
             case "group.open":
-                return OpenGroupForUiTest(Arg(0)) ? "ok" : "error: no such group row";
+                return OpenGroupInChats(Arg(0)) ? "ok" : "error: no such group row";
 
             case "group.send":
                 if (args.Count < 2)
@@ -155,7 +155,7 @@ public sealed partial class MainWindow
 
             // The conversation's call button: starts a call, or joins the one going on.
             case "group.call":
-                if (!OpenGroupForUiTest(Arg(0)))
+                if (!OpenGroupInChats(Arg(0)))
                 {
                     return "error: no such group row";
                 }
@@ -173,7 +173,7 @@ public sealed partial class MainWindow
                 return "ok";
 
             case "group.hangup":
-                if (!OpenGroupForUiTest(Arg(0)))
+                if (!OpenGroupInChats(Arg(0)))
                 {
                     return "error: no such group row";
                 }
@@ -214,7 +214,7 @@ public sealed partial class MainWindow
         }
     }
 
-    private bool OpenGroupForUiTest(string groupId)
+    private bool OpenGroupInChats(string groupId)
     {
         ShowChatsSection();
         RefreshChatsList(force: true);

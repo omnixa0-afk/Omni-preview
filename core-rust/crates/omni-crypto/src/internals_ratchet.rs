@@ -14,7 +14,11 @@ fn seal_payload(session: &mut SessionRecord, plaintext: &[u8]) -> OmniResult<Enc
         session.previous_send_chain_length,
         counter,
     );
-    let cipher = ChaCha20Poly1305::new_from_slice(&message_key)
+    // The root key is the one this send chain was made from: a receive ratchet replaces it, but
+    // also makes the next frame start a new chain (`needs_send_ratchet`).
+    let root_key = unprotect_chain_key(&session.protected_session_key)?;
+    let header_mac = header_mac(&root_key, &aad)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(message_key.as_slice())
         .map_err(|error| OmniError::Internal(format!("chacha20-poly1305 key init failed: {error}")))?;
     let sealed = cipher
         .encrypt(
@@ -27,7 +31,7 @@ fn seal_payload(session: &mut SessionRecord, plaintext: &[u8]) -> OmniResult<Enc
         .map_err(|_| OmniError::Internal("network payload encryption failed".to_string()))?;
     let (ciphertext, mac) = split_ciphertext_and_tag(&sealed)?;
 
-    session.protected_send_chain_key = Some(protect_bytes(&next_chain_key)?);
+    session.protected_send_chain_key = Some(protect_bytes(next_chain_key.as_slice())?);
     session.send_counter = counter;
     session.updated_at_unix_ms = session.updated_at_unix_ms.saturating_add(1);
 
@@ -38,6 +42,7 @@ fn seal_payload(session: &mut SessionRecord, plaintext: &[u8]) -> OmniResult<Enc
         nonce_hex: hex::encode(nonce),
         ciphertext_hex: hex::encode(ciphertext),
         mac_hex: hex::encode(mac),
+        header_mac_hex: Some(hex::encode(header_mac.as_slice())),
     })
 }
 
@@ -78,6 +83,22 @@ fn open_payload(
         skipped.remove(index).message_key
     } else {
         if payload_ratchet_public != working.remote_ratchet_public_key {
+            // A new chain costs a DH and, far along it, up to `MAX_NEW_CHAIN_JUMP` chain steps before
+            // the frame's own key can be checked — work anyone could impose with junk. Its header is
+            // checked first, against the root the new chain will have: one DH, one HKDF. A frame
+            // without the tag (an older sender) still opens within the gap, but never jumps far.
+            let far = payload.counter > MAX_RECEIVE_GAP;
+            let authentic = match payload.header_mac_hex.as_deref() {
+                Some(mac) => new_chain_header_is_authentic(&working, &payload_ratchet_public, payload, mac)?,
+                None => !far,
+            };
+            if !authentic {
+                return Err(OmniError::InvalidInput(if far {
+                    "encrypted payload is from an unknown ratchet chain far past the receive gap".to_string()
+                } else {
+                    "encrypted payload authentication failed".to_string()
+                }));
+            }
             // The rest of the current chain may still be on its way: the sender says how long it
             // was. Remember those keys before the chain is replaced.
             let previous_remote = working.remote_ratchet_public_key;
@@ -132,7 +153,7 @@ fn open_payload(
             .ok_or_else(|| OmniError::InvalidInput("receive chain key is not available".to_string()))
             .and_then(unprotect_chain_key)?;
         let (message_key, next_chain_key) = derive_chain_step(&chain_key)?;
-        working.protected_receive_chain_key = Some(protect_bytes(&next_chain_key)?);
+        working.protected_receive_chain_key = Some(protect_bytes(next_chain_key.as_slice())?);
         working.receive_counter = payload.counter;
         message_key
     };
@@ -153,7 +174,7 @@ fn open_payload(
     );
     let mut combined = ciphertext;
     combined.extend_from_slice(&mac);
-    let cipher = ChaCha20Poly1305::new_from_slice(&message_key)
+    let cipher = ChaCha20Poly1305::new_from_slice(message_key.as_slice())
         .map_err(|error| OmniError::Internal(format!("chacha20-poly1305 key init failed: {error}")))?;
     let plaintext = cipher
         .decrypt(
@@ -190,7 +211,7 @@ fn open_payload(
 struct SkippedMessageKey {
     ratchet_public: EphemeralPublicKey,
     counter: u64,
-    message_key: [u8; 32],
+    message_key: Zeroizing<[u8; 32]>,
 }
 
 /// ratchet public key (32) + counter (8, big-endian) + message key (32).
@@ -216,7 +237,7 @@ fn load_skipped_message_keys(session: &SessionRecord) -> OmniResult<Vec<SkippedM
             ratchet_public.copy_from_slice(&entry[..32]);
             let mut counter = [0u8; 8];
             counter.copy_from_slice(&entry[32..40]);
-            let mut message_key = [0u8; 32];
+            let mut message_key = Zeroizing::new([0u8; 32]);
             message_key.copy_from_slice(&entry[40..]);
             SkippedMessageKey {
                 ratchet_public: EphemeralPublicKey(ratchet_public),
@@ -235,11 +256,11 @@ fn store_skipped_message_keys(
         session.protected_skipped_message_keys = None;
         return Ok(());
     }
-    let mut bytes = Vec::with_capacity(skipped.len() * SKIPPED_MESSAGE_KEY_LEN);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(skipped.len() * SKIPPED_MESSAGE_KEY_LEN));
     for entry in skipped {
         bytes.extend_from_slice(&entry.ratchet_public.0);
         bytes.extend_from_slice(&entry.counter.to_be_bytes());
-        bytes.extend_from_slice(&entry.message_key);
+        bytes.extend_from_slice(entry.message_key.as_slice());
     }
     session.protected_skipped_message_keys = Some(protect_bytes(&bytes)?);
     Ok(())
@@ -273,7 +294,7 @@ fn skip_receive_chain_to(
             message_key,
         });
     }
-    session.protected_receive_chain_key = Some(protect_bytes(&chain_key)?);
+    session.protected_receive_chain_key = Some(protect_bytes(chain_key.as_slice())?);
     if skipped.len() > MAX_SKIPPED_MESSAGE_KEYS {
         let excess = skipped.len() - MAX_SKIPPED_MESSAGE_KEYS;
         skipped.drain(..excess);
@@ -281,8 +302,9 @@ fn skip_receive_chain_to(
     Ok(())
 }
 
-/// How far into a NEW chain a frame may be and still be tried (a chain step is one HKDF: this bounds
-/// what a junk frame costs). A sender ten seconds apart fills it in about two days of silence.
+/// How far into a NEW chain a frame may be and still be tried. A sender ten seconds apart fills it in
+/// about two days of silence. The steps are walked only for a frame whose header tag already checked
+/// out (`new_chain_header_is_authentic`): junk costs one DH and one HKDF, not this many.
 const MAX_NEW_CHAIN_JUMP: u64 = 16_384;
 
 /// Step the receive chain up to `until` without remembering the keys passed — for a new chain far
@@ -297,7 +319,7 @@ fn fast_forward_receive_chain(session: &mut SessionRecord, until: u64) -> OmniRe
         chain_key = next_chain_key;
         session.receive_counter = session.receive_counter.saturating_add(1);
     }
-    session.protected_receive_chain_key = Some(protect_bytes(&chain_key)?);
+    session.protected_receive_chain_key = Some(protect_bytes(chain_key.as_slice())?);
     Ok(())
 }
 
@@ -311,16 +333,16 @@ fn ensure_send_chain(session: &mut SessionRecord) -> OmniResult<()> {
     let new_local_ratchet = generate_x25519_secret();
     let new_local_ratchet_public =
         EphemeralPublicKey(X25519PublicKey::from(&new_local_ratchet).to_bytes());
-    let dh = new_local_ratchet.diffie_hellman(&remote_ratchet_public);
-    let (new_root_key, new_send_chain_key) = derive_ratchet_step(&root_key, &dh.to_bytes())?;
+    let dh = Zeroizing::new(new_local_ratchet.diffie_hellman(&remote_ratchet_public).to_bytes());
+    let (new_root_key, new_send_chain_key) = derive_ratchet_step(&root_key, &dh)?;
 
     session.previous_send_chain_length = session.send_counter;
     session.send_counter = 0;
     session.needs_send_ratchet = false;
     session.local_ratchet_public_key = new_local_ratchet_public;
-    session.protected_local_ratchet_key = protect_bytes(new_local_ratchet.to_bytes().as_ref())?;
-    session.protected_session_key = protect_bytes(&new_root_key)?;
-    session.protected_send_chain_key = Some(protect_bytes(&new_send_chain_key)?);
+    session.protected_local_ratchet_key = protect_bytes(Zeroizing::new(new_local_ratchet.to_bytes()).as_slice())?;
+    session.protected_session_key = protect_bytes(new_root_key.as_slice())?;
+    session.protected_send_chain_key = Some(protect_bytes(new_send_chain_key.as_slice())?);
     Ok(())
 }
 
@@ -330,28 +352,58 @@ fn apply_receive_ratchet(
 ) -> OmniResult<()> {
     let root_key = unprotect_chain_key(&session.protected_session_key)?;
     let local_ratchet_private = unprotect_x25519_secret(&session.protected_local_ratchet_key)?;
-    let dh = local_ratchet_private.diffie_hellman(&x25519_from_ephemeral_public(new_remote_ratchet_public));
-    let (new_root_key, new_receive_chain_key) = derive_ratchet_step(&root_key, &dh.to_bytes())?;
+    let dh = Zeroizing::new(local_ratchet_private.diffie_hellman(&x25519_from_ephemeral_public(new_remote_ratchet_public)).to_bytes());
+    let (new_root_key, new_receive_chain_key) = derive_ratchet_step(&root_key, &dh)?;
 
-    session.protected_session_key = protect_bytes(&new_root_key)?;
-    session.protected_receive_chain_key = Some(protect_bytes(&new_receive_chain_key)?);
+    session.protected_session_key = protect_bytes(new_root_key.as_slice())?;
+    session.protected_receive_chain_key = Some(protect_bytes(new_receive_chain_key.as_slice())?);
     session.remote_ratchet_public_key = *new_remote_ratchet_public;
     session.receive_counter = 0;
     session.needs_send_ratchet = true;
     Ok(())
 }
 
-fn derive_ratchet_step(root_key: &[u8; 32], dh_output: &[u8; 32]) -> OmniResult<([u8; 32], [u8; 32])> {
-    let mut ikm = Vec::new();
-    ikm.extend_from_slice(dh_output);
-    let okm = hkdf_expand_multi(Some(root_key), &ikm, b"omni-stage5-ratchet-step-v2", 64)?;
+/// (new root key, new chain key); both wiped when dropped.
+type KeyPair = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+
+fn derive_ratchet_step(root_key: &[u8; 32], dh_output: &[u8; 32]) -> OmniResult<KeyPair> {
+    let okm = hkdf_expand_multi(Some(root_key), dh_output, b"omni-stage5-ratchet-step-v2", 64)?;
     Ok((
-        slice_to_array::<32>(&okm[..32])?,
-        slice_to_array::<32>(&okm[32..64])?,
+        Zeroizing::new(slice_to_array::<32>(&okm[..32])?),
+        Zeroizing::new(slice_to_array::<32>(&okm[32..64])?),
     ))
 }
 
-fn derive_chain_step(chain_key: &[u8; 32]) -> OmniResult<([u8; 32], [u8; 32])> {
+/// The tag of a frame's header (its AAD) under the root key its chain was made from.
+fn header_mac(root_key: &[u8; 32], aad: &[u8]) -> OmniResult<Zeroizing<Vec<u8>>> {
+    hkdf_expand_multi(Some(root_key), aad, b"omni-stage5-header-mac-v1", HEADER_MAC_LEN)
+}
+
+const HEADER_MAC_LEN: usize = 32;
+
+/// Whether a frame of a NEW chain (`ratchet_public` is not the peer's current key) carries the header
+/// tag of that chain: the DH and root step the receive ratchet would do, on a copy, and nothing else.
+fn new_chain_header_is_authentic(
+    session: &SessionRecord,
+    ratchet_public: &EphemeralPublicKey,
+    payload: &EncryptedPayload,
+    mac_hex: &str,
+) -> OmniResult<bool> {
+    let Ok(mac) = hex::decode(mac_hex.trim()) else { return Ok(false) };
+    if mac.len() != HEADER_MAC_LEN {
+        return Ok(false);
+    }
+    let root_key = unprotect_chain_key(&session.protected_session_key)?;
+    let local_ratchet_private = unprotect_x25519_secret(&session.protected_local_ratchet_key)?;
+    let dh = Zeroizing::new(local_ratchet_private.diffie_hellman(&x25519_from_ephemeral_public(ratchet_public)).to_bytes());
+    let (new_root_key, _) = derive_ratchet_step(&root_key, &dh)?;
+    let aad = build_network_aad(session, ratchet_public, payload.previous_chain_length, payload.counter);
+    let expected = header_mac(&new_root_key, &aad)?;
+    // In constant time: how much of a forged tag matched says nothing.
+    Ok(expected.iter().zip(mac.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0)
+}
+
+fn derive_chain_step(chain_key: &[u8; 32]) -> OmniResult<KeyPair> {
     let okm = hkdf_expand_multi(
         Some(chain_key),
         b"omni-stage5-chain-step-input-v2",
@@ -359,8 +411,8 @@ fn derive_chain_step(chain_key: &[u8; 32]) -> OmniResult<([u8; 32], [u8; 32])> {
         64,
     )?;
     Ok((
-        slice_to_array::<32>(&okm[..32])?,
-        slice_to_array::<32>(&okm[32..64])?,
+        Zeroizing::new(slice_to_array::<32>(&okm[..32])?),
+        Zeroizing::new(slice_to_array::<32>(&okm[32..64])?),
     ))
 }
 
@@ -408,52 +460,5 @@ fn build_network_aad(
     aad.extend_from_slice(&previous_chain_length.to_be_bytes());
     aad.extend_from_slice(&counter.to_be_bytes());
     aad
-}
-
-fn fingerprint_input(material: &FingerprintMaterial) -> Vec<u8> {
-    let mut accounts = [
-        (
-            material.local_account_id.0.as_str(),
-            &material.local_identity_key.0,
-            &material.local_identity_signing_key.0,
-        ),
-        (
-            material.remote_account_id.0.as_str(),
-            &material.remote_identity_key.0,
-            &material.remote_identity_signing_key.0,
-        ),
-    ];
-    accounts.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
-
-    let mut devices = [
-        (
-            material.local_account_id.0.as_str(),
-            material.local_device_id.0.as_str(),
-            &material.local_device_key.0,
-        ),
-        (
-            material.remote_account_id.0.as_str(),
-            material.remote_device_id.0.as_str(),
-            &material.remote_device_key.0,
-        ),
-    ];
-    devices.sort_by(|lhs, rhs| (lhs.0, lhs.1).cmp(&(rhs.0, rhs.1)));
-
-    let mut input = Vec::new();
-    input.extend_from_slice(b"omni-stage5-fingerprint-v2");
-    for (account_id, agreement_key, signing_key) in accounts {
-        input.extend_from_slice(account_id.as_bytes());
-        input.push(0);
-        input.extend_from_slice(agreement_key);
-        input.extend_from_slice(signing_key);
-    }
-    for (account_id, device_id, device_key) in devices {
-        input.extend_from_slice(account_id.as_bytes());
-        input.push(0);
-        input.extend_from_slice(device_id.as_bytes());
-        input.push(0);
-        input.extend_from_slice(device_key);
-    }
-    input
 }
 

@@ -46,14 +46,6 @@ static ATTACHMENT_REORDER_BUFFERS: OnceLock<Mutex<HashMap<String, BTreeMap<i64, 
 static ATTACHMENT_RECEIVE_WRITERS: OnceLock<
     Mutex<HashMap<String, SharedAttachmentReceiveWriter>>,
 > = OnceLock::new();
-// Newest `created_at_unix_ms` of any session bootstrap seen from a peer, keyed
-// `{db_path}::{remote_account}::{remote_device}`. Used to tell a pairing-collision ECHO (a bootstrap
-// we have already seen, re-delivered by the durable backstop) from a peer that genuinely
-// re-bootstrapped after a reinstall. Both values compared come from the PEER's clock, so the
-// comparison is immune to clock skew between the two machines — an earlier attempt compared the
-// peer's timestamp against our own and was defeated by a 4.3 s skew on a real two-machine run.
-// Cleared per-profile by `clear_runtime_contact_ephemera_for_active_profile`.
-static LAST_INBOUND_BOOTSTRAP_AT: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 // In-flight attachment SEND workers, keyed `{db_path}::{transfer_id}`. A duplicated/replayed
 // download request must NOT spawn a second sender for a transfer already streaming: that sends the
 // whole file twice (2x data + CPU) and starves the sender's UI thread. See
@@ -72,7 +64,16 @@ const ATTACHMENT_SEND_WORKER_STUCK_AFTER_MS: i64 = 15_000;
 pub(crate) struct AttachmentSendWorker {
     superseded: std::sync::atomic::AtomicBool,
     write_blocked_since_ms: std::sync::atomic::AtomicI64,
+    /// The dialog that asked: workers are counted per requester.
+    requester: String,
 }
+
+/// How many send workers one requesting dialog may have in flight, and one profile in all. Each is a
+/// thread; the upload slots bound only those already sending, and every request with a new transfer
+/// id made one more, waiting (blind audit 2026-11-11, F3). A receiver asks for few files at once —
+/// photos fetch themselves at most 8 per dialog (TM-005) — and asks again when refused.
+pub(crate) const ATTACHMENT_SEND_WORKERS_PER_REQUESTER: usize = 16;
+pub(crate) const ATTACHMENT_SEND_WORKERS_PER_PROFILE: usize = 64;
 
 impl AttachmentSendWorker {
     pub(crate) fn write_started(&self) {
@@ -549,51 +550,85 @@ pub(crate) fn drop_attachment_receive_writer(db_path: &str, transfer_id: &str) {
     forget_attachment_receive_writer(db_path, transfer_id);
 }
 
-fn inbound_bootstrap_registry_key(db_path: &str, account_id: &str, device_id: &str) -> String {
-    format!("{db_path}::{account_id}::{device_id}")
+/// Check an inbound session bootstrap before anything is recorded or acted on (V-01): its device
+/// certificate chain must tie its keys to the account and device it names, and it must be signed for
+/// our active signed prekey. Shared by both accept paths. Returns the parsed bootstrap and that prekey.
+pub(crate) fn verify_inbound_session_bootstrap_message(
+    storage: &Storage,
+    message: &SessionBootstrapMessageV1,
+    local_device_id: &DeviceId,
+) -> OmniResult<(omni_crypto::SessionBootstrapMessage, omni_crypto::SignedPrekey)> {
+    let chain_json = message
+        .initiator_device_certificate_chain_json
+        .as_deref()
+        .ok_or_else(|| {
+            OmniError::InvalidInput("the session bootstrap carries no device certificate".to_string())
+        })?;
+    let chain: omni_crypto::DeviceCertificateChainV1 = serde_json::from_str(chain_json)
+        .map_err(|error| OmniError::InvalidInput(format!("bootstrap device certificate: {error}")))?;
+    // The one the bootstrap names: after a rotation a contact may still bootstrap from the bundle
+    // with the previous one (V-09).
+    let signed_prekey = storage
+        .get_signed_prekey_for_inbound_bootstrap(local_device_id, message.remote_signed_prekey_id)?
+        .ok_or_else(|| {
+            OmniError::InvalidInput("bootstrap message references an unexpected signed prekey".to_string())
+        })?;
+    let bootstrap = session_bootstrap_from_protocol(message)?;
+    omni_crypto::verify_inbound_session_bootstrap(&bootstrap, &chain, &signed_prekey)?;
+    Ok((bootstrap, signed_prekey))
 }
 
-/// Newest bootstrap timestamp seen from this peer, in the PEER's clock. `None` until one is recorded.
-pub(crate) fn last_inbound_bootstrap_created_at(
-    db_path: &str,
-    account_id: &str,
-    device_id: &str,
-) -> Option<i64> {
-    let key = inbound_bootstrap_registry_key(db_path, account_id, device_id);
-    LAST_INBOUND_BOOTSTRAP_AT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .ok()?
-        .get(&key)
-        .copied()
+/// What a verified bootstrap is relative to the ones already seen from its device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundBootstrapAge {
+    /// Newer than any seen: a new session (or the first). Carries the newest seen before it.
+    Newer(Option<i64>),
+    /// The one already seen, delivered again (the durable backstop re-sends it).
+    Same,
+    /// Older than one already accepted: a replay. Ignored.
+    Older,
+    /// Stamped more than [`BOOTSTRAP_AHEAD_OF_OUR_CLOCK_LIMIT_MS`] ahead of our clock. Ignored and
+    /// not recorded (V-08).
+    AheadOfOurClock,
 }
 
-/// Record a bootstrap we have now seen from this peer (whether we accepted it or ignored it as a
-/// collision echo) so a later re-delivery of the SAME one is recognised.
-pub(crate) fn record_inbound_bootstrap_created_at(
-    db_path: &str,
-    account_id: &str,
-    device_id: &str,
-    created_at_unix_ms: i64,
-) {
-    let key = inbound_bootstrap_registry_key(db_path, account_id, device_id);
-    if let Ok(mut registry) = LAST_INBOUND_BOOTSTRAP_AT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        let newest = registry.entry(key).or_insert(created_at_unix_ms);
-        *newest = (*newest).max(created_at_unix_ms);
+/// How far a bootstrap's `created_at` may run ahead of our clock. The age comparison stays on the
+/// peer's own clock (immune to ordinary skew), but its mark must not land in the far future: a
+/// device whose clock once ran a year ahead would leave a mark that makes every bootstrap it sends
+/// after the clock is fixed look like a replay — the contact silently dead until that date (V-08).
+/// An hour covers any working clock; a mark already past it is not trusted to call a bootstrap old.
+pub(crate) const BOOTSTRAP_AHEAD_OF_OUR_CLOCK_LIMIT_MS: i64 = 60 * 60 * 1000;
+
+/// Record a VERIFIED bootstrap from its device (V-08: never before the signature check) and say how
+/// it relates to the ones seen before. The mark is on disk (V-09: after a restart an old bootstrap is
+/// still recognised). Both timestamps come from the PEER's clock, which keeps the comparison immune to
+/// clock skew between the machines — an earlier attempt compared the peer's timestamp against our own
+/// and was defeated by a 4.3 s skew on a real two-machine run (docs/bugs/mutual-pairing-wedges-session.md).
+pub(crate) fn note_inbound_session_bootstrap(
+    storage: &Storage,
+    message: &SessionBootstrapMessageV1,
+    now_unix_ms: i64,
+) -> OmniResult<InboundBootstrapAge> {
+    let ahead_limit = now_unix_ms.saturating_add(BOOTSTRAP_AHEAD_OF_OUR_CLOCK_LIMIT_MS);
+    if message.created_at_unix_ms > ahead_limit {
+        return Ok(InboundBootstrapAge::AheadOfOurClock);
     }
-}
-
-pub(crate) fn clear_inbound_bootstrap_marks_for_profile(db_path: &str) {
-    let prefix = format!("{db_path}::");
-    if let Ok(mut registry) = LAST_INBOUND_BOOTSTRAP_AT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        registry.retain(|key, _| !key.starts_with(&prefix));
+    let account_id = AccountId(message.initiator_account_id.clone());
+    let device_id = DeviceId(message.initiator_device_id.clone());
+    // A mark past the limit came from a clock that has since been fixed (or from before this
+    // check): it cannot call anything a replay. The new bootstrap overwrites it.
+    let seen = storage
+        .newest_inbound_bootstrap_at(&account_id, &device_id)?
+        .filter(|seen_at| *seen_at <= ahead_limit);
+    let age = match seen {
+        Some(seen_at) if message.created_at_unix_ms < seen_at => InboundBootstrapAge::Older,
+        Some(seen_at) if message.created_at_unix_ms == seen_at => InboundBootstrapAge::Same,
+        _ => InboundBootstrapAge::Newer(seen),
+    };
+    if age != InboundBootstrapAge::Older {
+        storage.record_inbound_bootstrap_at(&account_id, &device_id, message.created_at_unix_ms, ahead_limit)?;
     }
+    Ok(age)
 }
 
 /// Reserve an in-flight slot for an attachment send worker. Returns `true` if reserved (the caller
@@ -601,13 +636,29 @@ pub(crate) fn clear_inbound_bootstrap_marks_for_profile(db_path: &str) {
 /// for this `{db_path, transfer_id}` is already running — a duplicate download request to drop.
 /// A running worker whose write is stuck (its peer went away and came back) is superseded instead:
 /// it stops, and the new request is served now rather than after the dead stream times out.
-pub(crate) fn reserve_attachment_send_worker(db_path: &str, transfer_id: &str) -> Option<Arc<AttachmentSendWorker>> {
+pub(crate) fn reserve_attachment_send_worker(
+    db_path: &str,
+    transfer_id: &str,
+    requester_dialog_key: &str,
+) -> Option<Arc<AttachmentSendWorker>> {
     let key = format!("{db_path}::{transfer_id}");
-    let worker = Arc::new(AttachmentSendWorker::default());
+    let worker = Arc::new(AttachmentSendWorker { requester: requester_dialog_key.to_string(), ..Default::default() });
     let Ok(mut registry) = ATTACHMENT_SEND_WORKERS_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
         // Poisoned lock: fail open (allow the send) rather than wedge all future transfers.
         return Some(worker);
     };
+    if !registry.contains_key(&key) {
+        let prefix = format!("{db_path}::");
+        let of_profile = || registry.iter().filter(|(running_key, _)| running_key.starts_with(&prefix));
+        let of_requester = of_profile().filter(|(_, running)| running.requester == requester_dialog_key).count();
+        if of_requester >= ATTACHMENT_SEND_WORKERS_PER_REQUESTER || of_profile().count() >= ATTACHMENT_SEND_WORKERS_PER_PROFILE {
+            omni_app_trace_log(
+                "attachment/send-worker",
+                &format!("transfer={transfer_id} refused: {of_requester} in flight for {requester_dialog_key}, the bound reached"),
+            );
+            return None;
+        }
+    }
     if let Some(running) = registry.get(&key) {
         if !running.stuck(current_unix_ms()) {
             return None;
@@ -785,29 +836,29 @@ mod attachment_send_worker_dedup_tests {
         let db = "test-db::attachment-send-dedup";
         let tid = "transfer-dedup-1";
         // First reservation for a transfer succeeds.
-        let first = super::reserve_attachment_send_worker(db, tid).unwrap();
+        let first = super::reserve_attachment_send_worker(db, tid, "dialog:dedup").unwrap();
         // A concurrent duplicate (e.g. the same request re-delivered over a second carrier) is
         // rejected while the first worker is still in flight - and while its write is blocked
         // briefly (back-pressure on a live link).
-        assert!(super::reserve_attachment_send_worker(db, tid).is_none());
+        assert!(super::reserve_attachment_send_worker(db, tid, "dialog:dedup").is_none());
         first.write_started();
-        assert!(super::reserve_attachment_send_worker(db, tid).is_none());
+        assert!(super::reserve_attachment_send_worker(db, tid, "dialog:dedup").is_none());
         first.write_done();
         // A different transfer is independent.
-        let other = super::reserve_attachment_send_worker(db, "transfer-dedup-2").unwrap();
+        let other = super::reserve_attachment_send_worker(db, "transfer-dedup-2", "dialog:dedup").unwrap();
         // After the worker finishes, a later legitimate resume can reserve the slot again.
         super::release_attachment_send_worker(db, tid, &first);
-        let again = super::reserve_attachment_send_worker(db, tid).unwrap();
+        let again = super::reserve_attachment_send_worker(db, tid, "dialog:dedup").unwrap();
         // Its write stuck past the limit (the peer went away): the next request takes over, and the
         // stuck worker, released late, does not free the new one's slot.
         again.write_blocked_since_ms.store(
             super::current_unix_ms() - super::ATTACHMENT_SEND_WORKER_STUCK_AFTER_MS,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let fresh = super::reserve_attachment_send_worker(db, tid).expect("a stuck worker is superseded");
+        let fresh = super::reserve_attachment_send_worker(db, tid, "dialog:dedup").expect("a stuck worker is superseded");
         assert!(again.superseded() && !fresh.superseded());
         super::release_attachment_send_worker(db, tid, &again);
-        assert!(super::reserve_attachment_send_worker(db, tid).is_none(), "the new worker still holds it");
+        assert!(super::reserve_attachment_send_worker(db, tid, "dialog:dedup").is_none(), "the new worker still holds it");
         super::release_attachment_send_worker(db, tid, &fresh);
         super::release_attachment_send_worker(db, "transfer-dedup-2", &other);
     }

@@ -2,6 +2,7 @@
 name = "omni-rendezvous-helper"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # The SEPARATE, untrusted-by-design rendezvous helper PROCESS (privilege separation): it does all
 # the dirty third-party network I/O (rendezvous providers + STUN) so the key-holding core never

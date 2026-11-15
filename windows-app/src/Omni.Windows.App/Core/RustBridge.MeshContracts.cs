@@ -16,8 +16,8 @@ internal sealed record NodeConnectivityDto(
 /// <summary>Per-contact connection state. <c>Link</c> ∈ { online_direct, online_via_relay,
 /// searching, will_deliver_later, cannot_reach }. <c>RelayHops</c> set only when relayed;
 /// <c>CannotReachReason</c> set only when cannot_reach ∈ { peer_offline, no_route_both_unreachable,
-/// rendezvous_disabled, address_stale, not_approved, verification_failed }. <c>Verified</c>
-/// (has_met) is orthogonal to the link.</summary>
+/// rendezvous_disabled, address_stale, not_approved, no_common_address_family, verification_failed }.
+/// <c>Verified</c> (has_met) is orthogonal to the link.</summary>
 internal sealed record ContactConnectionDto(
     [property: JsonPropertyName("account_id")] string AccountId,
     [property: JsonPropertyName("link")] string Link,
@@ -34,7 +34,18 @@ internal sealed record ContactConnectionDto(
     // A device of the contact told us its couriers and none is common one way or the other: it can be
     // met only over a link that is already up. CouriersToEnable: ours, off or only read, that would help.
     [property: JsonPropertyName("no_common_courier")] bool NoCommonCourier,
-    [property: JsonPropertyName("couriers_to_enable")] IReadOnlyList<string>? CouriersToEnable);
+    [property: JsonPropertyName("couriers_to_enable")] IReadOnlyList<string>? CouriersToEnable,
+    // The contact's own servers that would give one, not allowed yet: the card asks (V-13).
+    [property: JsonPropertyName("couriers_to_allow")] IReadOnlyList<string>? CouriersToAllow,
+    // Only for our own request awaiting an answer: "waiting_for_link" (no link yet — a request
+    // travels only over one) or "delivered".
+    [property: JsonPropertyName("request")] string? Request = null,
+    // With no_common_address_family: what each side publishes ("IPv4" / "IPv6" / "IPv4 и IPv6").
+    [property: JsonPropertyName("address_family_gap")] AddressFamilyGapDto? AddressFamilyGap = null);
+
+internal sealed record AddressFamilyGapDto(
+    [property: JsonPropertyName("ours")] string Ours,
+    [property: JsonPropertyName("theirs")] string Theirs);
 
 /// <summary>One step in a contact's live connection journey (Tier-2 trace). <c>Stage</c> ∈
 /// { lan, rendezvous, linked }; <c>Status</c> ∈ { started, ok, failed, skipped }. <c>Detail</c> is

@@ -596,6 +596,7 @@ public sealed partial class MainWindow
             CloseButtonText = "Отмена",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = rootElement.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
 
         if (await dialog.ShowAsync() != ContentDialogResult.Primary)
@@ -671,6 +672,7 @@ public sealed partial class MainWindow
             CloseButtonText = "Закрыть",
             DefaultButton = ContentDialogButton.Close,
             XamlRoot = rootElement.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
 
         await dialog.ShowAsync();

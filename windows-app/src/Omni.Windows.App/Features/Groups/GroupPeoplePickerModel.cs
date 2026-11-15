@@ -35,6 +35,8 @@ public sealed class GroupPickCandidate : INotifyPropertyChanged
     public Visibility AvatarImageVisibility { get; init; } = Visibility.Collapsed;
     public Visibility PresenceDotVisibility { get; init; } = Visibility.Collapsed;
     public Brush? PresenceDotBrush { get; init; }
+    // The circle's colour too: without it the picker drew the person grey and the chat list purple.
+    public Brush? AvatarBrush { get; init; }
 
     public bool IsSelectable => State == GroupPickState.Available;
 

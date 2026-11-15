@@ -2,6 +2,7 @@
 name = "omni-rendezvous"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Serverless rendezvous core (cross-platform, no platform deps): the signed/encrypted presence
 # BEACON (AEAD under a per-pair-derived key, bound to a rotating blinded TOPIC, with TTL + nonce
@@ -12,10 +13,13 @@ edition.workspace = true
 # См. docs/decisions/serverless-bootstrap-rendezvous.md + docs/decisions/community-volunteer-nodes.md.
 
 [dependencies]
+omni-net-primitives = { path = "../omni-net-primitives" }
 hkdf.workspace = true
 sha2.workspace = true
 chacha20poly1305.workspace = true
 rand_core.workspace = true
+# A first-contact beacon is sealed to the inviter's key too (seal_beacon_to).
+x25519-dalek.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The relay bundle rides a beacon as raw bytes; its `om3relay:` token is base64url of them (wire.rs).

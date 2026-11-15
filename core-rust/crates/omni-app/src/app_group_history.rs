@@ -51,7 +51,7 @@ pub(crate) fn sign_own_line(storage: &Storage, group_id: &str, payload: &mut Gro
     let identity = storage
         .get_local_identity_key(&account.descriptor.account_id)?
         .ok_or_else(|| OmniError::Internal("no identity key".into()))?;
-    let bytes = group_line_signing_bytes(group_id, &payload.message_id, payload.kind, &payload.body, payload.authored_at_unix_ms);
+    let bytes = group_line_signing_bytes(group_id, &payload.message_id, payload.kind, &payload.body, payload.authored_at_unix_ms, payload.reply_to.as_deref(), &payload.mentions);
     let signature = omni_crypto::sign_message(&identity.protected_signing_private_key, &bytes)?;
     let signature_b64 = B64.encode(&signature.bytes);
     payload.signature_b64 = Some(signature_b64.clone());
@@ -65,6 +65,8 @@ pub(crate) fn sign_own_line(storage: &Storage, group_id: &str, payload: &mut Gro
             body: payload.body.clone(),
             authored_at_unix_ms: payload.authored_at_unix_ms,
             signature_b64,
+            reply_to: payload.reply_to.clone(),
+            mentions: payload.mentions.clone(),
         },
     )
 }
@@ -76,6 +78,8 @@ fn line_signature_holds(
     kind: GroupAppKindV1,
     body: &str,
     authored_at_unix_ms: i64,
+    reply_to: Option<&str>,
+    mentions: &[String],
     sender_pub: &str,
     signature_b64: &str,
 ) -> bool {
@@ -90,7 +94,7 @@ fn line_signature_holds(
     let Ok(signature) = B64.decode(signature_b64) else {
         return false;
     };
-    let bytes = group_line_signing_bytes(group_id, message_id, kind, body, authored_at_unix_ms);
+    let bytes = group_line_signing_bytes(group_id, message_id, kind, body, authored_at_unix_ms, reply_to, mentions);
     omni_crypto::verify_signature(&key, &bytes, &omni_crypto::Signature { bytes: signature }).is_ok()
 }
 
@@ -106,13 +110,22 @@ pub(crate) fn keep_member_line(storage: &Storage, group_id: &str, sender: &Membe
         payload.kind,
         &payload.body,
         payload.authored_at_unix_ms,
+        payload.reply_to.as_deref(),
+        &payload.mentions,
         &sender.member_pub,
         signature_b64,
     ) {
         omni_app_trace_log("group/history", &format!("group={group_id} line {} with a bad signature dropped", payload.message_id));
         return false;
     }
-    let _ = storage.record_group_signed_line(
+    // Shown, but not kept for newcomers when dated past what a newcomer takes: the packet is the
+    // latest lines by that date, and a member's lines dated i64::MAX filled it — the newcomer dropped
+    // them all and got none of the real history (blind audit 2026-11-12, pass 15).
+    if payload.authored_at_unix_ms > crate::current_unix_ms() + HISTORY_CLOCK_SKEW_MS {
+        omni_app_trace_log("group/history", &format!("group={group_id} line {} dated ahead not kept for newcomers", payload.message_id));
+        return true;
+    }
+    if let Err(error) = storage.record_group_signed_line(
         group_id,
         &GroupSignedLine {
             message_id: payload.message_id.clone(),
@@ -122,8 +135,13 @@ pub(crate) fn keep_member_line(storage: &Storage, group_id: &str, sender: &Membe
             body: payload.body.clone(),
             authored_at_unix_ms: payload.authored_at_unix_ms,
             signature_b64: signature_b64.to_string(),
+            reply_to: payload.reply_to.clone(),
+            mentions: payload.mentions.clone(),
         },
-    );
+    ) {
+        // Shown all the same; only newcomers will not get it. Said here, not swallowed (pass 16).
+        omni_app_trace_log("group/history", &format!("group={group_id} line {} not kept for newcomers: {error}", payload.message_id));
+    }
     true
 }
 
@@ -131,9 +149,8 @@ pub(crate) fn keep_member_line(storage: &Storage, group_id: &str, sender: &Membe
 /// as many as fit.
 fn history_packet(storage: &Storage, group_id: &str, only_from: Option<&str>) -> OmniResult<Option<String>> {
     let mut lines: Vec<GroupHistoryLineV1> = storage
-        .list_recent_group_signed_lines(group_id, GROUP_HISTORY_MAX_LINES)?
+        .list_recent_group_signed_lines(group_id, GROUP_HISTORY_MAX_LINES, only_from)?
         .into_iter()
-        .filter(|line| only_from.is_none_or(|sender| line.sender_pub == sender))
         .filter_map(|line| {
             Some(GroupHistoryLineV1 {
                 kind: kind_of(&line.kind)?,
@@ -143,6 +160,8 @@ fn history_packet(storage: &Storage, group_id: &str, only_from: Option<&str>) ->
                 body: line.body,
                 authored_at_unix_ms: line.authored_at_unix_ms,
                 signature_b64: line.signature_b64,
+                reply_to: line.reply_to,
+                mentions: line.mentions,
             })
         })
         .collect();
@@ -185,22 +204,45 @@ pub(crate) fn send_history(storage: &Storage, group_id: &str, only_from: Option<
         body,
         authored_at_unix_ms: crate::current_unix_ms(),
         signature_b64: None,
+        reply_to: None,
+        mentions: Vec::new(),
     };
     crate::app_groups::send_app_payload(storage, group_id, &payload)?;
     omni_app_trace_log("group/history", &format!("group={group_id} history sent ({} bytes)", payload.body.len()));
     Ok(())
 }
 
-/// A history packet arrived. Each line counts only if its author's signature holds; a line we have
-/// is skipped, our own are skipped. Returns how many lines were added.
+/// How far ahead of our clock a history line may be dated.
+const HISTORY_CLOCK_SKEW_MS: i64 = 10 * 60 * 1000;
+
+/// A history packet arrived. A line counts only if its author is a member we know in this group and
+/// its signature holds, and it is not dated in the future; it is shown under the name the member's
+/// own card gives, not the one the line carries (V-14: any member could hand a newcomer lines signed
+/// with a key of its own under another member's name, at any time). A line of someone who left
+/// before we came is refused with them — we cannot tell they were ever in. A line we have is
+/// skipped, our own are skipped. Returns how many lines were added.
 pub(crate) fn receive_history(storage: &Storage, group_id: &str, group: &GroupRecord, payload: &GroupAppPayloadV1) -> OmniResult<usize> {
     let packet: GroupHistoryPacketV1 = serde_json::from_str(&payload.body)
         .map_err(|e| OmniError::InvalidInput(format!("group history: {e}")))?;
     omni_protocol::validate_group_history_packet_v1(&packet)?;
+    let members: std::collections::HashMap<String, String> = storage
+        .list_group_members(group_id)?
+        .into_iter()
+        .map(|member| (member.member_pub, member.display_name))
+        .collect();
+    let latest = crate::current_unix_ms() + HISTORY_CLOCK_SKEW_MS;
     let mut added = 0;
     let mut refused = 0;
     for line in &packet.lines {
         if line.sender_pub == group.my_member_pub || storage.message_exists(&line.message_id)? {
+            continue;
+        }
+        let Some(member_name) = members.get(&line.sender_pub) else {
+            refused += 1;
+            continue;
+        };
+        if line.authored_at_unix_ms > latest {
+            refused += 1;
             continue;
         }
         if !line_signature_holds(
@@ -209,6 +251,8 @@ pub(crate) fn receive_history(storage: &Storage, group_id: &str, group: &GroupRe
             line.kind,
             &line.body,
             line.authored_at_unix_ms,
+            line.reply_to.as_deref(),
+            &line.mentions,
             &line.sender_pub,
             &line.signature_b64,
         ) {
@@ -218,7 +262,8 @@ pub(crate) fn receive_history(storage: &Storage, group_id: &str, group: &GroupRe
         let sender = MemberCard {
             member_pub: line.sender_pub.clone(),
             account_id: String::new(),
-            display_name: line.sender_name.clone(),
+            display_name: member_name.clone(),
+            device_chain: String::new(),
         };
         let as_payload = GroupAppPayloadV1 {
             message_id: line.message_id.clone(),
@@ -226,17 +271,31 @@ pub(crate) fn receive_history(storage: &Storage, group_id: &str, group: &GroupRe
             body: line.body.clone(),
             authored_at_unix_ms: line.authored_at_unix_ms,
             signature_b64: Some(line.signature_b64.clone()),
+            reply_to: line.reply_to.clone(),
+            mentions: line.mentions.clone(),
         };
+        // Deleted here: no one's history brings it back.
+        if storage.message_is_deleted(&line.message_id).unwrap_or(false) {
+            continue;
+        }
         let taken = match line.kind {
             GroupAppKindV1::Text => storage
-                .insert_incoming_message(&line.message_id, &group.dialog_key, &line.body, line.authored_at_unix_ms)
+                .insert_incoming_message(
+                    &line.message_id,
+                    &group.dialog_key,
+                    &line.body,
+                    crate::app_groups::shown_line_time(line.authored_at_unix_ms, crate::current_unix_ms()),
+                )
+                .and_then(|_| storage.remember_received_message_reply(&line.message_id, line.reply_to.as_deref()))
+                .and_then(|_| storage.remember_message_mentions(&line.message_id, &line.mentions))
                 .and_then(|_| {
-                    storage.insert_group_message_meta(
+                    // A line of the past: not a new line for an agent's read place.
+                    storage.insert_group_history_message_meta(
                         group_id,
                         &GroupMessageMeta {
                             message_id: line.message_id.clone(),
                             sender_pub: Some(line.sender_pub.clone()),
-                            sender_name: line.sender_name.clone(),
+                            sender_name: member_name.clone(),
                             kind: "text".into(),
                         },
                     )
@@ -246,8 +305,12 @@ pub(crate) fn receive_history(storage: &Storage, group_id: &str, group: &GroupRe
         };
         match taken {
             Ok(()) => {
+                // Its author took it back before it came here (a deletion that waited for it).
+                if crate::app_message_actions::apply_pending_message_deletes(storage, &line.message_id).unwrap_or(false) {
+                    continue;
+                }
                 // The group's past handed to a newcomer is not news: it does not light the counter.
-                let _ = storage.mark_dialog_read_through(&group.dialog_key, line.authored_at_unix_ms);
+                let _ = storage.mark_dialog_read_through_history_line(&group.dialog_key, line.authored_at_unix_ms, &line.message_id);
                 keep_member_line(storage, group_id, &sender, &as_payload);
                 added += 1;
             }
@@ -256,7 +319,7 @@ pub(crate) fn receive_history(storage: &Storage, group_id: &str, group: &GroupRe
     }
     omni_app_trace_log(
         "group/history",
-        &format!("group={group_id} history: +{added} line(s), {refused} with a bad signature refused"),
+        &format!("group={group_id} history: +{added} line(s), {refused} refused (unknown author, bad signature or dated ahead)"),
     );
     Ok(added)
 }

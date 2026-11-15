@@ -5,9 +5,9 @@ using Microsoft.UI.Xaml.Media;
 
 namespace Omni.Windows.App.Features.Chats;
 
-/// The peer of the open 1:1 dialog as the transcript draws it: one instance shared by all message
+/// The other side's look as a message row draws it. In a 1:1 dialog one instance is shared by all
 /// items, so a new avatar or name reaches every incoming row without touching them one by one.
-internal sealed class ChatTranscriptPeer : INotifyPropertyChanged
+public sealed class ChatTranscriptPeer : INotifyPropertyChanged
 {
     private string avatarText = "?";
     private ImageSource? avatarImage;

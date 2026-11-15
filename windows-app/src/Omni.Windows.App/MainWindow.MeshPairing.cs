@@ -27,7 +27,7 @@ public sealed partial class MainWindow
             string reachability = string.Empty;
             try
             {
-                reachability = FormatNodeReachability(rustBridge.MeshConnectionState().Node);
+                reachability = FormatNodeReachability(MeshStateForScreen().Node);
             }
             catch (Exception)
             {

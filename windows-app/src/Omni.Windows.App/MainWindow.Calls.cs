@@ -120,9 +120,9 @@ public sealed partial class MainWindow
         callVideoService.PreferredCameraId = LoadPreferredCameraId();
     }
 
-    // Lazy, runs on first Settings view: enumerate cameras and fill the combo. Deferred off the
-    // boot path so camera enumeration (and its MF sensor stack) only happens when the user opens
-    // Settings. Guarded so it runs once; a failure leaves the guard clear for a retry.
+    // Lazy, runs on the first visit to «Звонки»: enumerate cameras and fill the combo. Deferred off
+    // the boot path so camera enumeration (and its MF sensor stack) only happens when somebody opens
+    // that page. Guarded so it runs once; a failure leaves the guard clear for a retry.
     private void EnsureCameraPickerPopulated()
     {
         if (cameraPickerPopulated)
@@ -206,9 +206,8 @@ public sealed partial class MainWindow
     {
         SettingsCameraSummaryTextBlock.Text = cameraCount switch
         {
-            0 => "Камеры не найдены. Звонок идёт только со звуком, пока камера не появится.",
-            _ when selected.DeviceId is null => "Используется системная камера по умолчанию. Изменение применится при следующем включении камеры.",
-            _ => $"Выбрано: {selected.DisplayName}. Изменение применится при следующем включении камеры.",
+            0 => "Камера не найдена.",
+            _ => "Применится при следующем включении камеры.",
         };
     }
 
@@ -231,8 +230,8 @@ public sealed partial class MainWindow
     private const string MicrophonePreferenceKey = "microphoneDeviceId";
     private const string SpeakerPreferenceKey = "speakerDeviceId";
 
-    // On every Settings view (not once, like the camera): a headset plugged in while the window
-    // was open must show up the next time Settings is opened. Enumeration is a few COM calls, off
+    // On every visit to «Звонки» (not once, like the camera): a headset plugged in while the window
+    // was open must show up the next time the page is opened. Enumeration is a few COM calls, off
     // the UI thread.
     private async void RefreshAudioDevicePickers()
     {
@@ -289,9 +288,9 @@ public sealed partial class MainWindow
         SettingsAudioDevicesSummaryTextBlock.Text = (devices.Microphones.Count, devices.Speakers.Count) switch
         {
             (0, 0) => "Звуковые устройства не найдены.",
-            (0, _) => "Микрофон не найден — собеседник вас не услышит, пока он не появится.",
-            (_, 0) => "Динамики не найдены — собеседника не будет слышно, пока они не появятся.",
-            _ => "Изменение применится к следующему звонку.",
+            (0, _) => "Микрофон не найден.",
+            (_, 0) => "Динамики не найдены.",
+            _ => "Применится к следующему звонку.",
         };
     }
 
@@ -348,10 +347,10 @@ public sealed partial class MainWindow
         callVideoService.SetDevicePreferences(encodeKey, decodeKey);
     }
 
-    // Lazy, runs on first Settings view: populate the "Аппаратное ускорение видео" device
+    // Lazy, runs on the first visit to «Звонки»: populate the "Аппаратное ускорение видео" device
     // combos from the live capability probe. Deferred off the startup path (and off the UI
-    // thread) so the HW-codec/camera enumeration only happens when the user actually opens
-    // Settings — or after a call has already warmed the probe cache.
+    // thread) so the HW-codec/camera enumeration only happens when somebody actually opens
+    // that page — or after a call has already warmed the probe cache.
     private async void EnsureCallVideoDevicePickersPopulated()
     {
         if (callVideoDevicePickersInitialized)
@@ -363,10 +362,9 @@ public sealed partial class MainWindow
         try
         {
             (string encodeKey, string decodeKey) = LoadDevicePreferenceKeys();
-            IReadOnlyList<NativeVideoDevice> devices =
-                await Task.Run(() => NativeWebRtcMediaProbe.GetProbeResult().VideoDevices);
-            PopulateCallVideoDeviceCombo(CallVideoEncodeDeviceComboBox, CallVideoMediaDirection.Encode, devices, encodeKey);
-            PopulateCallVideoDeviceCombo(CallVideoDecodeDeviceComboBox, CallVideoMediaDirection.Decode, devices, decodeKey);
+            NativeWebRtcMediaProbeResult probe = await Task.Run(NativeWebRtcMediaProbe.GetProbeResult);
+            PopulateCallVideoDeviceCombo(CallVideoEncodeDeviceComboBox, CallVideoMediaDirection.Encode, probe, encodeKey);
+            PopulateCallVideoDeviceCombo(CallVideoDecodeDeviceComboBox, CallVideoMediaDirection.Decode, probe, decodeKey);
         }
         catch
         {
@@ -379,10 +377,11 @@ public sealed partial class MainWindow
     private void PopulateCallVideoDeviceCombo(
         ComboBox combo,
         CallVideoMediaDirection direction,
-        IReadOnlyList<NativeVideoDevice> devices,
+        NativeWebRtcMediaProbeResult probe,
         string selectedKey)
     {
-        IReadOnlyList<CallVideoDeviceOption> options = CallVideoDeviceSelection.BuildOptions(direction, devices);
+        IReadOnlyList<CallVideoDeviceOption> options = CallVideoDeviceSelection.BuildOptions(
+            direction, probe.VideoDevices, probe.HardwareEncoderVendors);
         CallVideoDeviceOption selected = options
             .FirstOrDefault(option => string.Equals(option.Key, selectedKey, StringComparison.OrdinalIgnoreCase))
             ?? options[0];
@@ -400,7 +399,7 @@ public sealed partial class MainWindow
         }
     }
 
-    private void OnCallVideoDeviceSelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void OnCallVideoDeviceSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (suppressCallVideoDeviceSelection)
         {
@@ -412,9 +411,19 @@ public sealed partial class MainWindow
         string decodeKey = (CallVideoDecodeDeviceComboBox.SelectedItem as CallVideoDeviceOption)?.Key
             ?? CallVideoDeviceSelection.AutoKey;
 
-        callVideoService.SetDevicePreferences(encodeKey, decodeKey);
         SaveDevicePreferenceKeys(encodeKey, decodeKey);
-        SetActionStatus("Устройство видео обновлено. Применится при следующем звонке или перенастройке.");
+        try
+        {
+            bool appliedInCall = await callVideoService.ApplyDevicePreferencesAsync(encodeKey, decodeKey);
+            SetActionStatus(appliedInCall
+                ? "Устройство видео обновлено и уже работает в звонке."
+                : "Устройство видео обновлено. Применится в следующем звонке.");
+        }
+        catch (Exception ex)
+        {
+            // Saved and set either way: the next call uses it even if this call could not switch.
+            SetActionStatus($"Устройство видео сохранено, но в этом звонке не переключилось: {ex.Message}");
+        }
     }
 
     private (string EncodeKey, string DecodeKey) LoadDevicePreferenceKeys()
@@ -813,7 +822,9 @@ public sealed partial class MainWindow
         }
         CallOverlayHost.SetChromeAutoHide(shown && !overlay.IdentityVisible);
         ChatCallVideoGrid.Visibility = overlay.VideoGridVisible ? Visibility.Visible : Visibility.Collapsed;
-        CallVideoDiagnosticsTextBlock.Visibility = overlay.VideoGridVisible ? Visibility.Visible : Visibility.Collapsed;
+        // CallVideoDiagnosticsTextBlock is NOT tied to the video grid: it is the hidden source of the
+        // Diagnostics > Media page (FactRows.Mirror copies its Visibility too), and the side that only
+        // shows its screen, or a call without video, has no grid - the page went blank there.
         // The identity card already says what we wait for; the placeholder line only speaks when the
         // card is not there — otherwise the two texts were drawn on top of each other.
         RemoteCallVideoPlaceholderTextBlock.Visibility = overlay.RemotePlaceholderVisible && !overlay.IdentityVisible

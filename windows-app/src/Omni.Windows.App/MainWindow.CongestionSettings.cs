@@ -10,7 +10,6 @@ namespace Omni.Windows.App;
 public sealed partial class MainWindow
 {
     private bool suppressCongestionSelection;
-    private bool congestionVisibilityWired;
 
     // Ручной выбор контроллера перегрузки — устройственная настройка в device-preferences.json
     // (ключ "congestionControl"), та же плита чтения-записи, что у темы и камеры.
@@ -41,29 +40,9 @@ public sealed partial class MainWindow
             suppressCongestionSelection = false;
         }
 
-        // Строка состояния спрашивает ядро, а на старте окна оно часто ещё холодное — тот же
-        // приём, что у списка узлов: перечитать при показе раздела.
-        if (!congestionVisibilityWired)
-        {
-            SettingsSectionRoot.RegisterPropertyChangedCallback(
-                Microsoft.UI.Xaml.UIElement.VisibilityProperty,
-                OnSettingsVisibilityChangedForCongestion);
-            congestionVisibilityWired = true;
-        }
-
+        // Строка состояния спрашивает ядро, а на старте окна оно часто ещё холодное: страница
+        // перечитает её при показе (MainWindow.SettingsPages.cs).
         RefreshCongestionStatusText(stored);
-    }
-
-    private void OnSettingsVisibilityChangedForCongestion(
-        Microsoft.UI.Xaml.DependencyObject sender,
-        Microsoft.UI.Xaml.DependencyProperty dp)
-    {
-        if (SettingsSectionRoot.Visibility != Microsoft.UI.Xaml.Visibility.Visible)
-        {
-            return;
-        }
-
-        DispatcherQueue.TryEnqueue(() => RefreshCongestionStatusText(LoadPersistedCongestionMode()));
     }
 
     private void OnSettingsCongestionSelectionChanged(object sender, SelectionChangedEventArgs e)

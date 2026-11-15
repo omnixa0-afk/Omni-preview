@@ -82,17 +82,18 @@ impl OmniApp {
         let mut active_remote_bundle = self.transport.active_remote_prekey_bundle();
 
         for _ in 0..attempts {
-            let has_established_session = remote_account_id
-                .as_ref()
-                .and_then(|value| {
-                    self.storage
-                        .get_latest_session_for_remote_account(&AccountId(value.clone()))
-                        .ok()
-                        .flatten()
-                })
-                .is_some_and(|session| {
-                    session.bootstrap_state == omni_crypto::SessionBootstrapState::Established
-                });
+            // Sessions are read under the session lock (F6, audit 2026-11-09 #5) — taken for the read
+            // only, so the wait does not hold up the handler that may be setting the session up.
+            let has_established_session = remote_account_id.as_ref().is_some_and(|value| {
+                let Ok(_session_guard) = lock_app_session_guard(&self.session_lock) else { return false };
+                self.storage
+                    .get_latest_session_for_remote_account(&AccountId(value.clone()))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|session| {
+                        session.bootstrap_state == omni_crypto::SessionBootstrapState::Established
+                    })
+            });
             if remote_account_id.is_some() && (active_remote_bundle.is_some() || has_established_session)
             {
                 break;
@@ -279,108 +280,19 @@ impl OmniApp {
             initiator_device_certificate_chain_json: local_device_certificate_chain_json(
                 &self.storage,
             )?,
+            invite_claim_hex: None,
         })
     }
 
+    /// Accept a peer's session bootstrap as the responder. The same path as a bootstrap arriving
+    /// over the transport (`transport_accept_session_bootstrap`): verified against its device
+    /// certificate chain and our signed prekey before anything is recorded, replays ignored.
     pub fn accept_session_bootstrap(
         &self,
         message: &SessionBootstrapMessageV1,
     ) -> OmniResult<()> {
         let _ = self.ensure_runtime_profile_active("accept_session_bootstrap")?;
-        validate_session_bootstrap_message_v1(message)?;
-        self.storage.ensure_local_crypto_foundation(current_unix_ms())?;
-
-        let active_profile = self.current_active_profile_context_required()?;
-        let account = active_profile.account;
-        let device = active_profile.device;
-        let local_identity_key = self
-            .storage
-            .get_local_identity_key(&account.descriptor.account_id)?
-            .ok_or_else(|| OmniError::Storage("local identity key is missing".to_string()))?;
-        let local_device_key = self
-            .storage
-            .get_local_device_key(&device.device_id)?
-            .ok_or_else(|| OmniError::Storage("local device key is missing".to_string()))?;
-        let session_address = omni_crypto::SessionAddress {
-            remote_account_id: AccountId(message.initiator_account_id.clone()),
-            remote_device_id: DeviceId(message.initiator_device_id.clone()),
-        };
-        let has_approved_contact = self
-            .storage
-            .find_contact_by_remote_account_id(&AccountId(message.initiator_account_id.clone()))?
-            .is_some_and(|contact| {
-                contact.relationship_state == omni_identity::ContactRelationshipState::Approved
-            });
-        // Same collision-echo guard as the transport path: read the peer's newest-seen bootstrap
-        // mark before recording this one, and record it either way so re-deliveries are recognised.
-        let db_path = self.storage.db_path().to_string_lossy().to_string();
-        let last_seen_bootstrap_created_at = last_inbound_bootstrap_created_at(
-            &db_path,
-            &message.initiator_account_id,
-            &message.initiator_device_id,
-        );
-        record_inbound_bootstrap_created_at(
-            &db_path,
-            &message.initiator_account_id,
-            &message.initiator_device_id,
-            message.created_at_unix_ms,
-        );
-        if let Some(existing_session) = self.storage.get_session_record(&session_address)? {
-            if existing_session_should_absorb_incoming_bootstrap(
-                &account.descriptor.account_id,
-                &device.device_id,
-                &existing_session,
-                message,
-                has_approved_contact,
-                last_seen_bootstrap_created_at,
-            ) {
-                return Ok(());
-            }
-        }
-        let signed_prekey = self
-            .storage
-            .get_active_signed_prekey(&device.device_id)?
-            .ok_or_else(|| OmniError::Storage("active signed prekey is missing".to_string()))?;
-        let one_time_prekey = match message.remote_one_time_prekey_id {
-            Some(expected_id) => {
-                let candidate = self
-                    .storage
-                    .get_one_time_prekey_for_inbound_bootstrap(&device.device_id, expected_id, current_unix_ms())?
-                    .ok_or_else(|| {
-                        OmniError::Storage("expected one-time prekey is missing".to_string())
-                    })?;
-                Some(candidate)
-            }
-            None => None,
-        };
-
-        let bootstrap = session_bootstrap_from_protocol(message)?;
-        let session = bootstrap_responder_session(
-            &account.descriptor.account_id,
-            &local_identity_key,
-            &local_device_key,
-            &signed_prekey,
-            one_time_prekey.as_ref(),
-            &bootstrap,
-            current_unix_ms(),
-        )?;
-        let mut session = establish_session(&session, current_unix_ms());
-        self.storage.replace_session_record(&mut session)?;
-        let replay_window = self
-            .storage
-            .ensure_replay_window(&session.session_address, current_unix_ms())?;
-        self.storage.store_replay_window(&replay_window)?;
-
-        if let Some(prekey) = one_time_prekey {
-            self.storage
-                .mark_one_time_prekey_consumed(
-                    &prekey.device_id,
-                    prekey.prekey_id,
-                    current_unix_ms(),
-                )?;
-        }
-
-        Ok(())
+        transport_accept_session_bootstrap(&self.storage, message).map(|_| ())
     }
 
     pub fn refresh_contact_request_on_active_transport(&self) -> OmniResult<TransportCommandResult> {
@@ -411,28 +323,6 @@ impl OmniApp {
             .map(|contact| contact.petname)
             .unwrap_or_else(|| remote_account_id.clone());
 
-        let exact_active_session = active_remote_bundle
-            .as_ref()
-            .map(|bundle| {
-                self.storage.get_session_record(&omni_crypto::SessionAddress {
-                    remote_account_id: AccountId(bundle.account.account_id.clone()),
-                    remote_device_id: DeviceId(bundle.device.device_id.clone()),
-                })
-            })
-            .transpose()?
-            .flatten()
-            .filter(|value| {
-                value.bootstrap_state == omni_crypto::SessionBootstrapState::Established
-            });
-        // The request goes out on the active dialog, so the session must be that dialog's device's.
-        let active_dialog_session = match active_dialog_key.as_deref() {
-            Some(dialog_key) => self.storage.get_session_for_dialog(&remote_account, dialog_key)?,
-            None => self.storage.get_latest_session_for_remote_account(&remote_account)?,
-        };
-        let fallback_established_session = active_dialog_session.filter(|value| {
-            value.bootstrap_state == omni_crypto::SessionBootstrapState::Established
-        });
-
         let remote_bundle = if let Some(bundle) = active_remote_bundle {
             if bundle.account.account_id != remote_account.0 {
                 return Err(OmniError::Transport(
@@ -452,7 +342,18 @@ impl OmniApp {
             .storage
             .get_latest_remote_prekey_bundle_for_account(&remote_account)? };
         let Some(mut remote_bundle) = remote_bundle else {
-            if let Some(session) = exact_active_session.or(fallback_established_session) {
+            // The session is read under the lock it is sent under (F6, audit 2026-11-09 #5): a copy
+            // read before could be one another thread advanced or reset meanwhile, and the send used
+            // to fall back to it when the reload found none — writing a stale ratchet back and sending
+            // from it. The request goes out on the active dialog, so the session must be that dialog's
+            // device's.
+            let session_guard = lock_app_session_guard(&self.session_lock)?;
+            let established = match active_dialog_key.as_deref() {
+                Some(dialog_key) => self.storage.get_session_for_dialog(&remote_account, dialog_key)?,
+                None => self.storage.get_latest_session_for_remote_account(&remote_account)?,
+            }
+            .filter(|value| value.bootstrap_state == omni_crypto::SessionBootstrapState::Established);
+            if let Some(session) = established {
                 omni_app_trace_log(
                     "refresh_request/branch",
                     &format!(
@@ -460,7 +361,7 @@ impl OmniApp {
                         session.bootstrap_state, active_dialog_key
                     ),
                 );
-                let _session_guard = lock_app_session_guard(&self.session_lock)?;
+                let _session_guard = session_guard;
                 let contact = self.storage.add_outgoing_pending_contact(
                     &AddContactInput {
                         petname: existing_petname,
@@ -474,8 +375,6 @@ impl OmniApp {
                 )?;
                 self.storage
                     .record_contact_presence_activity(&contact.contact_id, now_unix_ms)?;
-                let session = reload_established_session_under_lock(&self.storage, &session)?
-                    .unwrap_or(session);
                 let _ = self.send_contact_request_signal_for_session(
                     &session,
                     active_dialog_key.as_deref(),
@@ -489,6 +388,7 @@ impl OmniApp {
                 });
             }
 
+            drop(session_guard);
             omni_app_trace_log(
                 "refresh_request/branch",
                 "no_remote_bundle+NO_established_session — Err returned",
@@ -593,6 +493,7 @@ impl OmniApp {
                 initiator_device_certificate_chain_json: local_device_certificate_chain_json(
                     &self.storage,
                 )?,
+                invite_claim_hex: None,
             };
 
             let envelope = omni_messaging::wrap_session_bootstrap(bootstrap_v1)?;

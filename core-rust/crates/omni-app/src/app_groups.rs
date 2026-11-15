@@ -64,6 +64,9 @@ pub struct GroupSummary {
     /// Newcomers get the recent history (an admin's switch, on by default).
     #[serde(default = "newcomer_history_default")]
     pub newcomer_history: bool,
+    /// The group has git repositories (docs/decisions/omni-workspace-git.md): the chat list marks it.
+    #[serde(default)]
+    pub is_workspace: bool,
 }
 
 fn newcomer_history_default() -> bool {
@@ -121,6 +124,15 @@ pub struct GroupMessageView {
     /// The file or photo of an `attachment` line, with its transfer state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<omni_types::AttachmentRecord>,
+    /// The line this one answers, as its quote shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<omni_types::MessageReplyPreview>,
+    /// The emoji on it; `who` holds names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<omni_types::MessageReactionView>,
+    /// It is pinned in the group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 // --- MLS state at rest -------------------------------------------------------------------------
@@ -190,12 +202,16 @@ impl omni_group_mls::Codec for ProtectedCodec {
     }
 }
 
+/// The key the active profile's MLS state is sealed with — one per profile: with one per database
+/// two profiles in one group shared their OpenMLS rows, and a profile's copy carried the others' MLS
+/// secrets (blind audit 2026-11-12, pass 17). As the codec is deterministic, the key also keeps the
+/// rows of profiles apart: the same group id seals to another lookup key. The unsealed key is cached
+/// with the very record it came from, and the record is read each time: the key is the database's,
+/// not the process's. Cached by path alone, it outlived the record — the last profile's deletion
+/// wipes the MLS state with its key, a backup restored over the database brings another one — and
+/// new groups were sealed with a key no longer stored: unreadable after a restart (blind audit
+/// 2026-11-10).
 fn mls_storage_key(storage: &Storage) -> OmniResult<[u8; 32]> {
-    static CACHE: OnceLock<Mutex<HashMap<String, [u8; 32]>>> = OnceLock::new();
-    let db = storage.db_path().to_string_lossy().to_string();
-    if let Some(key) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&db).copied()) {
-        return Ok(key);
-    }
     if storage.get_mls_storage_key_protected()?.is_none() {
         let fresh = omni_crypto::generate_group_key();
         let protected = omni_crypto::protect_bytes(&fresh)?;
@@ -206,16 +222,63 @@ fn mls_storage_key(storage: &Storage) -> OmniResult<[u8; 32]> {
     let json = storage
         .get_mls_storage_key_protected()?
         .ok_or_else(|| OmniError::Internal("mls storage key vanished".into()))?;
+    unseal_mls_storage_key(storage, &json)
+}
+
+fn unseal_mls_storage_key(storage: &Storage, json: &str) -> OmniResult<[u8; 32]> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, [u8; 32])>>> = OnceLock::new();
+    let db = storage.db_path().to_string_lossy().to_string();
+    let cached = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&db).filter(|(record, _)| record == json).map(|(_, key)| *key));
+    if let Some(key) = cached {
+        return Ok(key);
+    }
     let protected: omni_crypto::ProtectedSecret =
-        serde_json::from_str(&json).map_err(|e| OmniError::Internal(format!("mls key: {e}")))?;
+        serde_json::from_str(json).map_err(|e| OmniError::Internal(format!("mls key: {e}")))?;
     let raw = omni_crypto::unprotect_bytes(&protected)?;
     let key: [u8; 32] = raw
+        .as_slice()
         .try_into()
         .map_err(|_| OmniError::Internal("mls storage key has a wrong size".into()))?;
     if let Ok(mut cache) = CACHE.get_or_init(Default::default).lock() {
-        cache.insert(db, key);
+        cache.insert(db, (json.to_string(), key));
     }
     Ok(key)
+}
+
+/// Whether one of a row's blob values was sealed by the codec with `key`: the row is that profile's.
+fn sealed_with(key: &[u8; 32], blobs: &[Vec<u8>]) -> bool {
+    use aes_gcm_siv::aead::{Aead, KeyInit};
+    let cipher = aes_gcm_siv::Aes256GcmSiv::new(key.into());
+    blobs.iter().any(|blob| {
+        blob.strip_prefix(CODEC_TAG.as_slice())
+            .is_some_and(|sealed| cipher.decrypt(&aes_gcm_siv::Nonce::default(), sealed).is_ok())
+    })
+}
+
+/// A profile's deletion: its MLS rows go, by the key they are sealed with, active profile or not —
+/// the rows were not profile-scoped and stayed on disk (blind audit 2026-11-12, pass 17). The key
+/// itself goes with the profile's rows.
+pub(crate) fn forget_profile_mls(storage: &Storage, profile_id: &omni_identity::LocalProfileId) -> OmniResult<usize> {
+    let Some(json) = storage.mls_storage_key_protected_of(profile_id)? else {
+        return Ok(0);
+    };
+    // The database's old key, still held by another profile here: its rows are that one's too.
+    if storage.mls_storage_key_shared_with_another_profile(profile_id)? {
+        return Ok(0);
+    }
+    let key = unseal_mls_storage_key(storage, &json)?;
+    storage.retain_mls_rows(&|blobs| !sealed_with(&key, blobs))
+}
+
+/// A copy made for the active profile keeps its MLS rows alone: the others' are sealed with their
+/// own keys, which leave the copy with their profiles, but the rows themselves were theirs to keep.
+pub(crate) fn keep_own_mls_in_copy(storage: &Storage, copy: &Storage) -> OmniResult<usize> {
+    let key = mls_storage_key(storage)?;
+    copy.retain_mls_rows(&|blobs| sealed_with(&key, blobs))
 }
 
 /// Restores the previous thread-local key when the engine scope ends.
@@ -245,54 +308,236 @@ pub(crate) fn local_mls_identity(storage: &Storage) -> OmniResult<([u8; 32], Mem
         .get_local_identity_key(&account.descriptor.account_id)?
         .ok_or_else(|| OmniError::Internal("no identity key".into()))?;
     let seed = omni_crypto::mesh_identity_signing_key_bytes(&identity)?;
+    // The device chain makes the account in our card a fact the members check, not a claim.
+    let device_chain = storage
+        .get_local_device_certificate_chain()?
+        .map(|chain| B64.encode(chain.to_compact()))
+        .unwrap_or_default();
     Ok((
         seed,
         MemberCard {
             member_pub: B64.encode(identity.signing_public_key.0),
             account_id: account.descriptor.account_id.0.clone(),
             display_name: account.descriptor.display_name.clone(),
+            device_chain,
         },
     ))
 }
 
-/// Run `f` with this profile's MLS engine (own SQLite connection to the same database).
+/// The device a member card names, as its chain says (not yet verified — see [`check_member_card`]).
+pub(crate) fn card_device_chain(card: &MemberCard) -> Option<omni_crypto::DeviceCertificateChainV1> {
+    let bytes = B64.decode(&card.device_chain).ok()?;
+    omni_crypto::DeviceCertificateChainV1::from_compact(&bytes)
+}
+
+/// The MLS engine's check of a member card (`omni_group_mls::CardCheck`): its device chain holds, the
+/// chain's device key is the key that signs the leaf, and the card's account is the chain's. Before
+/// it, a member's KeyPackage could name any account — an admin's, to pass for them where the app
+/// trusts the account (a workspace review), or a server's own, to be served what only its own devices
+/// get (audit 2026-11-09, F01).
+fn check_member_card(card: &MemberCard, signature_key: &[u8]) -> Result<(), String> {
+    let chain = card_device_chain(card).ok_or_else(|| "the member card's device chain is unreadable".to_string())?;
+    omni_crypto::verify_device_certificate_chain(&chain).map_err(|error| format!("the member card's device chain: {error}"))?;
+    if chain.device.identity_signing_public_key.0.as_slice() != signature_key {
+        return Err("the member card's device chain is for another key".into());
+    }
+    if chain.account_id().0 != card.account_id {
+        return Err("the member card names another account than its device chain".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn mls_storage_key_for_tests(storage: &Storage) -> OmniResult<[u8; 32]> {
+    mls_storage_key(storage)
+}
+
+/// Tests: how many MLS rows of the database are sealed with `key`.
+#[cfg(test)]
+pub(crate) fn mls_rows_sealed_with_for_tests(storage: &Storage, key: &[u8; 32]) -> usize {
+    let count = std::cell::Cell::new(0);
+    storage
+        .retain_mls_rows(&|blobs| {
+            if sealed_with(key, blobs) {
+                count.set(count.get() + 1);
+            }
+            true
+        })
+        .unwrap();
+    count.get()
+}
+
+#[cfg(test)]
+pub(crate) fn check_member_card_for_tests(card: &MemberCard, signature_key: &[u8]) -> Result<(), String> {
+    check_member_card(card, signature_key)
+}
+
+/// The card with its account kept only when its device chain proves it, else empty. A card from
+/// before cards carried chains named its account unchecked (audit 2026-11-09, F01); its member puts
+/// the chain in on its next sweep (`refresh_own_cards_in_groups`).
+pub(crate) fn card_with_proven_account(card: &MemberCard) -> MemberCard {
+    let proven = !card.device_chain.is_empty()
+        && B64.decode(&card.member_pub).is_ok_and(|key| check_member_card(card, &key).is_ok());
+    if proven {
+        card.clone()
+    } else {
+        MemberCard { account_id: String::new(), ..card.clone() }
+    }
+}
+
+/// Put our card with its device chain into every group whose leaf of ours still carries one without
+/// (joined before cards carried chains): until then the members do not take our account as proven.
+/// Returns how many groups changed.
+pub(crate) fn refresh_own_cards_in_groups(storage: &Storage) -> usize {
+    let Ok(groups) = storage.list_groups() else {
+        return 0;
+    };
+    let mut changed = 0;
+    for group in groups.into_iter().filter(|g| g.my_status == "member") {
+        let Ok(gid) = group_id_bytes(&group.group_id) else { continue };
+        let refreshed = in_mls_transaction(storage, "group_own_commit", |storage| {
+            let commit = with_engine(storage, |engine| engine.refresh_own_card(&gid))?;
+            if let Some(commit) = &commit {
+                own_commit_bookkeeping(storage, &group.group_id, commit, &OwnChange::RefreshCard)?;
+            }
+            Ok(commit)
+        });
+        match refreshed {
+            Ok(Some(_)) => {
+                changed += 1;
+                crate::omni_app_trace_log("group/card", &format!("group={} our card now carries its device chain", group.group_id));
+            }
+            Ok(None) => {}
+            Err(error) => crate::omni_app_trace_log("group/card", &format!("group={} card not refreshed: {error}", group.group_id)),
+        }
+    }
+    changed
+}
+
+/// Whether a member card's device is one its account revoked, as far as we know (our own account's
+/// revocations always; another account's when it told us).
+pub(crate) fn card_device_revoked(storage: &Storage, card: &MemberCard) -> bool {
+    card_device_chain(card)
+        .is_some_and(|chain| storage.is_device_revoked(&chain.account_id(), &chain.device.device_id).unwrap_or(false))
+}
+
+/// Take revoked devices out of our groups: a revocation does not reach a group by itself, and a
+/// revoked device that ignores its order to wipe kept the group's keys (audit 2026-11-09, F02). We may
+/// remove a device of our own account in any group, any device as an admin; the members check that
+/// rule on the Commit. As an admin, also the members that said they left and are still in: their
+/// farewell's Commit failed or lost a race, and they held the epoch's keys (code audit 2026-11-09,
+/// OMNI-02). Returns how many groups changed.
+pub(crate) fn remove_revoked_and_departed_from_groups(storage: &Storage) -> usize {
+    let Ok(groups) = storage.list_groups() else {
+        return 0;
+    };
+    let mut changed = 0;
+    for group in groups.into_iter().filter(|g| g.my_status == "member") {
+        let Ok(gid) = group_id_bytes(&group.group_id) else { continue };
+        let Ok(view) = with_engine(storage, |engine| engine.view(&gid)) else { continue };
+        let we_are_admin = view.members.iter().any(|m| m.is_me && m.is_admin);
+        let left: std::collections::HashSet<String> = if we_are_admin {
+            storage
+                .list_group_members(&group.group_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.status == "left")
+                .map(|m| m.member_pub)
+                .collect()
+        } else {
+            Default::default()
+        };
+        let pubs: Vec<String> = view
+            .members
+            .iter()
+            .filter(|m| !m.is_me && (card_device_revoked(storage, &m.card) || left.contains(&m.card.member_pub)))
+            .map(|m| m.card.member_pub.clone())
+            .collect();
+        if pubs.is_empty() {
+            continue;
+        }
+        let removed = in_mls_transaction(storage, "group_own_commit", |storage| {
+            let commit = with_engine(storage, |engine| engine.remove_members(&gid, &pubs))?;
+            own_commit_bookkeeping(storage, &group.group_id, &commit, &OwnChange::Remove { member_pubs: pubs.clone() })
+        });
+        match removed {
+            Ok(()) => {
+                changed += 1;
+                crate::omni_app_trace_log("group/revoked", &format!("group={} removed {} revoked or departed device(s)", group.group_id, pubs.len()));
+            }
+            Err(error) => crate::omni_app_trace_log(
+                "group/revoked",
+                &format!("group={} {} revoked or departed device(s) not ours to remove: {error}", group.group_id, pubs.len()),
+            ),
+        }
+    }
+    changed
+}
+
+/// Run `f` with this profile's MLS engine, on the app's own connection and as one transaction (or
+/// inside the caller's): the engine had a connection of its own, so its Commit and the app's rows
+/// around it (the feed, the own change, the view) could not be one step — a failure between them
+/// left our MLS state an epoch ahead of a Commit nobody got (blind audit 2026-11-12, pass 17).
 pub(crate) fn with_engine<T>(
     storage: &Storage,
     f: impl FnOnce(&Engine<'_, ProtectedCodec>) -> omni_group_mls::Result<T>,
 ) -> OmniResult<T> {
-    static MIGRATED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let db = storage.db_path().to_path_buf();
-    // A keyed connection: the database is SQLCipher-encrypted (docs/decisions/db-at-rest-encryption.md).
-    let mut conn = Storage::open_keyed_connection(&db)?;
-    let key_text = db.to_string_lossy().to_string();
-    let needs_migration = MIGRATED
-        .get_or_init(Default::default)
-        .lock()
-        .map(|done| !done.contains(&key_text))
-        .unwrap_or(true);
-    if needs_migration {
-        Engine::<ProtectedCodec>::migrate(&mut conn).map_err(map_group_error)?;
-        if let Ok(mut done) = MIGRATED.get_or_init(Default::default).lock() {
-            done.insert(key_text);
-        }
-    }
     let key = mls_storage_key(storage)?;
     let _scope = KeyScope(MLS_STORAGE_KEY.with(|cell| cell.replace(Some(key))));
     let (seed, me) = local_mls_identity(storage)?;
-    let engine = Engine::<ProtectedCodec>::new(&conn, seed, me);
-    f(&engine).map_err(map_group_error)
+    in_mls_transaction(storage, "mls_step", |storage| {
+        let engine = Engine::<ProtectedCodec>::new(storage.connection_for_mls_engine(), seed, me).with_card_check(check_member_card);
+        f(&engine).map_err(map_group_error)
+    })
 }
 
-/// Profile delete: drop the MLS state of every group of the (still active) profile. The group rows
-/// themselves go with the profile's rows; the OpenMLS tables are not profile-scoped.
-pub(crate) fn forget_groups_mls(storage: &Storage) {
-    let Ok(groups) = storage.list_groups() else {
-        return;
-    };
-    for group in groups {
-        if let Ok(gid) = group_id_bytes(&group.group_id) {
-            let _ = with_engine(storage, |engine| engine.delete_group(&gid));
-        }
+/// One MLS step at a time: each loads the group, changes it and stores it, so two at once (a files
+/// project's thread sending beside the feed being taken in) stored one over the other and our next
+/// message reused a generation the members had used up — they dropped it and every later one until
+/// the counter caught up (live 2026-10-31). Reentrant: a step may call another; one lock for every
+/// profile, as only one is active.
+static ENGINE: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+
+/// `f` as one transaction that MLS steps are part of. The engine's lock is taken BEFORE the
+/// transaction begins, everywhere: a thread holding the lock and waiting for the database, while
+/// another held the database and waited for the lock, ended in "database is locked".
+pub(crate) fn in_mls_transaction<T>(storage: &Storage, name: &str, f: impl FnOnce(&Storage) -> OmniResult<T>) -> OmniResult<T> {
+    let _one_at_a_time = ENGINE.lock();
+    migrate_mls_tables(storage)?;
+    storage.with_immediate_transaction(name, f)
+}
+
+/// The databases whose MLS tables this process has brought up to date.
+static MLS_MIGRATED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// Bring the MLS tables up to date once per database and process, BEFORE any transaction of ours
+/// begins: the migrations want a connection of their own (a keyed one: the database is
+/// SQLCipher-encrypted, docs/decisions/db-at-rest-encryption.md), and run inside our open write
+/// transaction they waited on it — the first MLS step after a start that came inside one (a Commit
+/// taken in, a line sent) failed with "database is locked" (blind audit 2026-11-13, pass 18).
+fn migrate_mls_tables(storage: &Storage) -> OmniResult<()> {
+    let db = storage.db_path().to_path_buf();
+    let key_text = db.to_string_lossy().to_string();
+    let done = MLS_MIGRATED.get_or_init(Default::default).lock().map(|done| done.contains(&key_text)).unwrap_or(false);
+    if done {
+        return Ok(());
+    }
+    if storage.in_transaction() {
+        return Err(OmniError::Internal("the MLS tables are brought up to date outside a transaction".into()));
+    }
+    let mut conn = Storage::open_keyed_connection(&db)?;
+    Engine::<ProtectedCodec>::migrate(&mut conn).map_err(map_group_error)?;
+    if let Ok(mut done) = MLS_MIGRATED.get_or_init(Default::default).lock() {
+        done.insert(key_text);
+    }
+    Ok(())
+}
+
+/// Tests: this process has not brought `storage`'s MLS tables up to date (as after a start).
+#[cfg(test)]
+pub(crate) fn forget_mls_migrated_for_tests(storage: &Storage) {
+    if let Ok(mut done) = MLS_MIGRATED.get_or_init(Default::default).lock() {
+        done.remove(&storage.db_path().to_string_lossy().to_string());
     }
 }
 
@@ -354,6 +599,9 @@ pub(crate) enum OwnChange {
     /// We put back a member whose branch lost (`app_group_branches`). Not re-issued: if this Commit
     /// loses its epoch, the member asks again.
     PutBack { member_pub: String },
+    /// Our leaf took our card with its device chain (`refresh_own_cards_in_groups`). Not re-issued:
+    /// the next sweep sees the leaf without it and does it again.
+    RefreshCard,
 }
 
 // --- the shell-facing API ----------------------------------------------------------------------
@@ -368,22 +616,26 @@ impl OmniApp {
         }
         let gid = omni_crypto::generate_group_key()[..16].to_vec();
         let group_id = hex::encode(&gid);
-        with_engine(&self.storage, |engine| engine.create_group(&gid, name))?;
-        let (_, me) = local_mls_identity(&self.storage)?;
         let now = current_unix_ms();
-        self.storage.upsert_group(&GroupRecord {
-            group_id: group_id.clone(),
-            name: name.to_string(),
-            my_member_pub: me.member_pub,
-            my_status: "member".into(),
-            dialog_key: group_dialog_key(&group_id),
-            created_at_unix_ms: now,
-            updated_at_unix_ms: now,
+        // The group's MLS state and its row here as one: apart, a failure between them left MLS state
+        // of a group nobody sees (blind audit 2026-11-13, pass 18).
+        in_mls_transaction(&self.storage, "group created", |storage| {
+            with_engine(storage, |engine| engine.create_group(&gid, name))?;
+            let (_, me) = local_mls_identity(storage)?;
+            storage.upsert_group(&GroupRecord {
+                group_id: group_id.clone(),
+                name: name.to_string(),
+                my_member_pub: me.member_pub,
+                my_status: "member".into(),
+                dialog_key: group_dialog_key(&group_id),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })?;
+            let view = with_engine(storage, |engine| engine.view(&gid))?;
+            apply_view(storage, &group_id, &view, now)?;
+            insert_system_line(storage, &group_id, &format!("Группа «{name}» создана"), now)
         })?;
-        let view = with_engine(&self.storage, |engine| engine.view(&gid))?;
-        apply_view(&self.storage, &group_id, &view, now)?;
         self.resubscribe_group(&group_id);
-        insert_system_line(&self.storage, &group_id, &format!("Группа «{name}» создана"), now)?;
         self.group_summary(&group_id)?
             .ok_or_else(|| OmniError::Internal("group vanished after create".into()))
     }
@@ -501,9 +753,12 @@ impl OmniApp {
         let db_path = self.storage.db_path().to_string_lossy().into_owned();
         // Our other devices' leaves: what they wrote is ours, as a sent copy is in a 1:1 chat.
         let my_account = self.storage.get_local_account()?.map(|a| a.descriptor.account_id.0).unwrap_or_default();
-        let own_pubs: std::collections::HashSet<String> = self
-            .storage
-            .list_group_members(group_id)?
+        let members = self.storage.list_group_members(group_id)?;
+        // "<name> · <owner's agent>": whose agent wrote it (docs/decisions/omni-workspace-git.md section 5).
+        let agent_labels = crate::app_workspace::agents::labels(&self.storage, &members);
+        let names_by_account: HashMap<String, String> =
+            members.iter().map(|m| (m.account_id.clone(), m.display_name.clone())).collect();
+        let own_pubs: std::collections::HashSet<String> = members
             .into_iter()
             .filter(|m| !m.account_id.is_empty() && m.account_id == my_account)
             .map(|m| m.member_pub)
@@ -518,13 +773,32 @@ impl OmniApp {
                     || m.and_then(|m| m.sender_pub.as_ref()).is_some_and(|pub_key| own_pubs.contains(pub_key));
                 GroupMessageView {
                     sender_pub: m.and_then(|m| m.sender_pub.clone()),
-                    sender_name: m.map(|m| m.sender_name.clone()).unwrap_or_default(),
+                    sender_name: m
+                        .map(|m| {
+                            let label = m.sender_pub.as_ref().and_then(|p| agent_labels.get(p)).map(String::as_str).unwrap_or("");
+                            format!("{}{label}", m.sender_name)
+                        })
+                        .unwrap_or_default(),
                     kind: m.map(|m| m.kind.clone()).unwrap_or_else(|| "text".into()),
                     is_mine,
                     status: format!("{:?}", record.status).to_lowercase(),
                     message_id: record.id,
                     body: record.body,
                     created_at_unix_ms: record.created_at_unix_ms,
+                    reply: record.reply,
+                    pinned: record.pinned,
+                    reactions: record
+                        .reactions
+                        .into_iter()
+                        .map(|mut reaction| {
+                            for who in reaction.who.iter_mut() {
+                                if let Some(name) = names_by_account.get(who.as_str()) {
+                                    *who = name.clone();
+                                }
+                            }
+                            reaction
+                        })
+                        .collect(),
                     attachment: record.attachment.map(|mut attachment| {
                         // How many members it is coming from right now (stage 3: several at once).
                         attachment.source_count =
@@ -537,6 +811,12 @@ impl OmniApp {
     }
 
     pub fn send_group_text(&self, group_id: &str, body: &str) -> OmniResult<()> {
+        self.send_group_line(group_id, body, None, &[])
+    }
+
+    /// A text line that answers `reply_to` (a line of the same group) and names members: `picked` are
+    /// the accounts chosen in the suggestion list (`app_group_mentions`).
+    pub fn send_group_line(&self, group_id: &str, body: &str, reply_to: Option<&str>, picked: &[String]) -> OmniResult<()> {
         let _ = self.ensure_runtime_profile_active("send_group_text")?;
         let body = body.trim();
         if body.is_empty() {
@@ -559,20 +839,27 @@ impl OmniApp {
             body: body.to_string(),
             authored_at_unix_ms: now,
             signature_b64: None,
+            reply_to: reply_to.map(str::to_string),
+            mentions: crate::app_group_mentions::resolve_mentions(&self.storage.list_group_members(group_id)?, body, picked)?,
         };
+        self.storage.remember_message_mentions(&payload.message_id, &payload.mentions)?;
+        // Before the signed line is kept: a newcomer's history reads it from here.
+        self.storage.remember_message_reply(&payload.message_id, &group.dialog_key, reply_to)?;
+        payload.reply_to = self.storage.message_reply_to(&payload.message_id)?;
         crate::app_group_history::sign_own_line(&self.storage, group_id, &mut payload, &me)?;
-        send_app_payload(&self.storage, group_id, &payload)?;
-        self.storage
-            .insert_group_outgoing_message(&payload.message_id, &group.dialog_key, body, now)?;
-        self.storage.insert_group_message_meta(
-            group_id,
-            &GroupMessageMeta {
-                message_id: payload.message_id,
-                sender_pub: Some(me.member_pub),
-                sender_name: me.display_name,
-                kind: "text".into(),
-            },
-        )?;
+        // The line in our thread and in the group's queue, as one (blind audit 2026-11-11, pass 13).
+        act_and_say(&self.storage, group_id, &payload, |storage| {
+            storage.insert_group_outgoing_message(&payload.message_id, &group.dialog_key, body, now)?;
+            storage.insert_group_message_meta(
+                group_id,
+                &GroupMessageMeta {
+                    message_id: payload.message_id.clone(),
+                    sender_pub: Some(me.member_pub.clone()),
+                    sender_name: me.display_name.clone(),
+                    kind: "text".into(),
+                },
+            )
+        })?;
         self.flush_group_feed();
         Ok(())
     }
@@ -586,6 +873,8 @@ impl OmniApp {
         source_file_path: &str,
         display_file_name: Option<&str>,
         as_photo: bool,
+        recording: Option<omni_types::AttachmentPresentationKindV1>,
+        reply_to: Option<&str>,
     ) -> OmniResult<()> {
         let _ = self.ensure_runtime_profile_active("send_group_attachment")?;
         let source_file_path = source_file_path.trim();
@@ -599,9 +888,10 @@ impl OmniApp {
         let group = self.active_group(group_id)?;
         let message_id = random_id("g-");
         let now = current_unix_ms();
+        self.storage.remember_message_reply(&message_id, &group.dialog_key, reply_to)?;
         // The file first: one this app cannot take (or a picture it cannot read) fails here,
         // before the thread shows a message.
-        let staged = crate::stage_outgoing_photo_if_asked(&self.storage, &message_id, source_file_path, as_photo)?;
+        let staged = crate::stage_outgoing_photo_if_asked(&self.storage, &message_id, source_file_path, as_photo, recording)?;
         let runtime = crate::register_outgoing_attachment(
             &self.storage,
             &message_id,
@@ -615,20 +905,25 @@ impl OmniApp {
         // A big file is still being read: the line shows now, the preparation sends its offer
         // (`send_prepared_group_attachment_offer`).
         let preparing = runtime.attachment.state == omni_types::AttachmentTransferState::Preparing;
-        if !preparing {
-            send_group_attachment_offer(&self.storage, group_id, &runtime, body, now)?;
-        }
         let (_, me) = local_mls_identity(&self.storage)?;
-        self.storage.insert_group_outgoing_message(&message_id, &group.dialog_key, body, now)?;
-        self.storage.insert_group_message_meta(
-            group_id,
-            &GroupMessageMeta {
-                message_id,
-                sender_pub: Some(me.member_pub),
-                sender_name: me.display_name,
-                kind: "attachment".into(),
-            },
-        )?;
+        // The offer on the group's queue and our line with its author, as one: the offer was queued
+        // first, and a failure (or a crash) before the line sent the members a file its sender's
+        // thread did not show (blind audit 2026-11-13, pass 19).
+        in_mls_transaction(&self.storage, "group attachment", |storage| {
+            if !preparing {
+                send_group_attachment_offer(storage, group_id, &runtime, body, now)?;
+            }
+            storage.insert_group_outgoing_message(&message_id, &group.dialog_key, body, now)?;
+            storage.insert_group_message_meta(
+                group_id,
+                &GroupMessageMeta {
+                    message_id: message_id.clone(),
+                    sender_pub: Some(me.member_pub.clone()),
+                    sender_name: me.display_name.clone(),
+                    kind: "attachment".into(),
+                },
+            )
+        })?;
         self.flush_group_feed();
         Ok(())
     }
@@ -647,7 +942,12 @@ impl OmniApp {
                 renew: false,
                 authored_at_unix_ms: current_unix_ms(),
             };
-            send_control_1to1(&self.storage, &self.transport, dialog_key, GroupControlKind::Invite, &invite)?;
+            {
+                // The public methods send under the session lock, like every other sender (B05,
+                // audit 2026-11-09 #6); the retry on a stale write stays as a second line.
+                let _session_guard = crate::lock_app_session_guard(&self.session_lock)?;
+                send_control_1to1(&self.storage, &self.transport, dialog_key, GroupControlKind::Invite, &invite)?;
+            }
             let now = current_unix_ms();
             self.storage.record_group_sent_invite(group_id, dialog_key, now)?;
             // Only we see this line: the invitation goes over 1:1, not through the group.
@@ -696,6 +996,7 @@ impl OmniApp {
             return Err(OmniError::InvalidInput("no such invitation".into()));
         }
         let withdraw = GroupInviteDeclineV2 { version: GROUP_WIRE_VERSION_V2, group_id: group_id.to_string() };
+        let _session_guard = crate::lock_app_session_guard(&self.session_lock)?;
         let _ = send_control_1to1(&self.storage, &self.transport, dialog_key, GroupControlKind::InviteDecline, &withdraw);
         let name = contact_name_for_dialog(&self.storage, dialog_key);
         insert_system_line(&self.storage, group_id, &format!("Приглашение отменено: {name}"), current_unix_ms())?;
@@ -730,6 +1031,7 @@ impl OmniApp {
             .storage
             .get_group_invite(group_id)?
             .ok_or_else(|| OmniError::InvalidInput("no such invitation".into()))?;
+        let _session_guard = crate::lock_app_session_guard(&self.session_lock)?;
         accept_invite_via(&self.storage, &self.transport, &invite)
     }
 
@@ -741,6 +1043,7 @@ impl OmniApp {
             .ok_or_else(|| OmniError::InvalidInput("no such invitation".into()))?;
         self.storage.upsert_group_invite(&GroupInviteRecord { status: "declined".into(), ..invite.clone() })?;
         let decline = GroupInviteDeclineV2 { version: GROUP_WIRE_VERSION_V2, group_id: group_id.to_string() };
+        let _session_guard = crate::lock_app_session_guard(&self.session_lock)?;
         let _ = send_control_1to1(
             &self.storage,
             &self.transport,
@@ -793,6 +1096,8 @@ impl OmniApp {
             body: String::new(),
             authored_at_unix_ms: current_unix_ms(),
             signature_b64: None,
+            reply_to: None,
+            mentions: Vec::new(),
         };
         send_app_payload(&self.storage, group_id, &payload)?;
         self.flush_group_feed();
@@ -800,6 +1105,7 @@ impl OmniApp {
     }
 
     fn delete_group_here(&self, group: &GroupRecord) -> OmniResult<()> {
+        crate::app_group_calls::end_group_call_here(&self.storage.db_path().to_string_lossy(), &group.group_id);
         let gid = group_id_bytes(&group.group_id)?;
         with_engine(&self.storage, |engine| engine.delete_group(&gid))?;
         // Out of the group: stop taking its frames (re-subscribing with no members, as before,
@@ -815,8 +1121,7 @@ impl OmniApp {
         self.active_group(group_id)?;
         let gid = group_id_bytes(group_id)?;
         let pubs = self.person_pubs(group_id, member_pub)?;
-        let commit = with_engine(&self.storage, |engine| engine.remove_members(&gid, &pubs))?;
-        self.after_own_commit(group_id, &commit, OwnChange::Remove { member_pubs: pubs })
+        self.own_commit(group_id, OwnChange::Remove { member_pubs: pubs.clone() }, |engine| engine.remove_members(&gid, &pubs))
     }
 
     pub fn rename_group(&self, group_id: &str, name: &str) -> OmniResult<()> {
@@ -828,8 +1133,7 @@ impl OmniApp {
         self.active_group(group_id)?;
         let gid = group_id_bytes(group_id)?;
         let new_name = name.clone();
-        let commit = with_engine(&self.storage, |engine| engine.update_meta(&gid, |m| m.name = new_name))?;
-        self.after_own_commit(group_id, &commit, OwnChange::Rename { name })
+        self.own_commit(group_id, OwnChange::Rename { name }, |engine| engine.update_meta(&gid, |m| m.name = new_name))
     }
 
     /// An admin sets the group's picture (`Some(path)` of an image file — normalized to a small
@@ -847,8 +1151,7 @@ impl OmniApp {
         };
         let gid = group_id_bytes(group_id)?;
         let wanted = avatar.clone();
-        let commit = with_engine(&self.storage, |engine| engine.update_meta(&gid, |m| m.avatar = wanted))?;
-        self.after_own_commit(group_id, &commit, OwnChange::Avatar { avatar })
+        self.own_commit(group_id, OwnChange::Avatar { avatar }, |engine| engine.update_meta(&gid, |m| m.avatar = wanted))
     }
 
     /// An admin decides whether a newcomer gets the recent history (on by default). It rides in the
@@ -857,29 +1160,37 @@ impl OmniApp {
         let _ = self.ensure_runtime_profile_active("set_group_newcomer_history")?;
         self.active_group(group_id)?;
         let gid = group_id_bytes(group_id)?;
-        let commit = with_engine(&self.storage, |engine| engine.update_meta(&gid, |m| m.newcomer_history = on))?;
-        self.after_own_commit(group_id, &commit, OwnChange::NewcomerHistory { on })
+        self.own_commit(group_id, OwnChange::NewcomerHistory { on }, |engine| engine.update_meta(&gid, |m| m.newcomer_history = on))
     }
 
     pub fn set_group_admin(&self, group_id: &str, member_pub: &str, admin: bool) -> OmniResult<()> {
         let _ = self.ensure_runtime_profile_active("set_group_admin")?;
         self.active_group(group_id)?;
+        // An agent is never an admin (docs/decisions/omni-workspace-git.md section 5).
+        let account = self.storage.list_group_members(group_id)?.into_iter().find(|m| m.member_pub == member_pub).map(|m| m.account_id);
+        if admin && account.is_some_and(|a| crate::app_workspace::agents::is_agent(&self.storage, &a)) {
+            return Err(OmniError::InvalidInput("агент не может быть админом".into()));
+        }
         let gid = group_id_bytes(group_id)?;
         let targets = self.person_pubs(group_id, member_pub)?;
-        let mut after = Vec::new();
-        let commit = with_engine(&self.storage, |engine| {
-            engine.update_meta(&gid, |m| {
-                m.admins.retain(|a| !targets.contains(a));
-                if admin {
-                    m.admins.extend(targets.iter().cloned());
-                }
-                after = m.admins.clone();
-            })
-        })?;
-        self.after_own_commit(group_id, &commit, OwnChange::Admins { admins: after })
+        // The admins after the change are what the Commit makes them, and they are only known inside it.
+        let after = std::cell::RefCell::new(Vec::new());
+        self.own_commit_with(
+            group_id,
+            |_| OwnChange::Admins { admins: after.borrow().clone() },
+            |engine| {
+                engine.update_meta(&gid, |m| {
+                    m.admins.retain(|a| !targets.contains(a));
+                    if admin {
+                        m.admins.extend(targets.iter().cloned());
+                    }
+                    *after.borrow_mut() = m.admins.clone();
+                })
+            },
+        )
     }
 
-    fn active_group(&self, group_id: &str) -> OmniResult<GroupRecord> {
+    pub(crate) fn active_group(&self, group_id: &str) -> OmniResult<GroupRecord> {
         let group = self
             .storage
             .get_group(group_id)?
@@ -890,8 +1201,26 @@ impl OmniApp {
         Ok(group)
     }
 
-    fn after_own_commit(&self, group_id: &str, commit: &[u8], change: OwnChange) -> OmniResult<()> {
-        own_commit_bookkeeping(&self.storage, group_id, commit, &change)?;
+    /// Our Commit and its bookkeeping as one transaction ([`with_engine`]), then out to the members.
+    fn own_commit(
+        &self,
+        group_id: &str,
+        change: OwnChange,
+        make: impl FnOnce(&Engine<'_, ProtectedCodec>) -> omni_group_mls::Result<Vec<u8>>,
+    ) -> OmniResult<()> {
+        self.own_commit_with(group_id, move |_| change, make)
+    }
+
+    fn own_commit_with(
+        &self,
+        group_id: &str,
+        change: impl FnOnce(&[u8]) -> OwnChange,
+        make: impl FnOnce(&Engine<'_, ProtectedCodec>) -> omni_group_mls::Result<Vec<u8>>,
+    ) -> OmniResult<()> {
+        in_mls_transaction(&self.storage, "group_own_commit", |storage| {
+            let commit = with_engine(storage, make)?;
+            own_commit_bookkeeping(storage, group_id, &commit, &change(&commit))
+        })?;
         self.resubscribe_group(group_id);
         self.flush_group_feed();
         Ok(())
@@ -929,8 +1258,10 @@ impl OmniApp {
             .map(|m| {
                 // A file without a caption reads as the 1:1 list does: «Фото», «Файл: name».
                 let text = match &m.attachment {
-                    Some(file) if m.body.trim().is_empty() => match &file.presentation {
-                        Some(_) => "Фото".to_string(),
+                    Some(file) if m.body.trim().is_empty() => match file.presentation.as_ref().map(|shown| shown.kind) {
+                        Some(omni_types::AttachmentPresentationKindV1::Photo) => "Фото".to_string(),
+                        Some(omni_types::AttachmentPresentationKindV1::Voice) => "Голосовое сообщение".to_string(),
+                        Some(omni_types::AttachmentPresentationKindV1::VideoNote) => "Видеосообщение".to_string(),
                         None => format!("Файл: {}", file.file_name),
                     },
                     _ => m.body.clone(),
@@ -964,6 +1295,7 @@ impl OmniApp {
             unread_count,
             avatar_path: self.storage.group_avatar_image_path(group_id).unwrap_or(None),
             newcomer_history,
+            is_workspace: !self.storage.list_workspace_repo_names(group_id)?.is_empty(),
         }))
     }
 
@@ -995,8 +1327,12 @@ impl OmniApp {
 /// re-created `group_ops`, and the next start's migration dropped `groups`/`group_members` on it
 /// (docs/bugs/old-build-wiped-groups.md). The row and the members come back from the MLS view; our
 /// feed counts on past what it may already have carried. Run at mesh start, before subscribing.
-/// Returns how many came back.
-pub(crate) fn restore_groups_without_rows(storage: &Storage) -> usize {
+/// `local_node` is the node this profile runs as: our feed in a group is named by it. Returns how
+/// many came back.
+pub(crate) fn restore_groups_without_rows(
+    storage: &Storage,
+    local_node: &omni_mesh_runtime::MeshNodeAddress,
+) -> usize {
     let Ok(candidates) = storage.list_group_ids_without_row() else {
         return 0;
     };
@@ -1030,7 +1366,12 @@ pub(crate) fn restore_groups_without_rows(storage: &Storage) -> usize {
         if storage.upsert_group(&record).is_err() {
             continue;
         }
-        let feed_id = omni_mesh_runtime::MeshRuntime::group_feed_id_for("omni.group.feed", &group_id, &me.member_pub);
+        let feed_id = omni_mesh_runtime::MeshRuntime::group_feed_id_for(
+            "omni.group.feed",
+            &group_id,
+            &me.member_pub,
+            local_node,
+        );
         let floor = storage.group_feed_seq_floor(&group_id, &feed_id).unwrap_or(0);
         let _ = storage.set_group_feed_seq(&group_id, floor);
         // No members before: apply_view writes no "X в группе" lines for them.
@@ -1049,10 +1390,17 @@ pub(crate) fn restore_groups_without_rows(storage: &Storage) -> usize {
 /// and every autoconnect tick: a group joined from a Welcome (the 1:1 receive path, no mesh handle
 /// there) gets its feed subscription within a tick instead of on our first own message — frames
 /// that arrive before the subscription are only held by the mesh.
+///
+/// A group we are no longer in (removed, dissolved) is unsubscribed on the same tick: those used to
+/// keep their subscription — frames of a group we are out of kept coming (A10, audit 2026-11-09 #6).
 pub(crate) fn resubscribe_all_groups_via(storage: &Storage, mesh: &omni_mesh_runtime::MeshRuntime) {
     if let Ok(groups) = storage.list_groups() {
-        for group in groups.iter().filter(|g| g.my_status == "member") {
-            resubscribe_group_via(storage, mesh, &group.group_id);
+        for group in &groups {
+            match group.my_status.as_str() {
+                "member" => resubscribe_group_via(storage, mesh, &group.group_id),
+                "removed" | "dissolved" => mesh.unsubscribe_group_destination(&group.group_id),
+                _ => {}
+            }
         }
     }
 }
@@ -1135,6 +1483,7 @@ fn publish_group_feed_outbox(storage: &Storage, mesh: &omni_mesh_runtime::MeshRu
             "omni.group.feed",
             &group_id,
             &group.my_member_pub,
+            &mesh.node_address(),
         );
         let Ok(seq) = storage.next_group_feed_seq(&group_id) else {
             continue;
@@ -1170,6 +1519,8 @@ fn send_group_attachment_offer(
         body: serde_json::to_string(&offer).map_err(|e| OmniError::Internal(e.to_string()))?,
         authored_at_unix_ms,
         signature_b64: None,
+        reply_to: None,
+        mentions: Vec::new(),
     };
     omni_protocol::validate_group_app_payload_v1(&payload)?;
     crate::app_group_history::sign_own_line(storage, group_id, &mut payload, &me)?;
@@ -1179,6 +1530,15 @@ fn send_group_attachment_offer(
 /// A group file whose preparation just ended: its offer goes out now (the line has been in the
 /// thread since it was sent). The mesh tick publishes the feed.
 pub(crate) fn send_prepared_group_attachment_offer(storage: &Storage, message_id: &str) -> OmniResult<()> {
+    #[cfg(test)]
+    {
+        let db_path = storage.db_path().to_string_lossy().into_owned();
+        let mut fail = crate::app_attachment_preparation::FAIL_PREPARED_OFFER.lock().unwrap();
+        if let Some(at) = fail.iter().position(|p| *p == db_path) {
+            fail.remove(at);
+            return Err(OmniError::StorageLocked("test: the offer fails".into()));
+        }
+    }
     let runtime = storage
         .get_attachment_runtime_info(message_id)?
         .ok_or_else(|| OmniError::Storage(format!("attachment '{message_id}' was not found")))?;
@@ -1190,13 +1550,43 @@ pub(crate) fn send_prepared_group_attachment_offer(storage: &Storage, message_id
 }
 
 pub(crate) fn send_app_payload(storage: &Storage, group_id: &str, payload: &GroupAppPayloadV1) -> OmniResult<()> {
+    act_and_say(storage, group_id, payload, |_| Ok(()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the group's queue refuses the next lines of this thread.
+    pub(crate) static FAIL_GROUP_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Do something here and say it to the group, as one: `here` (the local change) and the line's
+/// place in the group's queue are written in one transaction — both, or neither and an error. They
+/// were separate writes: a failure between them left the thing done here and never said, or said
+/// and not done (blind audit 2026-11-11, pass 13, class 2; maintainers' decision 2026-11-11). The line
+/// is sealed in the same transaction: the MLS engine shares the app's connection now (pass 17), so
+/// a line not queued does not spend a generation either. `here` gets the storage inside the
+/// transaction: it must not open another connection (`Storage::open`) — that one would wait on this.
+pub(crate) fn act_and_say<T>(
+    storage: &Storage,
+    group_id: &str,
+    payload: &GroupAppPayloadV1,
+    here: impl FnOnce(&Storage) -> OmniResult<T>,
+) -> OmniResult<T> {
     omni_protocol::validate_group_app_payload_v1(payload)?;
     let gid = group_id_bytes(group_id)?;
     let json = serde_json::to_string(payload).map_err(|e| OmniError::Internal(e.to_string()))?;
-    let (epoch, mls) = with_engine(storage, |engine| engine.encrypt(&gid, json.as_bytes()))?;
     let now = current_unix_ms();
-    storage.record_group_outbox(group_id, epoch, &payload.message_id, &json, now)?;
-    storage.enqueue_group_feed(group_id, &mls, now)
+    in_mls_transaction(storage, "group action and its line", |storage| {
+        let (epoch, mls) = with_engine(storage, |engine| engine.encrypt(&gid, json.as_bytes()))?;
+        let done = here(storage)?;
+        #[cfg(test)]
+        if FAIL_GROUP_QUEUE.with(|fail| fail.get()) {
+            return Err(OmniError::Storage("test: the group's queue does not take the line".into()));
+        }
+        storage.record_group_outbox(group_id, epoch, &payload.message_id, &json, now)?;
+        storage.enqueue_group_feed(group_id, &mls, now)?;
+        Ok(done)
+    })
 }
 
 /// Group-call control from the calls module (free fn: the ingest worker has no `OmniApp`).
@@ -1211,6 +1601,8 @@ pub(crate) fn publish_group_call_control_via(
         body: serde_json::to_string(control).map_err(|e| OmniError::Internal(e.to_string()))?,
         authored_at_unix_ms: current_unix_ms(),
         signature_b64: None,
+        reply_to: None,
+        mentions: Vec::new(),
     };
     send_app_payload(storage, group_id, &payload)
 }
@@ -1233,16 +1625,21 @@ pub(crate) fn own_commit_bookkeeping(storage: &Storage, group_id: &str, commit: 
 /// who went. Returns whether we are still in the group.
 pub(crate) fn apply_view(storage: &Storage, group_id: &str, view: &GroupView, now: i64) -> OmniResult<bool> {
     let before = storage.list_group_members(group_id)?;
+    // A member that said it left stays «left» until a Commit takes it out: a Commit about someone else
+    // made it a member again, and its lines counted (code audit 2026-11-09, OMNI-02).
+    let said_it_left = |member_pub: &str| before.iter().any(|b| b.member_pub == member_pub && b.status == "left");
     let members: Vec<GroupMemberRecord> = view
         .members
         .iter()
         .map(|m| GroupMemberRecord {
             node_hint_hex: node_hex_of(&m.card.member_pub),
             member_pub: m.card.member_pub.clone(),
-            account_id: m.card.account_id.clone(),
+            // Only an account the card's device chain proves: everything that trusts a member's
+            // account reads it from here (approvals, authorship, our own devices).
+            account_id: card_with_proven_account(&m.card).account_id,
             display_name: m.card.display_name.clone(),
             role: if m.is_admin { "admin".into() } else { "member".into() },
-            status: "member".into(),
+            status: if said_it_left(&m.card.member_pub) { "left".into() } else { "member".into() },
         })
         .collect();
     storage.replace_group_members(group_id, &members)?;
@@ -1286,7 +1683,11 @@ pub(crate) fn apply_view(storage: &Storage, group_id: &str, view: &GroupView, no
                 .collect();
             let db_path = storage.db_path().to_string_lossy().to_string();
             if let Some(rekey) = crate::app_group_calls::on_group_members_removed(&db_path, group_id, &removed)? {
-                publish_group_call_control_via(storage, group_id, &rekey)?;
+                // Not said: owed again, or we alone would hold the new secret.
+                if let Err(error) = publish_group_call_control_via(storage, group_id, &rekey) {
+                    crate::app_group_calls::owe_group_call_rekey(&db_path, group_id, rekey);
+                    return Err(error);
+                }
             }
             if group.name != view.name {
                 insert_system_line(storage, group_id, &format!("Новое название: «{}»", view.name), now)?;
@@ -1318,6 +1719,9 @@ pub(crate) fn apply_view(storage: &Storage, group_id: &str, view: &GroupView, no
             sync_group_avatar(storage, group_id, view.avatar.as_deref())?;
         }
         let my_status = if view.active { "member" } else { "removed" };
+        if !view.active {
+            crate::app_group_calls::end_group_call_here(&storage.db_path().to_string_lossy(), group_id);
+        }
         if !view.active && group.my_status == "member" {
             insert_system_line(storage, group_id, "Вас удалили из группы", now)?;
         }
@@ -1389,13 +1793,29 @@ pub(crate) fn ingest_group_feed_item(
         Some(group) if group.my_status == "member" => {}
         // Not in it (yet): if we accepted an invitation, the Welcome may still be on its way — keep it.
         _ => {
-            if storage.get_group_invite(&group_id)?.is_some_and(|i| i.status == "accepted") {
-                storage.push_group_pending_inbound(&group_id, 0, &mls, current_unix_ms())?;
+            if storage.get_group_invite(&group_id)?.is_some_and(|i| i.status == "accepted")
+                && !storage.push_group_pending_inbound(&group_id, 0, &mls, current_unix_ms())?
+            {
+                crate::omni_app_trace_log("group/pending", &format!("group={group_id} not kept: it holds as much as it may before its Welcome"));
             }
             return Ok(());
         }
     }
-    receive_mls(storage, transport, &group_id, &mls)
+    receive_mls(storage, transport, &group_id, &mls, false)
+}
+
+/// A line's time as kept and shown: its author's, but not more than an hour past ours — a line dated
+/// far ahead stayed the newest of the chat for good (code audit 2026-11-09, OMNI-03). Its signed copy
+/// keeps the author's time as signed.
+pub(crate) fn shown_line_time(authored_at_unix_ms: i64, now_unix_ms: i64) -> i64 {
+    authored_at_unix_ms.min(now_unix_ms.saturating_add(omni_storage::PIN_CLOCK_AHEAD_MS))
+}
+
+/// What [`receive_mls`] took in its transaction: a Commit, done there, or anything else, handled after.
+enum Received {
+    Gone,
+    Commit { still_in: bool, reissue: Option<u64> },
+    Other(Inbound),
 }
 
 pub(crate) fn receive_mls(
@@ -1403,11 +1823,67 @@ pub(crate) fn receive_mls(
     transport: &crate::TransportManager,
     group_id: &str,
     mls: &[u8],
+    pending: bool,
 ) -> OmniResult<()> {
     let gid = group_id_bytes(group_id)?;
-    let inbound = with_engine(storage, |engine| engine.receive(&gid, mls))?;
     let now = current_unix_ms();
     let db_path = storage.db_path().to_string_lossy().to_string();
+    // A Commit and what it changes here — the view, our messages of a rolled-back epoch sent again,
+    // our own change made again — are one transaction with the MLS step that merged it: a failure
+    // between them left the group's crypto state and its members here apart (blind audit
+    // 2026-11-12, pass 17). Rolled back, the Commit comes again.
+    let received = in_mls_transaction(storage, "group_receive", |storage| {
+        // A message that waited for its epoch leaves the queue in the step that handles it: rolled
+        // back, it is there again. One already gone was handled on the way (a Commit opened it).
+        if pending && !storage.delete_group_pending_inbound(group_id, mls)? {
+            return Ok(Received::Gone);
+        }
+        let inbound = with_engine(storage, |engine| engine.receive(&gid, mls))?;
+        let Inbound::Commit { outcome, view, put_back } = inbound else {
+            return Ok(Received::Other(inbound));
+        };
+        for member_pub in &put_back {
+            crate::app_group_branches::note_put_back(storage, group_id, member_pub);
+        }
+        match &outcome {
+            CommitOutcome::Rejected(reason) => {
+                crate::omni_app_trace_log("group/commit", &format!("group={group_id} rejected: {reason}"));
+                return Ok(Received::Commit { still_in: false, reissue: None });
+            }
+            CommitOutcome::LostIgnored => return Ok(Received::Commit { still_in: false, reissue: None }),
+            CommitOutcome::Merged | CommitOutcome::ReplacedLoser { .. } => {}
+        }
+        let still_in = apply_view(storage, group_id, &view, now)?;
+        let mut reissue = None;
+        if let CommitOutcome::ReplacedLoser { our_commit_lost } = outcome {
+            // Our messages of the rolled-back epoch did not reach the winning branch: re-send.
+            for json in storage.list_group_outbox_since(group_id, view.epoch)? {
+                if let Ok(payload) = serde_json::from_str::<GroupAppPayloadV1>(&json) {
+                    let _ = send_app_payload(storage, group_id, &payload);
+                }
+            }
+            if our_commit_lost {
+                reissue = Some(view.epoch);
+            }
+        }
+        Ok(Received::Commit { still_in, reissue })
+    })?;
+    let inbound = match received {
+        Received::Gone => return Ok(()),
+        Received::Commit { still_in, reissue } => {
+            // Our lost change is made again once the Commit stands: making it may send 1:1 frames
+            // (invitations), which never go out of an open transaction (pass 18). Kept until made.
+            if let Some(epoch) = reissue {
+                reissue_own_change(storage, transport, group_id, epoch)?;
+            }
+            if still_in {
+                // Messages that were ahead of us may open now — each its own step, after the Commit stands.
+                open_pending_inbound(storage, transport, group_id)?;
+            }
+            return Ok(());
+        }
+        Received::Other(inbound) => inbound,
+    };
     match inbound {
         Inbound::Application { sender, payload, .. } => {
             let Ok(payload) = serde_json::from_slice::<GroupAppPayloadV1>(&payload) else {
@@ -1420,8 +1896,29 @@ pub(crate) fn receive_mls(
             if sender.member_pub == group.my_member_pub {
                 return Ok(()); // our own message echoed back
             }
+            // What the handlers below trust the sender's account for, they get only when proven.
+            let sender = card_with_proven_account(&sender);
+            // A device its account revoked: nothing it says counts, even before a Commit takes it out
+            // (one that ignores its order to wipe still holds the epoch's keys).
+            if card_device_revoked(storage, &sender) {
+                crate::omni_app_trace_log("group/revoked", &format!("group={group_id} a line from a revoked device dropped"));
+                return Ok(());
+            }
+            // Only a member in the group now is heard (code audit 2026-11-09, OMNI-02): one that said
+            // it left holds the epoch's keys until an admin's Commit takes it out, and one taken out
+            // still opens a line of an epoch before its removal that comes late.
+            let Some(sender_record) = storage.list_group_members(group_id)?.into_iter().find(|m| m.member_pub == sender.member_pub) else {
+                crate::omni_app_trace_log("group/ingest", &format!("group={group_id} a line from one not in the group dropped"));
+                return Ok(());
+            };
+            if sender_record.status == "left" {
+                crate::omni_app_trace_log("group/ingest", &format!("group={group_id} a line from a member that left dropped"));
+                return Ok(());
+            }
             // It opened in our epoch: the sender is on our branch, whatever it asked before.
             let _ = storage.drop_group_readd_request(group_id, &sender.member_pub);
+            // Heard in the group: its Welcome, if we kept one for it, arrived.
+            let _ = storage.drop_group_invitee_welcomes_of(group_id, &sender.account_id);
             if !crate::app_group_history::keep_member_line(storage, group_id, &sender, &payload) {
                 return Ok(());
             }
@@ -1430,23 +1927,53 @@ pub(crate) fn receive_mls(
                     crate::app_group_history::receive_history(storage, group_id, &group, &payload)?;
                     crate::record_group_changed_event(&db_path, group_id);
                 }
+                GroupAppKindV1::MessageDelete => {
+                    crate::app_message_actions::receive_group_delete(storage, &group.dialog_key, &sender, &payload)?;
+                    crate::record_group_changed_event(&db_path, group_id);
+                }
+                GroupAppKindV1::MessagePin => {
+                    crate::app_message_actions::receive_group_pin(storage, &group.dialog_key, &payload)?;
+                    crate::record_group_changed_event(&db_path, group_id);
+                }
+                GroupAppKindV1::Text if storage.message_is_deleted(&payload.message_id)? => {}
+                // Here already (a resend), or the id is another chat's: nothing of it is stored again.
+                GroupAppKindV1::Text if storage.message_exists(&payload.message_id)? => {
+                    let _ = crate::app_message_actions::message_id_taken_elsewhere(storage, &payload.message_id, &group.dialog_key);
+                }
                 GroupAppKindV1::Text => {
-                    let record = storage.insert_incoming_message(
-                        &payload.message_id,
-                        &group.dialog_key,
-                        &payload.body,
-                        payload.authored_at_unix_ms,
-                    )?;
-                    storage.insert_group_message_meta(
-                        group_id,
-                        &GroupMessageMeta {
-                            message_id: payload.message_id.clone(),
-                            sender_pub: Some(sender.member_pub.clone()),
-                            sender_name: sender.display_name.clone(),
-                            kind: "text".into(),
-                        },
-                    )?;
-                    crate::record_inbound_message_event(&db_path, &group.dialog_key, &record.id, &payload.body);
+                    // The line and what belongs to it (the reply, the mentions, its author) as one: written
+                    // apart, a failure between them left the line without them, and the line sent again
+                    // was taken for one already here (blind audit 2026-11-13, pass 18).
+                    let (record, deleted) = storage.with_immediate_transaction("group text line", |storage| {
+                        let record = storage.insert_incoming_message(
+                            &payload.message_id,
+                            &group.dialog_key,
+                            &payload.body,
+                            shown_line_time(payload.authored_at_unix_ms, now),
+                        )?;
+                        storage.remember_received_message_reply(&payload.message_id, payload.reply_to.as_deref())?;
+                        storage.remember_message_mentions(&payload.message_id, &payload.mentions)?;
+                        storage.insert_group_message_meta(
+                            group_id,
+                            &GroupMessageMeta {
+                                message_id: payload.message_id.clone(),
+                                sender_pub: Some(sender.member_pub.clone()),
+                                sender_name: sender.display_name.clone(),
+                                kind: "text".into(),
+                            },
+                        )?;
+                        let deleted = crate::app_message_actions::apply_pending_message_deletes(storage, &payload.message_id)?;
+                        Ok((record, deleted))
+                    })?;
+                    if deleted {
+                        crate::record_group_changed_event(&db_path, group_id);
+                    } else {
+                        crate::record_inbound_message_event(&db_path, &group.dialog_key, &record.id, &payload.body);
+                    }
+                }
+                GroupAppKindV1::Reaction => {
+                    crate::app_message_reactions::receive_group_reaction(storage, &group.dialog_key, &sender, &payload)?;
+                    crate::record_group_changed_event(&db_path, group_id);
                 }
                 GroupAppKindV1::Attachment => {
                     crate::app_group_attachments::receive_offer(storage, group_id, &group, &sender, &payload)?;
@@ -1465,21 +1992,23 @@ pub(crate) fn receive_mls(
                     }
                 }
                 GroupAppKindV1::Dissolve => {
-                    let by_admin = storage
-                        .list_group_members(group_id)?
-                        .iter()
-                        .any(|m| m.member_pub == sender.member_pub && m.role == "admin");
+                    let by_admin = sender_record.role == "admin";
                     if !by_admin {
                         crate::omni_app_trace_log("group/ingest", &format!("group={group_id} dissolve from a non-admin ignored"));
                         return Ok(());
                     }
-                    with_engine(storage, |engine| engine.delete_group(&gid))?;
-                    storage.upsert_group(&GroupRecord {
-                        my_status: "dissolved".into(),
-                        updated_at_unix_ms: now,
-                        ..group
+                    // The group's MLS state goes with its row marked dissolved, as one: apart, a failure
+                    // between them left a group shown as ours with no keys to open it (pass 18).
+                    in_mls_transaction(storage, "group dissolved", |storage| {
+                        with_engine(storage, |engine| engine.delete_group(&gid))?;
+                        storage.upsert_group(&GroupRecord {
+                            my_status: "dissolved".into(),
+                            updated_at_unix_ms: now,
+                            ..group
+                        })?;
+                        insert_system_line(storage, group_id, &format!("Группа удалена ({})", sender.display_name), now)
                     })?;
-                    insert_system_line(storage, group_id, &format!("Группа удалена ({})", sender.display_name), now)?;
+                    crate::app_group_calls::end_group_call_here(&db_path, group_id);
                     crate::record_group_changed_event(&db_path, group_id);
                 }
                 GroupAppKindV1::Profile => {
@@ -1490,50 +2019,42 @@ pub(crate) fn receive_mls(
                 GroupAppKindV1::ProfileAsk => {
                     crate::app_group_member_profiles::answer_profile_ask(storage, group_id)?;
                 }
+                GroupAppKindV1::WorkspaceRefs => {
+                    crate::app_workspace::receive_refs(storage, group_id, &sender, &payload.body, now)?;
+                }
+                GroupAppKindV1::WorkspaceRule => {
+                    crate::app_workspace::receive_rule(storage, group_id, &sender, &payload.body)?;
+                }
+                GroupAppKindV1::WorkspaceApprove => {
+                    crate::app_workspace::receive_approval(storage, group_id, &sender, &payload.body, now)?;
+                }
+                GroupAppKindV1::WorkspaceFiles => {
+                    crate::app_workspace::custody::receive(storage, group_id, &sender, &payload.body)?;
+                }
+                GroupAppKindV1::WorkspaceAgents => {
+                    crate::app_workspace::agents::receive(storage, group_id, &sender, &payload.body)?;
+                }
                 GroupAppKindV1::Leave => {
                     storage.set_group_member_status(group_id, &sender.member_pub, "left")?;
                     crate::record_group_changed_event(&db_path, group_id);
                     // An admin turns the farewell into a Commit (concurrent admins: the rank rule).
                     let pubs = vec![sender.member_pub.clone()];
-                    if let Ok(commit) = with_engine(storage, |engine| engine.remove_members(&gid, &pubs)) {
-                        own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Remove { member_pubs: pubs })?;
-                    }
+                    in_mls_transaction(storage, "group_own_commit", |storage| {
+                        if let Ok(commit) = with_engine(storage, |engine| engine.remove_members(&gid, &pubs)) {
+                            own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Remove { member_pubs: pubs })?;
+                        }
+                        Ok(())
+                    })?;
                 }
             }
         }
-        Inbound::Commit { outcome, view, put_back } => {
-            for member_pub in &put_back {
-                crate::app_group_branches::note_put_back(storage, group_id, member_pub);
-            }
-            match &outcome {
-                CommitOutcome::Rejected(reason) => {
-                    crate::omni_app_trace_log("group/commit", &format!("group={group_id} rejected: {reason}"));
-                    return Ok(());
-                }
-                CommitOutcome::LostIgnored => return Ok(()),
-                CommitOutcome::Merged | CommitOutcome::ReplacedLoser { .. } => {}
-            }
-            let still_in = apply_view(storage, group_id, &view, now)?;
-            if let CommitOutcome::ReplacedLoser { our_commit_lost } = outcome {
-                // Our messages of the rolled-back epoch did not reach the winning branch: re-send.
-                for json in storage.list_group_outbox_since(group_id, view.epoch)? {
-                    if let Ok(payload) = serde_json::from_str::<GroupAppPayloadV1>(&json) {
-                        let _ = send_app_payload(storage, group_id, &payload);
-                    }
-                }
-                if our_commit_lost {
-                    reissue_own_change(storage, transport, group_id, view.epoch)?;
-                }
-            }
-            if still_in {
-                // Messages that were ahead of us may open now.
-                for pending in storage.take_group_pending_inbound(group_id)? {
-                    let _ = receive_mls(storage, transport, group_id, &pending);
-                }
-            }
-        }
+        Inbound::Commit { .. } => {}
         Inbound::Future { epoch } => {
-            storage.push_group_pending_inbound(group_id, epoch, mls, now)?;
+            // Not kept (the queue is full of nearer ones): not handled either — it comes again, by
+            // then perhaps opened in its turn (pass 20). Taken as handled, it was lost.
+            if !storage.push_group_pending_inbound(group_id, epoch, mls, now)? {
+                return Err(crate::not_yet(format!("group={group_id} epoch={epoch} not kept: the group holds as much as it may")));
+            }
         }
         Inbound::ForkSeen { epoch, ours_wins } => {
             crate::app_group_branches::on_fork_seen(storage, group_id, epoch, ours_wins, now)?;
@@ -1547,6 +2068,12 @@ pub(crate) fn receive_mls(
         Inbound::Ignored(reason) => {
             crate::omni_app_trace_log("group/ingest", &format!("group={group_id} ignored: {reason}"));
         }
+        // Not kept here, so not handled: the frame is to come again (the mesh's RetryAWhile, and after
+        // a restart), once we are nearer its epoch. Taken as handled, an honest message of a member far ahead of us after a
+        // long time offline was lost for good (blind audit 2026-11-13, pass 20).
+        Inbound::TooFarAhead { epoch, current } => {
+            return Err(crate::not_yet(format!("group={group_id} epoch {epoch} is too far ahead of ours ({current})")));
+        }
     }
     Ok(())
 }
@@ -1558,13 +2085,35 @@ fn reissue_own_change(
     group_id: &str,
     epoch_after: u64,
 ) -> OmniResult<()> {
-    let Some(json) = storage.take_group_own_change(group_id, epoch_after)? else {
+    let Some(json) = storage.get_group_own_change(group_id, epoch_after)? else {
         return Ok(());
     };
-    let Ok(change) = serde_json::from_str::<OwnChange>(&json) else {
-        return Ok(());
+    reissue_kept_change(storage, transport, group_id, epoch_after, &json)
+}
+
+/// Make our change kept for `epoch_after` again, and let it go only once it is made. Taken off first,
+/// a failure on the way (no session for an invitee, pass 17) or a crash (pass 19) lost it with
+/// nothing left to try again from. An MLS change goes in the transaction of the Commit that makes it
+/// again; an invitation (sent 1:1, never out of a transaction) goes once sent. One that does not
+/// read goes.
+pub(crate) fn reissue_kept_change(
+    storage: &Storage,
+    transport: &crate::TransportManager,
+    group_id: &str,
+    epoch_after: u64,
+    json: &str,
+) -> OmniResult<()> {
+    let Ok(change) = serde_json::from_str::<OwnChange>(json) else {
+        return storage.drop_group_own_change(group_id, epoch_after, json);
     };
-    reissue_change(storage, transport, group_id, change)
+    if matches!(change, OwnChange::Add { .. }) {
+        reissue_change(storage, transport, group_id, change)?;
+        return storage.drop_group_own_change(group_id, epoch_after, json);
+    }
+    in_mls_transaction(storage, "own change again", |storage| {
+        storage.drop_group_own_change(group_id, epoch_after, json)?;
+        reissue_change(storage, transport, group_id, change)
+    })
 }
 
 /// Make one of our own changes again, on the branch we are on now.
@@ -1576,7 +2125,7 @@ pub(crate) fn reissue_change(
 ) -> OmniResult<()> {
     let gid = group_id_bytes(group_id)?;
     match change {
-        OwnChange::PutBack { .. } => {}
+        OwnChange::PutBack { .. } | OwnChange::RefreshCard => {}
         OwnChange::Add { dialog_keys } => {
             // The Welcome we sent is for a dead branch: ask the invitees for a fresh KeyPackage.
             let group = storage.get_group(group_id)?.ok_or_else(|| OmniError::InvalidInput("unknown group".into()))?;
@@ -1602,28 +2151,38 @@ pub(crate) fn reissue_change(
                 .map(|m| m.card.member_pub.clone())
                 .collect();
             if !still.is_empty() {
-                let commit = with_engine(storage, |engine| engine.remove_members(&gid, &still))?;
-                own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Remove { member_pubs: still })?;
+                in_mls_transaction(storage, "group_own_commit", |storage| {
+                    let commit = with_engine(storage, |engine| engine.remove_members(&gid, &still))?;
+                    own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Remove { member_pubs: still })
+                })?;
             }
         }
         OwnChange::Rename { name } => {
             let new_name = name.clone();
-            let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.name = new_name))?;
-            own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Rename { name })?;
+            in_mls_transaction(storage, "group_own_commit", |storage| {
+                let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.name = new_name))?;
+                own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Rename { name })
+            })?;
         }
         OwnChange::Admins { admins } => {
             let wanted = admins.clone();
-            let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.admins = wanted))?;
-            own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Admins { admins })?;
+            in_mls_transaction(storage, "group_own_commit", |storage| {
+                let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.admins = wanted))?;
+                own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Admins { admins })
+            })?;
         }
         OwnChange::Avatar { avatar } => {
             let wanted = avatar.clone();
-            let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.avatar = wanted))?;
-            own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Avatar { avatar })?;
+            in_mls_transaction(storage, "group_own_commit", |storage| {
+                let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.avatar = wanted))?;
+                own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::Avatar { avatar })
+            })?;
         }
         OwnChange::NewcomerHistory { on } => {
-            let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.newcomer_history = on))?;
-            own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::NewcomerHistory { on })?;
+            in_mls_transaction(storage, "group_own_commit", |storage| {
+                let commit = with_engine(storage, |engine| engine.update_meta(&gid, |m| m.newcomer_history = on))?;
+                own_commit_bookkeeping(storage, group_id, &commit, &OwnChange::NewcomerHistory { on })
+            })?;
         }
     }
     Ok(())
@@ -1650,7 +2209,11 @@ pub(crate) fn handle_incoming_group_control(
             let record = GroupInviteRecord {
                 group_id: invite.group_id.clone(),
                 name: invite.name.clone(),
-                inviter_name: invite.inviter_name.clone(),
+                // Who invited is the contact the session is with, not the name the invitation gives:
+                // a contact could pass its invitation off as another's (blind audit 2026-11-13, pass 20).
+                inviter_name: Some(contact_name_for_dialog(storage, &receive_context.dialog_key))
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| invite.inviter_name.clone()),
                 inviter_dialog_key: receive_context.dialog_key.clone(),
                 status: "pending".into(),
                 received_at_unix_ms: current_unix_ms(),
@@ -1713,7 +2276,7 @@ pub(crate) fn handle_incoming_group_control(
         }
         Some(GroupControlKind::Welcome) => {
             let welcome: GroupWelcomeV2 = serde_json::from_str(&control.payload_json).map_err(|_| decode("welcome"))?;
-            join_from_welcome(storage, transport, &welcome)
+            join_from_welcome(storage, transport, &receive_context.dialog_key, &welcome)
         }
         Some(GroupControlKind::InviteDecline) => {
             let decline: GroupInviteDeclineV2 =
@@ -1767,77 +2330,198 @@ pub(crate) fn add_invitee(
     accept: &GroupInviteAcceptV2,
 ) -> OmniResult<Option<GroupWelcomeV2>> {
     omni_protocol::validate_group_invite_accept_v2(accept)?;
-    if !storage.take_group_sent_invite(&accept.group_id, invitee_dialog_key)? {
-        return Ok(None);
-    }
     if storage.get_group(&accept.group_id)?.is_none_or(|g| g.my_status != "member") {
         return Ok(None);
+    }
+    // Added already, its Welcome kept: the invitee asks again because it did not arrive — it goes
+    // again (maintainers' decision 2026-11-11). Past the Commit the invitation is spent; without this, a
+    // Welcome lost on the way left the invitee in the tree and out of the group for good.
+    if !storage.list_group_sent_invites(&accept.group_id)?.iter().any(|(dialog, _)| dialog == invitee_dialog_key) {
+        if let Some((_, json)) = kept_welcomes_for(storage, invitee_dialog_key, Some(&accept.group_id))?.into_iter().next() {
+            crate::omni_app_trace_log("group/add", &format!("group={} the kept Welcome goes again to {invitee_dialog_key}", accept.group_id));
+            return Ok(serde_json::from_str(&json).ok());
+        }
     }
     let gid = group_id_bytes(&accept.group_id)?;
     let kp = B64
         .decode(&accept.key_package_b64)
         .map_err(|_| OmniError::InvalidInput("group key package b64".into()))?;
-    let out = with_engine(storage, |engine| engine.add_members(&gid, &[kp]))?;
-    own_commit_bookkeeping(
-        storage,
-        &accept.group_id,
-        &out.commit,
-        &OwnChange::Add { dialog_keys: vec![invitee_dialog_key.to_string()] },
-    )?;
+    // The KeyPackage is for the contact we invited: its account (which its device chain proves) is the
+    // account of the chat the accept came over.
+    let card = with_engine(storage, |engine| engine.key_package_card(&kp))?;
+    if let Some(account) = storage.resolve_contact_for_dialog(invitee_dialog_key)?.and_then(|c| c.remote_account_id) {
+        if card.account_id != account.0 {
+            crate::omni_app_trace_log("group/add", &format!("group={} accept over {invitee_dialog_key} names another account", accept.group_id));
+            return Ok(None);
+        }
+    }
+    // Spent only now, by an accept we can take: spent first, an accept whose KeyPackage did not read
+    // (a client's fault, a transient engine error) lost the invitation for good — the next, good one
+    // found none (blind audit 2026-11-11, G2).
+    // The invitation is spent, the member added and its Welcome kept, as one: spent apart, a crash
+    // before the add lost the invitation, and the accept sent again found neither it nor a Welcome
+    // (blind audit 2026-11-13, pass 19). Refused by the engine, nothing changed and the invitation
+    // stays for another accept (H5).
+    let added = in_mls_transaction(storage, "group_own_commit", |storage| {
+        if !storage.take_group_sent_invite(&accept.group_id, invitee_dialog_key)? {
+            return Ok(None);
+        }
+        let out = with_engine(storage, |engine| engine.add_members(&gid, &[kp]))?;
+        own_commit_bookkeeping(
+            storage,
+            &accept.group_id,
+            &out.commit,
+            &OwnChange::Add { dialog_keys: vec![invitee_dialog_key.to_string()] },
+        )?;
+        let welcome = GroupWelcomeV2 {
+            version: GROUP_WIRE_VERSION_V2,
+            group_id: accept.group_id.clone(),
+            welcome_b64: B64.encode(&out.welcome),
+        };
+        let json = serde_json::to_string(&welcome).map_err(|e| OmniError::Internal(e.to_string()))?;
+        storage.put_group_invitee_welcome(&accept.group_id, invitee_dialog_key, &card.account_id, &json, current_unix_ms())?;
+        Ok(Some(welcome))
+    })?;
+    let Some(welcome) = added else {
+        return Ok(None);
+    };
     // The newcomer gets the recent history in the epoch it joins (best effort: the add stands).
     let newcomer_history = with_engine(storage, |engine| engine.view(&gid)).map(|view| view.newcomer_history).unwrap_or(true);
     if let Err(error) = crate::app_group_history::send_newcomer_history(storage, &accept.group_id, newcomer_history) {
         crate::omni_app_trace_log("group/history", &format!("group={} history not sent: {error}", accept.group_id));
     }
-    Ok(Some(GroupWelcomeV2 {
-        version: GROUP_WIRE_VERSION_V2,
-        group_id: accept.group_id.clone(),
-        welcome_b64: B64.encode(&out.welcome),
-    }))
+    Ok(Some(welcome))
 }
 
-/// Join a group from its MLS Welcome — only for an invitation we accepted.
+/// How long a Welcome is kept for an invitee not heard in the group yet.
+const PENDING_WELCOME_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+fn kept_welcomes_for(storage: &Storage, dialog_key: &str, group_id: Option<&str>) -> OmniResult<Vec<(String, String)>> {
+    storage.group_invitee_welcomes_for(dialog_key, group_id, current_unix_ms() - PENDING_WELCOME_KEEP_MS)
+}
+
+/// The session with `dialog_key` came up: the Welcomes kept for it go again — the one sent may have
+/// gone where nobody heard it. An invitee in the group already ignores one (it joins only from an
+/// invitation it accepted, `join_from_welcome`).
+pub(crate) fn resend_kept_welcomes(storage: &Storage, transport: &crate::TransportManager, dialog_key: &str) {
+    let Ok(kept) = kept_welcomes_for(storage, dialog_key, None) else {
+        return;
+    };
+    for (group_id, json) in kept {
+        let Ok(welcome) = serde_json::from_str::<GroupWelcomeV2>(&json) else {
+            continue;
+        };
+        let sent = send_control_1to1(storage, transport, dialog_key, GroupControlKind::Welcome, &welcome);
+        crate::omni_app_trace_log("group/add", &format!("group={group_id} kept Welcome to {dialog_key} again: {}", sent.is_ok()));
+    }
+}
+
+/// Join a group from its MLS Welcome — only for an invitation we accepted, and only from the one who
+/// invited us (`from_dialog_key`): before, any approved contact that knew the group id could send one
+/// (V-15).
 pub(crate) fn join_from_welcome(
     storage: &Storage,
     transport: &crate::TransportManager,
+    from_dialog_key: &str,
     welcome: &GroupWelcomeV2,
 ) -> OmniResult<()> {
     omni_protocol::validate_group_welcome_v2(welcome)?;
     let Some(invite) = storage.get_group_invite(&welcome.group_id)? else {
         return Ok(());
     };
-    if invite.status != "accepted" {
+    if invite.status != "accepted" || invite.inviter_dialog_key != from_dialog_key {
         return Ok(());
     }
     let bytes = B64
         .decode(&welcome.welcome_b64)
         .map_err(|_| OmniError::InvalidInput("group welcome b64".into()))?;
     let gid = group_id_bytes(&welcome.group_id)?;
-    // A renewed Welcome replaces a group joined on a branch that lost.
-    if storage.get_group(&welcome.group_id)?.is_some() {
-        let _ = with_engine(storage, |engine| engine.delete_group(&gid));
-    }
-    let joined = with_engine(storage, |engine| engine.join(&bytes))?;
-    if joined != gid {
-        return Err(OmniError::InvalidInput("welcome is for another group".into()));
-    }
-    let view = with_engine(storage, |engine| engine.view(&gid))?;
-    let (_, me) = local_mls_identity(storage)?;
+    // A renewed Welcome replaces a group joined on a branch that lost — but what we hold goes only
+    // once the new Welcome opened, for this group: a junk one leaves the group as it was.
+    // Joined in MLS and a member here, as one: apart, a failure between them left MLS state of a
+    // group we do not show, and the Welcome again found it joined (blind audit 2026-11-13, pass 18).
     let now = current_unix_ms();
-    storage.upsert_group(&GroupRecord {
-        group_id: welcome.group_id.clone(),
-        name: view.name.clone(),
-        my_member_pub: me.member_pub,
-        my_status: "member".into(),
-        dialog_key: group_dialog_key(&welcome.group_id),
-        created_at_unix_ms: now,
-        updated_at_unix_ms: now,
+    in_mls_transaction(storage, "group joined", |storage| {
+        with_engine(storage, |engine| engine.join_group_from_welcome(&gid, &bytes))?;
+        let view = with_engine(storage, |engine| engine.view(&gid))?;
+        let (_, me) = local_mls_identity(storage)?;
+        storage.upsert_group(&GroupRecord {
+            group_id: welcome.group_id.clone(),
+            name: view.name.clone(),
+            my_member_pub: me.member_pub,
+            my_status: "member".into(),
+            dialog_key: group_dialog_key(&welcome.group_id),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+        })?;
+        apply_view(storage, &welcome.group_id, &view, now)?;
+        insert_system_line(storage, &welcome.group_id, "Вы вступили в группу", now)
     })?;
-    apply_view(storage, &welcome.group_id, &view, now)?;
-    insert_system_line(storage, &welcome.group_id, "Вы вступили в группу", now)?;
     crate::app_group_member_profiles::introduce_after_join(storage, &welcome.group_id);
-    for pending in storage.take_group_pending_inbound(&welcome.group_id)? {
-        let _ = receive_mls(storage, transport, &welcome.group_id, &pending);
+    open_pending_inbound(storage, transport, &welcome.group_id)
+}
+
+/// Open the messages that waited for the epoch we are in now. Each leaves the queue in the step
+/// that handles it (`receive_mls`): taken all at once before, a crash on the way lost them (pass 18).
+/// One that fails for a passing reason (the database, the engine) waits again (pass 17); one that
+/// fails on its own content goes.
+pub(crate) fn open_pending_inbound(storage: &Storage, transport: &crate::TransportManager, group_id: &str) -> OmniResult<()> {
+    // One drain per group and thread: a Commit opened here asks for another, which only marks that
+    // the queue is to be read again — before, it read the whole queue once more inside this one,
+    // and a chain of waiting Commits went as deep as the queue is long (blind audit 2026-11-13,
+    // pass 19).
+    let key = format!("{}|{group_id}", storage.db_path().display());
+    let first = DRAINING.with(|draining| {
+        let mut draining = draining.borrow_mut();
+        match draining.get_mut(&key) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                draining.insert(key.clone(), false);
+                true
+            }
+        }
+    });
+    if !first {
+        return Ok(());
+    }
+    struct Draining(String);
+    impl Drop for Draining {
+        fn drop(&mut self) {
+            DRAINING.with(|draining| draining.borrow_mut().remove(&self.0));
+        }
+    }
+    let _draining = Draining(key.clone());
+    loop {
+        drain_pending_once(storage, transport, group_id)?;
+        let again = DRAINING.with(|draining| draining.borrow_mut().get_mut(&key).map(std::mem::take).unwrap_or(false));
+        if !again {
+            return Ok(());
+        }
+    }
+}
+
+thread_local! {
+    /// The groups whose waiting messages this thread is reading, and whether to read them again.
+    static DRAINING: std::cell::RefCell<HashMap<String, bool>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn drain_pending_once(storage: &Storage, transport: &crate::TransportManager, group_id: &str) -> OmniResult<()> {
+    for (epoch, mls) in storage.list_group_pending_inbound(group_id)? {
+        match receive_mls(storage, transport, group_id, &mls, true) {
+            Ok(()) => {}
+            Err(error @ (OmniError::Storage(_) | OmniError::Internal(_) | OmniError::Transport(_))) => {
+                crate::omni_app_trace_log("group/pending", &format!("group={group_id} epoch={epoch} waits again: {error}"));
+                // Rolled back, it is still there; failed after its step, it is put back.
+                storage.push_group_pending_inbound(group_id, epoch, &mls, current_unix_ms())?;
+            }
+            Err(error) => {
+                crate::omni_app_trace_log("group/pending", &format!("group={group_id} epoch={epoch} dropped: {error}"));
+                storage.delete_group_pending_inbound(group_id, &mls)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1877,6 +2561,13 @@ fn send_control_1to1_once<T: serde::Serialize>(
     kind: GroupControlKind,
     payload: &T,
 ) -> OmniResult<()> {
+    // Never out of an open transaction: the ratchet step stored with the frame would be taken back by
+    // a rollback after the frame is gone, and the next frame sealed with the same step — a re-made
+    // invitation inside the transaction of the Commit that called for it did that (blind audit
+    // 2026-11-13, pass 18).
+    if storage.in_transaction() {
+        return Err(OmniError::Internal("a 1:1 group control does not go out of an open transaction".into()));
+    }
     let payload_json = serde_json::to_string(payload).map_err(|e| OmniError::Internal(e.to_string()))?;
     let remote_account_id = dialog_account(storage, dialog_key)?
         .ok_or_else(|| OmniError::InvalidInput("group control needs a known contact or our own device".into()))?;

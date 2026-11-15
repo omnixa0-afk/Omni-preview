@@ -277,6 +277,7 @@ impl OmniApp {
     /// this only changes WHEN they take effect. Spawns a child process (reads its startup preamble), so
     /// callers must run it OFF the UI thread.
     pub fn respawn_rendezvous_runtime(&self) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("respawn_rendezvous_runtime")?;
         let db_path = self.storage.db_path().to_string_lossy().to_string();
         clear_rendezvous_runtime_for_profile(&db_path);
         self.ensure_rendezvous_runtime().map(|_| ())
@@ -492,6 +493,7 @@ impl OmniApp {
     /// — publish it out-of-band so anyone (not only contacts) can import the in-segment entry points.
     /// Errors when the list is empty (nothing to share). See docs/decisions/dht-bootstrap-mesh-propagation.md.
     pub fn export_dht_bootstrap_bundle(&self) -> OmniResult<String> {
+        let _ = self.ensure_runtime_profile_active("export_dht_bootstrap_bundle")?;
         let nodes = load_dht_bootstrap_nodes(&self.storage.db_path().to_string_lossy());
         if nodes.is_empty() {
             return Err(OmniError::InvalidInput(

@@ -2,6 +2,7 @@
 name = "omni-ffi"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 [dependencies]
 omni-app = { path = "../omni-app" }
@@ -12,6 +13,9 @@ omni-crypto = { path = "../omni-crypto" }
 # host has no sibling helper .exe to spawn and re-execs itself instead (see ffi_exports_helpers.rs).
 # They stay separate processes; only the code they run is shared.
 omni-dht-helper = { path = "../omni-dht-helper" }
+omni-git-helper = { path = "../omni-git-helper" }
+# An agent's Omni over MCP: `--run-helper mcp` runs it in a single-file host.
+omni-mcp = { path = "../omni-mcp" }
 omni-identity = { path = "../omni-identity" }
 omni-messaging = { path = "../omni-messaging" }
 # The `OMNI_TRACE_FILE` sink, written for the shell too (`omni_trace_write`) — one writer per file.

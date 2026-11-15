@@ -34,7 +34,6 @@ public sealed partial class MainWindow : Window
 
     private enum ContactsFilterMode
     {
-        All,
         Pending,
         Approved,
         Declined,
@@ -131,7 +130,7 @@ public sealed partial class MainWindow : Window
     private bool suppressContactSelectionSync;
     private bool suppressCallVideoPreferenceSelection;
     private ContactsWorkspaceMode currentContactsWorkspaceMode = ContactsWorkspaceMode.Directory;
-    private ContactsFilterMode currentContactsFilterMode = ContactsFilterMode.All;
+    private ContactsFilterMode currentContactsFilterMode = ContactsFilterMode.Approved;
     private bool isOnboardingBusy;
     private bool bootStarted;
 
@@ -172,7 +171,9 @@ public sealed partial class MainWindow : Window
         rustBridge = new RustBridge(this.appDirectory);
         MediaFiles.Attach(rustBridge);
         CleanupUiTempDirectory();
+        Features.Shared.EmojiFonts.Initialize(this.appDirectory);
         InitializeComponent();
+        AuthenticatedNavigationView.SelectionChanged += OnAuthenticatedNavigationSelectionChanged;
         callVideoService = new CallVideoService(
             rustBridge,
             DispatcherQueue,
@@ -192,6 +193,10 @@ public sealed partial class MainWindow : Window
             ApplyBackgroundRefresh);
         Title = "Omni";
         ApplyWindowIcon();
+        // WinUI finishes establishing the native window during the first activation. Reapply the
+        // cached icon once then, so the taskbar does not keep the default window-class icon.
+        Activated += ReapplyWindowIconOnFirstActivation;
+        Closed += (_, _) => ReleaseWindowIcons();
         MenuFlyoutItem openContactProfileMenuItem = new()
         {
             Text = "Профиль",
@@ -248,7 +253,7 @@ public sealed partial class MainWindow : Window
         SettingsProfileEditorStatusTextBlock.Text = "Публичное имя и аватар можно обновить после входа в профиль.";
         SettingsPasswordSummaryTextBlock.Text = "Пароль не задан.";
         DiagnosticsPingStatusTextBlock.Text = "Проверка ядра пока не запускалась.";
-        SettingsExportStatusTextBlock.Text = "Резервная копия аккаунта пока не сохранена.";
+        SettingsExportStatusTextBlock.Text = string.Empty;
         ImportAccountFileNameTextBlock.Text = "Файл не выбран.";
         ImportAccountFileSummaryTextBlock.Text = string.Empty;
         ImportAccountStatusTextBlock.Text = "Выберите файл копии и введите фразу восстановления.";
@@ -258,7 +263,6 @@ public sealed partial class MainWindow : Window
         InitializeNetworkNodes();
         InitializePublicRelays();
         InitializePublishPlans();
-        InitializeBackupReminder();
         InitializeRendezvousProviders();
         RefreshDiscoverabilitySettings();
         InitializeCallVideoPreferencePickers();
@@ -266,7 +270,9 @@ public sealed partial class MainWindow : Window
         InitializeAudioDevicePickers();
         InitializeThemePicker();
         InitializeBackgroundMode();
+        InitializeTraceLogSetting();
         InitializeCongestionPicker();
+        InitializeSettingsPages();
         ApplyPersistedCallVideoDevicePreferences();
         ApplyContactsWorkspaceMode(currentContactsWorkspaceMode);
         UpdateContactsFilterButtons();

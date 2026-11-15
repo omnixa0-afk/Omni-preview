@@ -2,6 +2,7 @@
 name = "omni-node"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Headless Omni core: a thin CLI/stdin driver over `omni-app` (no UI). Used as a
 # deterministic test harness for the mesh (e.g. the durable store-and-forward live

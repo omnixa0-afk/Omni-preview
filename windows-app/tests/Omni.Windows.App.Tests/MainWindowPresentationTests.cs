@@ -200,6 +200,36 @@ public sealed class MainWindowPresentationTests
                 new HashSet<string> { "acct-peer" }));
     }
     [Fact]
+    public void BuildContactStatus_AnOutgoingRequestSaysWhetherItReachedTheContact()
+    {
+        // A request leaves only over a live link; "Запрос отправлен" for one that never left read as
+        // a request the contact ignored. See contact-request-said-sent-without-a-link.md.
+        long nowUnixMs = 1_700_000_000_000;
+        ContactSnapshot contact = ApprovedPeerContact(nowUnixMs) with
+        {
+            RelationshipState = "pending",
+            PendingRequestDirection = "outgoing",
+        };
+        ContactConnectionDto Connection(string? request, string? reason = null, AddressFamilyGapDto? gap = null)
+            => new("acct-peer", "cannot_reach", null, null, reason ?? "not_approved", false, null, false, null, null, request, gap);
+
+        Assert.Equal("Запрос создан", MainWindowPresentation.BuildContactStatus(contact, nowUnixMs, new HashSet<string>()));
+        Assert.Equal(
+            "Запрос ждёт связи с контактом",
+            MainWindowPresentation.BuildContactStatus(contact, nowUnixMs, new HashSet<string>(), Connection("waiting_for_link")));
+        Assert.Equal(
+            "Запрос доставлен, ждём ответа",
+            MainWindowPresentation.BuildContactStatus(contact, nowUnixMs, new HashSet<string>(), Connection("delivered")));
+        Assert.Equal(
+            "Запрос не доставлен: у вас только IPv6, у контакта только IPv4 — нужен релей",
+            MainWindowPresentation.BuildContactStatus(
+                contact,
+                nowUnixMs,
+                new HashSet<string>(),
+                Connection("waiting_for_link", "no_common_address_family", new AddressFamilyGapDto("IPv6", "IPv4"))));
+    }
+
+    [Fact]
     public void MapContactPresenceDotKind_IsLiveOnlyWhileALinkIsHeld()
     {
         long nowUnixMs = 1_700_000_000_000;
@@ -682,5 +712,5 @@ public sealed class MainWindowPresentationTests
     }
 
     private static ContactConnectionDto Contact(string accountId, string link, string? carrier)
-        => new(accountId, link, null, carrier, null, true, null, false, null);
+        => new(accountId, link, null, carrier, null, true, null, false, null, null);
 }

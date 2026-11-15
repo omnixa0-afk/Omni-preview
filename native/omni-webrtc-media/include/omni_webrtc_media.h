@@ -19,7 +19,7 @@ extern "C" {
 
 /* Also written into the probe JSON literals in omni_webrtc_media.cpp (the no-backend and the
  * factory-failure answers) — bump those together with this. */
-#define OMNI_WEBRTC_MEDIA_ABI_VERSION 23u
+#define OMNI_WEBRTC_MEDIA_ABI_VERSION 24u
 
 typedef enum OmniWebRtcMediaStatus {
     OMNI_WEBRTC_MEDIA_STATUS_OK = 0,
@@ -378,7 +378,7 @@ OMNI_WEBRTC_MEDIA_API OmniWebRtcMediaStatus omni_webrtc_media_smoke_audio_jitter
  * #5 increment 1a (2026-06-01): D3D11 offscreen render + readback smoke. Proves the GPU
  * render-target + staging readback path headlessly (no display). Returns OK on success,
  * INTERNAL_ERROR if the D3D device/readback fails, NOT_IMPLEMENTED off-Windows.
- * See docs/notes/video-gpu-render-swapchainpanel.md.
+ * See docs/decisions/video-render-architecture.md.
  */
 OMNI_WEBRTC_MEDIA_API OmniWebRtcMediaStatus omni_webrtc_media_smoke_d3d11_solid_readback(void);
 
@@ -429,7 +429,7 @@ OMNI_WEBRTC_MEDIA_API OmniWebRtcMediaStatus omni_webrtc_media_smoke_d3d11_swapch
  * MF-HW-encodes NV12 color-bars, HW-decodes them into an NV12 D3D11 texture, reads back the Y
  * plane and asserts the color-bar pattern survived. NOT_IMPLEMENTED (skip) when the machine has
  * no HW H.264 encoder/decoder MFT — HW decode is optional; SW OpenH264 is the mandatory fallback.
- * See docs/notes/hw-decode-CONTINUE.md.
+ * See docs/decisions/media-hw-efficiency-and-device-codec-selection.md.
  */
 OMNI_WEBRTC_MEDIA_API OmniWebRtcMediaStatus omni_webrtc_media_smoke_mf_h264_hw_decode(void);
 
@@ -694,6 +694,27 @@ OMNI_WEBRTC_MEDIA_API void omni_webrtc_media_router_deliver(
     void* context,
     const uint8_t* packet,
     size_t packet_len);
+
+/*
+ * Voice messages (ABI 24). Packets are each preceded by their length, 2 bytes, little-endian.
+ * decode: the whole sound, mono, into out_pcm at sample_rate_hz (8, 12, 16, 24 or 48 kHz). A broken
+ *   packet is concealed; BUFFER_TOO_SMALL keeps what fitted, with out_samples saying how much.
+ * encode: 48 kHz mono PCM, whole 20 ms frames, into packets.
+ */
+OMNI_WEBRTC_MEDIA_API OmniWebRtcMediaStatus omni_webrtc_media_opus_decode_packets(
+    const uint8_t* packets,
+    size_t packets_len,
+    int32_t sample_rate_hz,
+    int16_t* out_pcm,
+    size_t out_capacity_samples,
+    size_t* out_samples);
+OMNI_WEBRTC_MEDIA_API OmniWebRtcMediaStatus omni_webrtc_media_opus_encode_pcm(
+    const int16_t* pcm,
+    size_t sample_count,
+    int32_t bitrate_bps,
+    uint8_t* out_packets,
+    size_t out_capacity,
+    size_t* out_len);
 
 #ifdef __cplusplus
 }

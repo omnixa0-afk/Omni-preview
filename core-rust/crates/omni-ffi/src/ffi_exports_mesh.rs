@@ -251,7 +251,7 @@ pub extern "C" fn omni_mesh_rendezvous_reach_contact(
 /// The active profile's network entry-node registry (the seeded base node + user-added relays /
 /// bootstrap) as a JSON payload — an array of `{id, endpoint, node_address_hex, label, source,
 /// removable}`, parsed + freed by the C# bridge. The list the «Узлы сети / Релеи» screen renders; an
-/// empty list is valid (LAN + invite still connect). See docs/notes/roadmap-CONTINUE.md.
+/// empty list is valid (LAN + invite still connect). See docs/decisions/community-volunteer-nodes.md.
 #[no_mangle]
 pub extern "C" fn omni_network_node_list(handle: *mut OmniAppHandle) -> *mut c_char {
     match catch_unwind(AssertUnwindSafe(|| network_node_list_impl(handle))) {

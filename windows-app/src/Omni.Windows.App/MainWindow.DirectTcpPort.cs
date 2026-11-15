@@ -89,10 +89,7 @@ public sealed partial class MainWindow
     {
         const string applies = " Применится при следующем подключении.";
         SettingsDirectTcpPortSummaryTextBlock.Text = (string.IsNullOrEmpty(port) || port == "0")
-            ? "Порт TCP-двери выбирается автоматически и пробрасывается через UPnP. Надёжно не на всех " +
-              "роутерах." + applies
-            : $"TCP-дверь слушает порт {port}. Пробросьте этот TCP-порт на роутере на этот ПК " +
-              "(Port Forwarding → TCP), чтобы собеседник с мобильного гарантированно дозвонился без релея." +
-              applies;
+            ? "0 — порт выбирается сам и пробрасывается через UPnP, не на всех роутерах надёжно." + applies
+            : $"Пробросьте TCP-порт {port} на роутере на этот компьютер." + applies;
     }
 }

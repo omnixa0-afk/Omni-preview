@@ -8,6 +8,9 @@ static MEDIA_DATAGRAMS_DROPPED_NO_NEGOTIATION: AtomicU64 = AtomicU64::new(0);
 static MEDIA_DATAGRAMS_DROPPED_NO_SINK: AtomicU64 = AtomicU64::new(0);
 static MEDIA_DATAGRAMS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static MEDIA_DATAGRAMS_SENT: AtomicU64 = AtomicU64::new(0);
+/// 1:1 call datagrams that did not open with the peer's key, or were replays: dropped before the
+/// engine. A steady count in a working call means someone on the path is sending into it.
+static CALL_DATAGRAMS_UNOPENED: AtomicU64 = AtomicU64::new(0);
 
 /// Outbound counterpart of the inbound media counters, reported at the same cadence and naming the
 /// LANE the batch took (mesh link vs legacy transport). Together the three counters localize a
@@ -242,6 +245,8 @@ impl OmniApp {
                 .or_default();
             negotiation.group_full_capabilities = Some(capabilities.clone());
         }
+        // The passport goes out signed with our identity key (V-27): load it while storage is at hand.
+        crate::app_screen_control::local_signing_identity(&self.storage)?;
         crate::app_group_calls::store_own_group_video_capabilities(&db_path, &group_id, &capabilities);
         reselect_group_media(&db_path, &dialog_key);
         realtime_media_negotiation_snapshot_for_dialog(&db_path, &dialog_key)
@@ -338,8 +343,11 @@ impl OmniApp {
                 "no mesh link for realtime media in dialog '{dialog_key}'"
             )));
         }
+        // End-to-end: sealed with the call's key, so a relay on the path carries ciphertext it can
+        // neither read nor alter (docs/decisions/call-media-e2e.md). No keys, no send.
+        let sealed = seal_direct_call_datagram(&route.db_path, dialog_key, payload)?;
         runtime
-            .send_media(node, payload)
+            .send_media(node, &sealed)
             .map_err(|error| OmniError::Transport(format!("mesh media send failed: {error}")))?;
         trace_media_datagram_out(dialog_key, "mesh", payload.len());
         Ok(())
@@ -625,8 +633,13 @@ fn select_realtime_media_configuration(
         .max_datagram_bytes
         .min(remote.max_datagram_bytes)
         .min(omni_transport::REALTIME_MEDIA_DATAGRAM_MAX_BYTES as u32)
-        // Запас от потолка транспорта — с обоснованием у самой константы.
-        .min(omni_transport::REALTIME_MEDIA_DATAGRAM_SAFE_BYTES as u32);
+        // Запас от потолка транспорта — с обоснованием у самой константы. Из него же место под
+        // печать датаграммы (заголовок и тег AEAD): движок режет пакеты по этому числу, и
+        // запечатанная датаграмма укладывается в тот же бюджет, что открытая раньше.
+        .min(
+            (omni_transport::REALTIME_MEDIA_DATAGRAM_SAFE_BYTES
+                - omni_crypto::CALL_MEDIA_SEAL_OVERHEAD_BYTES) as u32,
+        );
     let (video, video_note) = match select_realtime_video_configuration(local, remote) {
         Ok(video) => (Some(video), None),
         Err(note) => (None, Some(note)),
@@ -1187,6 +1200,25 @@ fn push_incoming_group_media_datagram(sinks: &RealtimeMediaInboundSinks, dialog_
     if !sinks.deliver(dialog_key, payload) {
         note_media_datagram_without_sink(dialog_key);
     }
+}
+
+/// A 1:1 call datagram that did not open, or was a replay (see `CALL_DATAGRAMS_UNOPENED`). Sampled
+/// like the other media counters.
+fn note_unopened_call_datagram(dialog_key: &str) {
+    let dropped = CALL_DATAGRAMS_UNOPENED.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped.is_multiple_of(250) {
+        omni_app_trace_log(
+            "media/datagram-drop",
+            &format!("dialog={dialog_key} reason=did-not-open total={dropped}"),
+        );
+    }
+}
+
+/// How many call datagrams this process dropped before the engine because they did not open with
+/// the sender's key or were replays — 1:1 and group calls together. Process-wide and cumulative: the
+/// shell shows the growth since its call started (Diagnostics → Media).
+pub fn call_datagrams_unopened_total() -> u64 {
+    CALL_DATAGRAMS_UNOPENED.load(Ordering::Relaxed) + app_group_calls::group_media_unopened_total()
 }
 
 /// Media that passed the gate but has no engine to go to: a call not wired yet (the first packets

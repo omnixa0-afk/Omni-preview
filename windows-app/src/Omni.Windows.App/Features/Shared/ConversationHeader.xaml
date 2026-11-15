@@ -13,7 +13,8 @@
        so its bottom line runs along the top of the chat list's search box (y 48). The avatar is as
        tall as the buttons, and the side margins 12, not 16 (owner, 2026-10-12: «аватарку
        можно и побольше, опять пустые большие поля»). -->
-  <Grid Margin="12,3,12,4" ColumnSpacing="10">
+  <!-- The bar paints itself, so it is one colour whatever page it stands on. -->
+  <Grid Padding="12,3,12,4" Background="{ThemeResource OmniBgPanelBrush}" ColumnSpacing="10">
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="Auto" />
       <ColumnDefinition Width="Auto" />

@@ -1,7 +1,7 @@
 #pragma once
 
 // Vendor-neutral D3D11 video renderer for the SwapChainPanel video path
-// (docs/decisions/video-render-architecture.md, docs/notes/video-gpu-render-swapchainpanel.md).
+// (docs/decisions/video-render-architecture.md).
 //
 // Uses ONLY OS abstractions (D3D11 / DXGI / D3DCompile) — never vendor SDKs
 // (NVENC/NVDEC/AMF/QSV). Falls back to the WARP software device when no hardware device is

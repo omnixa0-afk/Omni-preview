@@ -16,8 +16,10 @@
 //! a compromise of this process is contained to "a malicious courier" = DoS only — it can't deceive
 //! (identity-bound trust + the AEAD beacon) and can't reach the core's keys.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +56,35 @@ struct GatedProvider {
     publish_quota: Mutex<ProviderHealth>,
     read_quota: Mutex<ProviderHealth>,
     watch_quota: Mutex<ProviderHealth>,
+    /// What this courier did since the helper started, per kind of operation — the `stats` command.
+    tally: [OpTally; 3],
+}
+
+/// Counts of one kind of operation on one courier: how many went out and how they ended. A skipped
+/// courier (cooling down) is not counted — it was not asked.
+#[derive(Default)]
+struct OpTally {
+    ok: AtomicU64,
+    quota: AtomicU64,
+    fail: AtomicU64,
+}
+
+impl OpTally {
+    fn record(&self, result: &CourierResult) {
+        let counter = match result {
+            CourierResult::Hit | CourierResult::Miss => &self.ok,
+            CourierResult::QuotaExhausted => &self.quota,
+            CourierResult::Fail => &self.fail,
+            CourierResult::Skipped | CourierResult::Late => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `ok/quota/fail`.
+    fn render(&self) -> String {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        format!("{}/{}/{}", load(&self.ok), load(&self.quota), load(&self.fail))
+    }
 }
 
 /// Which couriers a fetch asks: the web ones (ntfy, Nostr — fast), the BT-DHT one (seconds per query),
@@ -95,9 +126,9 @@ impl Legs {
 /// Which quota an operation draws on: publishing, fetching, or holding a subscription.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
-    Publish,
-    Read,
-    Watch,
+    Publish = 0,
+    Read = 1,
+    Watch = 2,
 }
 
 impl GatedProvider {
@@ -114,6 +145,7 @@ impl GatedProvider {
             publish_quota: Mutex::new(ProviderHealth::new()),
             read_quota: Mutex::new(ProviderHealth::new()),
             watch_quota: Mutex::new(ProviderHealth::new()),
+            tally: Default::default(),
         }
     }
 
@@ -167,6 +199,10 @@ impl GatedProvider {
 
     fn on_failure(&self, now: u64) {
         health(&self.health).on_failure(now);
+    }
+
+    fn tally(&self, op: Op) -> &OpTally {
+        &self.tally[op as usize]
     }
 }
 
@@ -239,6 +275,8 @@ enum CourierResult {
     Skipped,
     /// Провайдер жив и ответил, но у нас кончилась квота на нём (HTTP 429 и подобное).
     QuotaExhausted,
+    /// Asked, but the round had its answer and stopped waiting; the courier finishes on its own.
+    Late,
 }
 
 struct CourierOutcome {
@@ -280,6 +318,7 @@ fn attribution(reports: &[CourierOutcome]) -> String {
                 format!("{}=quota+{}ms", r.label, r.ms)
             }
             CourierResult::QuotaExhausted => format!("{}=quota+{}ms:{}", r.label, r.ms, r.reason),
+            CourierResult::Late => format!("{}=late+{}ms", r.label, r.ms),
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -310,14 +349,16 @@ fn health(m: &Mutex<ProviderHealth>) -> std::sync::MutexGuard<'_, ProviderHealth
 /// Alongside the successful results it returns a per-provider [`CourierOutcome`] for EVERY provider
 /// (including the ones skipped for cooldown), so the caller can log which courier carried the round.
 /// `is_meaningful` classifies an `Ok` value as a hit vs an empty miss (publish passes `|_| true`;
-/// fetch passes "returned ≥1 blob") — it only shapes the log, never the returned values.
+/// fetch passes "returned ≥1 blob"). It also ends the round early: once a courier has a hit, the
+/// others are waited for only until [`ROUND_AFTER_HIT`] past it and [`ROUND_FLOOR`] past the start —
+/// see [`fan_out_among_indexed`].
 #[cfg(test)]
-fn fan_out<T: Send>(
+fn fan_out<T: Send + 'static>(
     providers: &Providers,
     op_kind: Op,
     now: u64,
-    op: impl Fn(&dyn RendezvousChannel) -> Result<T, ChannelError> + Sync,
-    is_meaningful: impl Fn(&T) -> bool,
+    op: impl Fn(&dyn RendezvousChannel) -> Result<T, ChannelError> + Send + Sync + 'static,
+    is_meaningful: impl Fn(&T) -> bool + Send + Sync + 'static,
 ) -> (Vec<T>, Vec<CourierOutcome>) {
     let all: Vec<usize> = (0..providers.len()).collect();
     fan_out_among(providers, &all, op_kind, now, op, is_meaningful)
@@ -325,25 +366,36 @@ fn fan_out<T: Send>(
 
 /// [`fan_out`] over the couriers `eligible` (indices into `providers`) — the ones a topic goes through
 /// (see [`couriers_for_topic`]). The others are not tried and not reported.
-fn fan_out_among<T: Send>(
+fn fan_out_among<T: Send + 'static>(
     providers: &Providers,
     eligible: &[usize],
     op_kind: Op,
     now: u64,
-    op: impl Fn(&dyn RendezvousChannel) -> Result<T, ChannelError> + Sync,
-    is_meaningful: impl Fn(&T) -> bool,
+    op: impl Fn(&dyn RendezvousChannel) -> Result<T, ChannelError> + Send + Sync + 'static,
+    is_meaningful: impl Fn(&T) -> bool + Send + Sync + 'static,
 ) -> (Vec<T>, Vec<CourierOutcome>) {
-    fan_out_among_indexed(providers, eligible, op_kind, now, |_, ch| op(ch), is_meaningful)
+    fan_out_among_indexed(providers, eligible, op_kind, now, move |_, ch| op(ch), is_meaningful)
 }
 
+/// A round with a hit waits for the other couriers this much longer…
+const ROUND_AFTER_HIT: Duration = Duration::from_millis(700);
+/// …and in any case until this long after it started: the couriers that answer at all answer within
+/// it, and the slow tail (a relay that does not take the connection — offchain.pub, 10 s on the stand,
+/// 2026-10-27, while the beacon had come from two others in 0.1 s) no longer holds the dial behind it.
+const ROUND_FLOOR: Duration = Duration::from_millis(1500);
+
 /// [`fan_out_among`] whose `op` also gets the courier's index — for work that differs per courier.
-fn fan_out_among_indexed<T: Send>(
+///
+/// Each courier runs on a thread of its own and settles its own health and tally when it is done, so
+/// a courier the round stopped waiting for (reported `late`) still finishes: its post still lands,
+/// its timeout still cools it down for the next round.
+fn fan_out_among_indexed<T: Send + 'static>(
     providers: &Providers,
     eligible: &[usize],
     op_kind: Op,
     now: u64,
-    op: impl Fn(usize, &dyn RendezvousChannel) -> Result<T, ChannelError> + Sync,
-    is_meaningful: impl Fn(&T) -> bool,
+    op: impl Fn(usize, &dyn RendezvousChannel) -> Result<T, ChannelError> + Send + Sync + 'static,
+    is_meaningful: impl Fn(&T) -> bool + Send + Sync + 'static,
 ) -> (Vec<T>, Vec<CourierOutcome>) {
     let mut probe: Vec<usize> = eligible
         .iter()
@@ -361,60 +413,65 @@ fn fan_out_among_indexed<T: Send>(
     // nostr ~1 с, BT-DHT 3-10 с (итеративный поиск по рою — его нормальная цена), итого раунд ~6 с
     // вместо ~1 с. Хуже того, КАЖДЫЙ добавленный релей делал рандеву медленнее — избыточность
     // приходилось покупать задержкой, хотя весь смысл в том, что достаточно ОДНОГО ответа.
-    //
-    // Провайдеры независимы: свой канал (`Send + Sync`), свой мьютекс здоровья, общего изменяемого
-    // состояния нет. Поэтому хватает `std::thread::scope` без единой новой зависимости. Порядок
-    // отчётов восстанавливается по индексу — строка атрибуции обязана оставаться детерминированной.
-    type Slot<T> = Option<(CourierResult, u64, Option<T>, String)>;
-    let mut slots: Vec<Slot<T>> = (0..providers.len()).map(|_| None).collect();
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(probe.len());
-        for &i in &probe {
+    // Порядок отчётов восстанавливается по индексу — строка атрибуции обязана оставаться
+    // детерминированной.
+    type Slot<T> = (CourierResult, u64, Option<T>, String);
+    let op = Arc::new(op);
+    let is_meaningful = Arc::new(is_meaningful);
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Slot<T>)>();
+    let started = Instant::now();
+    for &i in &probe {
+        let (providers, op, is_meaningful, tx) = (Arc::clone(providers), Arc::clone(&op), Arc::clone(&is_meaningful), tx.clone());
+        std::thread::spawn(move || {
             let provider = &providers[i];
-            let op = &op;
-            handles.push((
-                i,
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let outcome = op(i, provider.channel.as_ref());
-                    (outcome, started.elapsed().as_millis() as u64)
-                }),
-            ));
-        }
-        for (i, handle) in handles {
-            let provider = &providers[i];
+            let began = Instant::now();
             // Паника внутри одного курьера не должна валить раунд — остальные ноги уже отработали.
-            let Ok((outcome, ms)) = handle.join() else {
-                provider.on_failure(now);
-                slots[i] = Some((CourierResult::Fail, 0, None, "panicked".to_string()));
-                continue;
-            };
-            slots[i] = Some(match outcome {
-                Ok(value) => {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(i, provider.channel.as_ref())));
+            let ms = began.elapsed().as_millis() as u64;
+            let slot: Slot<T> = match outcome {
+                Err(_) => {
+                    provider.on_failure(now);
+                    (CourierResult::Fail, 0, None, "panicked".to_string())
+                }
+                Ok(Ok(value)) => {
                     provider.on_success(op_kind);
-                    let result = if is_meaningful(&value) {
-                        CourierResult::Hit
-                    } else {
-                        CourierResult::Miss
-                    };
+                    let result = if is_meaningful(&value) { CourierResult::Hit } else { CourierResult::Miss };
                     (result, ms, Some(value), String::new())
                 }
-                Err(error) if error.is_quota_exhausted() => {
+                Ok(Err(error)) if error.is_quota_exhausted() => {
                     // Квота, а не поломка: провайдер жив и отвечает, просто до сброса лимита нам
                     // тут ничего не светит. Отдельная метка в трассе — чтобы `=fail` не читалось
                     // как «курьер сломан», и отдельный длинный откат вместо долбёжки в дверь.
-                    let reason = short_reason(&error);
                     provider.on_quota_exhausted(op_kind, now);
-                    (CourierResult::QuotaExhausted, ms, None, reason)
+                    (CourierResult::QuotaExhausted, ms, None, short_reason(&error))
                 }
-                Err(error) => {
-                    let reason = short_reason(&error);
+                Ok(Err(error)) => {
                     provider.on_failure(now);
-                    (CourierResult::Fail, ms, None, reason)
+                    (CourierResult::Fail, ms, None, short_reason(&error))
                 }
-            });
+            };
+            provider.tally(op_kind).record(&slot.0);
+            let _ = tx.send((i, slot));
+        });
+    }
+    drop(tx);
+
+    let mut slots: Vec<Option<Slot<T>>> = (0..providers.len()).map(|_| None).collect();
+    let mut pending = probe.len();
+    let mut cutoff: Option<Instant> = None;
+    while pending > 0 {
+        let received = match cutoff {
+            Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())).ok(),
+            None => rx.recv().ok(),
+        };
+        let Some((i, slot)) = received else { break };
+        pending -= 1;
+        if cutoff.is_none() && matches!(slot.0, CourierResult::Hit) {
+            cutoff = Some((Instant::now() + ROUND_AFTER_HIT).max(started + ROUND_FLOOR));
         }
-    });
+        slots[i] = Some(slot);
+    }
+    let waited = started.elapsed().as_millis() as u64;
 
     let mut out = Vec::new();
     let mut reports = Vec::with_capacity(eligible.len());
@@ -423,6 +480,13 @@ fn fan_out_among_indexed<T: Send>(
             continue;
         }
         match slot {
+            // Опрошен, но раунд его не дождался: он доделает своё сам.
+            None if probe.contains(&i) => reports.push(CourierOutcome {
+                label: p.label.clone(),
+                result: CourierResult::Late,
+                ms: waited,
+                reason: String::new(),
+            }),
             // Провайдер в откате в этом раунде не опрашивался — но в отчёте он есть, чтобы в логе
             // был виден ВЕСЬ набор курьеров, а не только опрошенные.
             None => reports.push(CourierOutcome {
@@ -480,6 +544,12 @@ pub fn run(args: Vec<String>) -> i32 {
         eprintln!("usage: omni-rendezvous-helper --listen <addr>  |  --connect <addr> <command>");
         return 2;
     };
+    // No token, no listener: nobody could talk to us, and a listener anyone could talk to is what
+    // V-21 closed. The core always passes one.
+    if omni_rendezvous::helper_ipc::helper_token_from_env().is_none() {
+        eprintln!("cannot listen on {addr}: {} is not set", omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV);
+        return 2;
+    }
 
     // Service (listener) mode must never show a terminal window: detach any inherited console so
     // even a careless launch can't pop one. (Client mode keeps its console for stdout.) The app
@@ -497,8 +567,10 @@ pub fn run(args: Vec<String>) -> i32 {
         omni_rendezvous::parse_provider_urls(std::env::var("OMNI_RENDEZVOUS_PROVIDERS").ok())
             .into_iter()
             .filter_map(|entry| {
-                let (url, _) = omni_rendezvous::parse_courier_entry(&entry);
-                channel_for_url(url).map(|channel| GatedProvider::for_entry(&entry, channel))
+                let (url, courier_use) = omni_rendezvous::parse_courier_entry(&entry);
+                // A courier a contact named reaches public addresses only (V-13).
+                let public_only = courier_use == omni_rendezvous::CourierUse::PairOnly;
+                channel_for_url(url, public_only).map(|channel| GatedProvider::for_entry(&entry, channel))
             })
             .collect(),
     );
@@ -517,25 +589,35 @@ pub fn run(args: Vec<String>) -> i32 {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| addr.clone());
     eprintln!("omni-rendezvous-helper listening on {bound}");
+    let _ = helper_started();
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // A place before a thread: connections that never prove the token are bounded (pass 20).
+        let Some(slot) = omni_rendezvous::helper_ipc::reserve_auth_slot() else { continue };
         let providers = Arc::clone(&providers);
-        std::thread::spawn(move || serve(stream, &providers));
+        std::thread::spawn(move || serve(stream, &providers, slot));
     }
     0
 }
 
-fn serve(stream: TcpStream, providers: &Providers) {
+fn serve(stream: TcpStream, providers: &Providers, slot: omni_rendezvous::helper_ipc::AuthSlot) {
     let Ok(read_half) = stream.try_clone() else { return };
     let mut reader = BufReader::new(read_half);
     let mut writer = stream;
-    let mut line = String::new();
+    // Only a client holding the token the core gave us (V-21), within a few seconds (pass 20);
+    // requests bounded (V-12).
+    let token = omni_rendezvous::helper_ipc::process_helper_token();
+    if !omni_rendezvous::helper_ipc::accept_tcp_client(&writer, &mut reader, token, slot) {
+        return;
+    }
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+        let line = match omni_rendezvous::helper_ipc::read_line_capped(
+            &mut reader,
+            omni_rendezvous::helper_ipc::HELPER_REQUEST_MAX,
+        ) {
+            Ok(line) if !line.is_empty() => line,
+            _ => break,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -574,6 +656,7 @@ fn handle_line(line: &str, providers: &Providers) -> String {
         "fetch" => handle_fetch(parts.next(), parts.next(), parts.next(), parts.next(), providers),
         "fetch-many" => handle_fetch_many(parts.next(), parts.next(), providers),
         "watch" => handle_watch(line.trim_start_matches("watch"), providers),
+        "stats" => handle_stats(providers),
         other => format!("ERR unknown command '{other}'"),
     }
 }
@@ -648,7 +731,8 @@ fn handle_publish(
             providers[*i].channel.max_blob().is_none_or(|max| blob.len() <= max || slim.as_ref().is_some_and(|slim| slim.len() <= max))
         })
         .collect();
-    let post = |ch: &dyn RendezvousChannel| {
+    // Owned: a courier the round stops waiting for finishes its post on its own thread.
+    let post = move |ch: &dyn RendezvousChannel| {
         let fits = |len: usize| ch.max_blob().is_none_or(|max| len <= max);
         let to_post = if fits(blob.len()) { &blob } else { slim.as_ref().filter(|slim| fits(slim.len())).unwrap_or(&blob) };
         if replace {
@@ -712,8 +796,9 @@ fn publish_along_stages(
     stages: &[Vec<String>],
     reach: usize,
     now: u64,
-    post: impl Fn(&dyn RendezvousChannel) -> Result<(), ChannelError> + Sync,
+    post: impl Fn(&dyn RendezvousChannel) -> Result<(), ChannelError> + Send + Sync + 'static,
 ) -> (Vec<()>, Vec<CourierOutcome>) {
+    let post = Arc::new(post);
     let groups: Vec<Vec<usize>> = stages
         .iter()
         .map(|kinds| {
@@ -734,7 +819,10 @@ fn publish_along_stages(
             passed_over.extend(group);
             continue;
         }
-        let (ok, mut outcomes) = fan_out_among(providers, &group, Op::Publish, now, &post, |_| true);
+        let (ok, mut outcomes) = fan_out_among(providers, &group, Op::Publish, now, {
+            let post = Arc::clone(&post);
+            move |ch: &dyn RendezvousChannel| post(ch)
+        }, |_| true);
         if !ok.is_empty() {
             taken += 1;
         }
@@ -742,7 +830,10 @@ fn publish_along_stages(
         reports.append(&mut outcomes);
     }
     if taken == 0 && !passed_over.is_empty() {
-        let (ok, mut outcomes) = fan_out_among(providers, &passed_over, Op::Publish, now, &post, |_| true);
+        let (ok, mut outcomes) = fan_out_among(providers, &passed_over, Op::Publish, now, {
+            let post = Arc::clone(&post);
+            move |ch: &dyn RendezvousChannel| post(ch)
+        }, |_| true);
         accepted.extend(ok);
         reports.append(&mut outcomes);
     }
@@ -779,7 +870,7 @@ fn handle_fetch(
         &eligible,
         Op::Read,
         now,
-        |ch| ch.fetch(&topic, dht_key.as_ref()),
+        move |ch| ch.fetch(&topic, dht_key.as_ref()),
         |blobs: &Vec<Vec<u8>>| !blobs.is_empty(),
     );
     let hexes: Vec<String> = results.into_iter().flatten().map(|blob| to_hex(&blob)).collect();
@@ -817,12 +908,13 @@ fn handle_fetch_many(legs: Option<&str>, topics: Option<&str>, providers: &Provi
         }
     }
     let eligible: Vec<usize> = (0..providers.len()).filter(|i| !per_courier[*i].is_empty()).collect();
+    let per_courier = Arc::new(per_courier);
     let (results, reports) = fan_out_among_indexed(
         providers,
         &eligible,
         Op::Read,
         now,
-        |i, ch| ch.fetch_many(&per_courier[i]),
+        move |i, ch| ch.fetch_many(&per_courier[i]),
         |blobs: &Vec<Vec<u8>>| !blobs.is_empty(),
     );
     let hexes: Vec<String> = results.into_iter().flatten().map(|blob| to_hex(&blob)).collect();
@@ -884,19 +976,27 @@ fn handle_watch(args: &str, providers: &Providers) -> String {
     if watched.is_empty() {
         return "OK\tnone-can-watch".to_string();
     }
-    let watchers: Vec<usize> = watched.iter().map(|(i, _)| *i).collect();
+    let watchers: Vec<(usize, Vec<Topic>)> = watched.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     for (i, topics) in watched {
         let (providers, tx) = (Arc::clone(providers), tx.clone());
         std::thread::spawn(move || {
             let started = Instant::now();
             let outcome = providers[i].channel.watch(&topics, wait);
+            let tally = providers[i].tally(Op::Watch);
             match &outcome {
-                Ok(_) => providers[i].on_success(Op::Watch),
-                Err(error) if error.is_quota_exhausted() => {
-                    providers[i].on_quota_exhausted(Op::Watch, now_ms())
+                Ok(_) => {
+                    providers[i].on_success(Op::Watch);
+                    tally.record(&CourierResult::Hit);
                 }
-                Err(_) => providers[i].on_failure(now_ms()),
+                Err(error) if error.is_quota_exhausted() => {
+                    providers[i].on_quota_exhausted(Op::Watch, now_ms());
+                    tally.record(&CourierResult::QuotaExhausted);
+                }
+                Err(_) => {
+                    providers[i].on_failure(now_ms());
+                    tally.record(&CourierResult::Fail);
+                }
             }
             let _ = tx.send((i, outcome, started.elapsed().as_millis() as u64));
         });
@@ -912,12 +1012,19 @@ fn handle_watch(args: &str, providers: &Providers) -> String {
         };
         pending -= 1;
         let label = &providers[i].label;
-        match outcome {
-            Ok(blobs) if !blobs.is_empty() => {
+        match outcome.map(|blobs| (blobs.is_empty(), fresh_arrivals(blobs))) {
+            Ok((_, fresh)) if !fresh.is_empty() => {
                 reports.push(format!("{label}=ok+{ms}ms"));
-                let hexes: Vec<String> = blobs.iter().map(|b| to_hex(b)).collect();
+                // The other couriers' waits end now with nothing taken: what reaches them next is kept
+                // for the next watch, not taken by a wait whose answer nobody reads.
+                for (j, topics) in watchers.iter().filter(|(j, _)| *j != i) {
+                    providers[*j].channel.release_watch(topics);
+                }
+                let hexes: Vec<String> = fresh.iter().map(|b| to_hex(b)).collect();
                 return format!("OK {}\t{}", hexes.join(" "), reports.join(" "));
             }
+            // Only copies of what an earlier watch already handed out.
+            Ok((false, _)) => reports.push(format!("{label}=again+{ms}ms")),
             Ok(_) => reports.push(format!("{label}=empty+{ms}ms")),
             // As in `attribution`: a quota is not a breakdown, and the log must not read as one.
             Err(error) if error.is_quota_exhausted() => {
@@ -929,13 +1036,73 @@ fn handle_watch(args: &str, providers: &Providers) -> String {
     format!("OK\t{}", reports.join(" "))
 }
 
+/// The blobs among `blobs` not handed out by a watch in the last [`ARRIVAL_MEMORY`]: a beacon is
+/// posted to two relays and read from three, and its second copy, kept by the other relay's held
+/// subscription, would answer the next watch at once with nothing new. A sealed beacon is unique
+/// per publication, so only a copy of the same publication is dropped.
+fn fresh_arrivals(blobs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    static HANDED_OUT: Mutex<VecDeque<(Instant, Vec<u8>)>> = Mutex::new(VecDeque::new());
+    let now = Instant::now();
+    let mut handed_out = HANDED_OUT.lock().unwrap_or_else(|poison| poison.into_inner());
+    while handed_out.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > ARRIVAL_MEMORY) {
+        handed_out.pop_front();
+    }
+    let mut fresh = Vec::new();
+    for blob in blobs {
+        if handed_out.iter().any(|(_, seen)| *seen == blob) || fresh.contains(&blob) {
+            continue;
+        }
+        fresh.push(blob);
+    }
+    for blob in &fresh {
+        if handed_out.len() >= ARRIVAL_MEMORY_CAP {
+            handed_out.pop_front();
+        }
+        handed_out.push_back((now, blob.clone()));
+    }
+    fresh
+}
+
+/// How long a watch remembers what it handed out, and how many of them.
+const ARRIVAL_MEMORY: Duration = Duration::from_secs(600);
+const ARRIVAL_MEMORY_CAP: usize = 256;
+
+/// `stats` → `OK up=<secs>\t<courier> pub=ok/quota/fail read=… watch=… conn=<n|->` per courier, tab-
+/// separated: what each courier did since the helper started (cumulative — the core logs the line,
+/// the difference between two lines is the rate). `conn` — the connections it opened, where it knows.
+fn handle_stats(providers: &Providers) -> String {
+    let mut line = format!("OK up={}", helper_started().elapsed().as_secs());
+    for provider in providers.iter() {
+        let connections = provider.channel.connections_opened().map_or_else(|| "-".to_string(), |n| n.to_string());
+        line.push_str(&format!(
+            "	{} pub={} read={} watch={} conn={connections}",
+            provider.label,
+            provider.tally(Op::Publish).render(),
+            provider.tally(Op::Read).render(),
+            provider.tally(Op::Watch).render(),
+        ));
+    }
+    line
+}
+
+/// When this helper process started serving (the first call — `run` makes it before listening).
+fn helper_started() -> Instant {
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(Instant::now)
+}
+
 /// Parse a 32-byte (64-hex) per-bucket `dht_key` seed. `None` if absent/malformed — the BT-DHT leg
 /// then can't address a slot and fails best-effort (N-of-many covers it); web couriers ignore it.
 fn parse_dht_key(hex: &str) -> Option<[u8; 32]> {
     from_hex(hex)?.try_into().ok()
 }
 
+/// A dev client: one command, the token from [`omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV`].
 fn run_client(endpoint: &str, command: &str) -> i32 {
+    let Some(token) = omni_rendezvous::helper_ipc::helper_token_from_env() else {
+        eprintln!("set {} to the helper's token", omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV);
+        return 2;
+    };
     let mut stream = match TcpStream::connect(endpoint) {
         Ok(s) => s,
         Err(error) => {
@@ -943,14 +1110,15 @@ fn run_client(endpoint: &str, command: &str) -> i32 {
             return 1;
         }
     };
-    if writeln!(stream, "{command}").is_err() {
+    if omni_rendezvous::helper_ipc::write_request(&mut stream, &token, command).is_err() {
         eprintln!("write failed");
         return 1;
     }
-    let _ = stream.flush();
-    let mut line = String::new();
-    match BufReader::new(stream).read_line(&mut line) {
-        Ok(_) => {
+    match omni_rendezvous::helper_ipc::read_line_capped(
+        &mut BufReader::new(stream),
+        omni_rendezvous::helper_ipc::HELPER_REPLY_MAX,
+    ) {
+        Ok(line) => {
             let line = line.trim_end();
             println!("{line}");
             i32::from(line.starts_with("ERR"))
@@ -1007,11 +1175,16 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 /// 2); the `dht://` host is a sentinel today (`dht://mainline`). An unrecognized scheme, or a `dht://`
 /// with no helper endpoint, is skipped (`None`) rather than mis-handled — N-of-many covers a missing
 /// leg. See docs/decisions/bt-dht-rendezvous-courier.md + omni-dht-helper.md.
-fn channel_for_url(url: &str) -> Option<Box<dyn RendezvousChannel + Send + Sync>> {
+///
+/// `public_only` (a courier a contact named): the web couriers connect to public addresses only and
+/// follow no redirect, whatever the name resolves to at the time (V-13).
+fn channel_for_url(url: &str, public_only: bool) -> Option<Box<dyn RendezvousChannel + Send + Sync>> {
     if url.starts_with("ws://") || url.starts_with("wss://") {
-        Some(Box::new(NostrChannel::with_relay(url)))
+        let channel = NostrChannel::with_relay(url);
+        Some(Box::new(if public_only { channel.public_only() } else { channel }))
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        Some(Box::new(NtfyChannel::with_base(url)))
+        let channel = NtfyChannel::with_base(url);
+        Some(Box::new(if public_only { channel.public_only() } else { channel }))
     } else if url.starts_with("dht://") {
         // The Mainline engine runs in the separate `omni-dht-helper` process; its loopback endpoint
         // arrives via `OMNI_DHT_HELPER_ENDPOINT`. Without it we DON'T construct the courier — N-of-many
@@ -1040,9 +1213,9 @@ mod tests {
 
     #[test]
     fn url_scheme_picks_the_courier() {
-        assert!(channel_for_url("https://ntfy.sh").is_some());
-        assert!(channel_for_url("wss://offchain.pub").is_some());
-        assert!(channel_for_url("ftp://nope").is_none());
+        assert!(channel_for_url("https://ntfy.sh", false).is_some());
+        assert!(channel_for_url("wss://offchain.pub", true).is_some());
+        assert!(channel_for_url("ftp://nope", false).is_none());
     }
 
     /// A fake provider that counts its calls and either always succeeds or always errors — enough to
@@ -1171,6 +1344,30 @@ mod tests {
         );
     }
 
+    /// Once a courier had the beacon, a courier stuck on its connect no longer holds the round (and the
+    /// dial behind it) for its whole timeout; it is reported `late`, and when it is done it settles its
+    /// own tally. With no hit at all the round still waits for everyone — nothing was found yet.
+    #[test]
+    fn a_round_with_a_hit_does_not_wait_out_a_stuck_courier() {
+        let fast = Arc::new(AtomicUsize::new(0));
+        let stuck = Duration::from_millis(2500);
+        let providers: Providers = Arc::new(vec![slow("test:stuck", stuck), labeled(&fast, true, "test:fast")]);
+        let started = Instant::now();
+        let (got, reports) = fan_out(&providers, Op::Read, 0, |ch| ch.fetch(&topic(), None), |b: &Vec<Vec<u8>>| !b.is_empty());
+        assert!(started.elapsed() < ROUND_FLOOR + Duration::from_millis(400), "{:?}", started.elapsed());
+        assert_eq!(got, vec![vec![vec![0xAB, 0xCD]]]);
+        let attr = attribution(&reports);
+        assert!(attr.starts_with("test:stuck=late+"), "{attr}");
+        std::thread::sleep(stuck);
+        assert_eq!(providers[0].tally(Op::Read).render(), "1/0/0", "the late courier counted itself");
+
+        let quiet: Providers = Arc::new(vec![slow("test:slow-empty", Duration::from_millis(1800)), slow("test:empty", Duration::ZERO)]);
+        let started = Instant::now();
+        let (_, reports) = fan_out(&quiet, Op::Read, 0, |ch| ch.fetch(&topic(), None), |b: &Vec<Vec<u8>>| !b.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(1800), "nothing found: everyone is waited for");
+        assert!(attribution(&reports).contains("test:slow-empty=empty"));
+    }
+
     #[test]
     fn the_attribution_order_survives_the_concurrency() {
         // Строка атрибуции читается людьми и разбирается тестами — порядок обязан идти по набору
@@ -1209,6 +1406,23 @@ mod tests {
             self.seen.lock().unwrap().push(k.copied());
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn stats_count_what_each_courier_did_and_leave_out_the_ones_not_asked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let providers: Providers =
+            Arc::new(vec![labeled(&calls, true, "test:up"), labeled(&calls, false, "test:down")]);
+        let topic_hex = "ab".repeat(32);
+        let publish = || handle_publish(Some(&topic_hex), Some("-"), Some("00"), Some("600"), Some("contact"), Some("-"), None, None, None, &providers);
+        let _ = publish();
+        let _ = handle_fetch(Some(&topic_hex), Some("-"), Some("all"), Some("-"), &providers);
+        // The failed courier cools down after its first refusal: the fetch and the next publish do not ask
+        // it, and what it was not asked is not counted.
+        let _ = publish();
+        let stats = handle_stats(&providers);
+        let couriers: Vec<&str> = stats.split('\t').skip(1).collect();
+        assert_eq!(couriers, ["test:up pub=2/0/0 read=1/0/0 watch=0/0/0 conn=-", "test:down pub=0/0/1 read=0/0/0 watch=0/0/0 conn=-"]);
     }
 
     /// R7 step 3: `handle_publish`/`handle_fetch` parse the `<dhtkey_hex>` IPC arg and thread it to the
@@ -1684,6 +1898,54 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         assert!(reply.starts_with("OK ab	"), "{reply}");
         assert!(reply.contains("test:fast=ok"), "{reply}");
+    }
+
+    /// A courier that hands out the same copy every watch and counts the releases it gets.
+    struct CopyChannel {
+        delay: Duration,
+        blob: Vec<u8>,
+        released: Arc<AtomicUsize>,
+    }
+
+    impl RendezvousChannel for CopyChannel {
+        fn publish(&self, _t: &Topic, _k: Option<&[u8; 32]>, _b: &[u8], _ttl: u32) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        fn fetch(&self, _t: &Topic, _k: Option<&[u8; 32]>) -> Result<Vec<Vec<u8>>, ChannelError> {
+            Ok(Vec::new())
+        }
+        fn supports_watch(&self) -> bool {
+            true
+        }
+        fn watch(&self, _t: &[Topic], _w: Duration) -> Result<Vec<Vec<u8>>, ChannelError> {
+            std::thread::sleep(self.delay);
+            Ok(vec![self.blob.clone()])
+        }
+        fn release_watch(&self, _t: &[Topic]) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A beacon goes to two relays: its first copy answers the watch and releases the other courier's
+    /// wait; the second copy, which that courier kept, does not answer the next watch as news.
+    #[test]
+    fn a_beacons_second_copy_is_not_news_and_the_courier_that_lost_the_race_is_released() {
+        let blob = vec![0x5E, 0xC0, 0x9D];
+        let (fast_released, slow_released) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let copy = |label: &str, delay: Duration, released: &Arc<AtomicUsize>| {
+            let channel = CopyChannel { delay, blob: blob.clone(), released: Arc::clone(released) };
+            GatedProvider::new(label.to_string(), Box::new(channel))
+        };
+        let providers: Providers = Arc::new(vec![
+            copy("test:fast", Duration::from_millis(20), &fast_released),
+            copy("test:slow", Duration::from_millis(300), &slow_released),
+        ]);
+        let watch = || handle_watch(&format!(" 5 {}", topic().id()), &providers);
+        assert!(watch().starts_with("OK 5ec09d\t"), "the first copy is news");
+        assert_eq!((fast_released.load(Ordering::SeqCst), slow_released.load(Ordering::SeqCst)), (0, 1));
+        let again = watch();
+        assert!(again.starts_with("OK\t"), "{again}");
+        assert!(again.contains("test:fast=again") && again.contains("test:slow=again"), "{again}");
     }
 
     /// Negative halves: nothing new until the wait ends → an empty `OK`; no courier that can watch

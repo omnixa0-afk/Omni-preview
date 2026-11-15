@@ -69,7 +69,7 @@ internal static partial class NativeWebRtcMediaEngine
 {
     // The one place the expected ABI lives; the probe reads it too (it had its own copy, and the
     // two drifted apart on the ABI 13 bump).
-    internal const uint ExpectedAbiVersion = 23;
+    internal const uint ExpectedAbiVersion = 24;
     private const int MaxErrorBytes = 64 * 1024;
     private const int MaxStringBytes = 1_048_576;
     internal const int MaxRtpBatchBytes = 1_048_576;
@@ -252,6 +252,41 @@ internal static partial class NativeWebRtcMediaEngine
     /// endpoint available" (headless host, denied permission) and is
     /// expected to be surfaced to the user rather than retried.
     /// </summary>
+    internal static bool TryDecodeOpusPackets(byte[] packets, int sampleRateHz, int capacitySamples, out short[] pcm, out int samples)
+    {
+        pcm = [];
+        samples = 0;
+        if (Library.Value.Library is not { } library)
+        {
+            return false;
+        }
+
+        pcm = new short[capacitySamples];
+        NativeWebRtcStatus status = library.OpusDecodePackets(packets, (nuint)packets.Length, sampleRateHz, pcm, (nuint)pcm.Length, out nuint written);
+        samples = (int)written;
+        return status == NativeWebRtcStatus.Ok || (status == NativeWebRtcStatus.BufferTooSmall && samples > 0);
+    }
+
+    /// 48 kHz mono PCM into Opus packets, each with its length ahead.
+    internal static bool TryEncodeOpusPcm(short[] pcm, int bitrateBps, out byte[] packets)
+    {
+        packets = [];
+        if (Library.Value.Library is not { } library)
+        {
+            return false;
+        }
+
+        byte[] buffer = new byte[Math.Max(64 * 1024, pcm.Length)];
+        NativeWebRtcStatus status = library.OpusEncodePcm(pcm, (nuint)pcm.Length, bitrateBps, buffer, (nuint)buffer.Length, out nuint written);
+        if (status != NativeWebRtcStatus.Ok)
+        {
+            return false;
+        }
+
+        packets = buffer[..(int)written];
+        return true;
+    }
+
     internal static bool TryCreateAudioCapture(
         int targetBitrateBps,
         out AudioCaptureSession? session,
@@ -460,6 +495,8 @@ internal static partial class NativeWebRtcMediaEngine
             // Group-call speaking indicator (2026-07-11): per-endpoint smoothed RMS for tiles.
             AudioCaptureLevel = LoadExport<AudioCaptureLevelDelegate>("omni_webrtc_media_audio_capture_level");
             AudioCaptureDigitalSilenceMs = LoadExport<AudioCaptureDigitalSilenceMsDelegate>("omni_webrtc_media_audio_capture_digital_silence_ms");
+            OpusDecodePackets = LoadExport<OpusDecodePacketsDelegate>("omni_webrtc_media_opus_decode_packets");
+            OpusEncodePcm = LoadExport<OpusEncodePcmDelegate>("omni_webrtc_media_opus_encode_pcm");
             AudioPlaybackLevel = LoadExport<AudioPlaybackLevelDelegate>("omni_webrtc_media_audio_playback_level");
             // Echo-canceller visibility (2026-08-11): an echo complaint is otherwise
             // undiagnosable — a canceller that is never fed looks like one that is failing.
@@ -563,6 +600,10 @@ internal static partial class NativeWebRtcMediaEngine
 
         internal AudioCaptureLevelDelegate AudioCaptureLevel { get; }
         internal AudioCaptureDigitalSilenceMsDelegate AudioCaptureDigitalSilenceMs { get; }
+
+        internal OpusDecodePacketsDelegate OpusDecodePackets { get; }
+
+        internal OpusEncodePcmDelegate OpusEncodePcm { get; }
 
         internal AudioPlaybackLevelDelegate AudioPlaybackLevel { get; }
 
@@ -1074,6 +1115,24 @@ internal static partial class NativeWebRtcMediaEngine
         IntPtr handle,
         uint delayMs,
         out uint appliedDelayMs);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate NativeWebRtcStatus OpusDecodePacketsDelegate(
+        [In] byte[] packets,
+        nuint packetsLength,
+        int sampleRateHz,
+        [Out] short[] pcm,
+        nuint pcmCapacity,
+        out nuint samples);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate NativeWebRtcStatus OpusEncodePcmDelegate(
+        [In] short[] pcm,
+        nuint sampleCount,
+        int bitrateBps,
+        [Out] byte[] packets,
+        nuint packetsCapacity,
+        out nuint packetsLength);
 
     // How long the mic's raw input has been pure digital zero (ABI 21): the call screen's "the
     // microphone hears nothing".

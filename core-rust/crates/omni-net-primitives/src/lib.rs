@@ -12,11 +12,14 @@
 pub mod bdp_cap;
 pub mod delay_cap;
 pub mod multicast;
+pub mod public_ip;
 pub mod quic;
 pub mod stun;
+pub mod tcp_punch;
 pub mod trace;
 
 pub use multicast::{MulticastSocket, MulticastSocketConfig};
+pub use public_ip::is_public_ip;
 pub use trace::{trace_enabled, trace_line};
 pub use quic::{
     bind_quic_udp_socket, omni_client_config, omni_client_config_for, omni_server_config,

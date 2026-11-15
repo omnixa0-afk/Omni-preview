@@ -149,6 +149,10 @@ fn windows_unprotect(blob: &[u8]) -> OmniResult<Vec<u8>> {
     }
 
     let plaintext = output.to_vec();
+    // DPAPI's buffer held the secret too: wiped before it goes back to the heap.
+    if !output.pb_data.is_null() {
+        unsafe { std::slice::from_raw_parts_mut(output.pb_data, output.cb_data as usize) }.zeroize();
+    }
     output.free();
     Ok(plaintext)
 }

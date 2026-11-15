@@ -12,7 +12,7 @@ use omni_mesh_runtime::{
     detect_global_ipv6, detect_primary_lan_ipv4, node_address_from_ed25519_pubkey,
     MeshBulkStreamCallback, MeshCallbacks, MeshConfig, MeshDhtBootstrapCallback,
     MeshDhtProxyCallback, MeshDhtProxyRequest,
-    MeshDhtProxyResult,
+    MeshDhtProxyResult, MeshDurableDone, MeshDurableOutcome, MeshDurableWireCallback,
     MeshHelloMaker, MeshInterfaceKind, MeshLinkQuality, MeshMediaCallback,
     MeshNodeAddress, MeshPeerDownCallback, MeshReachabilityState, MeshRuntime, MeshWireCallback,
 };
@@ -36,6 +36,15 @@ const MESH_AUTOCONNECT_INTERVAL_SECS: u64 = 3;
 /// carry for others) are snapshotted to disk. Before 2026-10-03 this happened only on a clean
 /// `stop_mesh`, so a crash or a killed process lost every undelivered message.
 const DURABLE_PERSIST_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the autoconnect worker rotates and erases prekeys (`Storage::maintain_local_prekeys`,
+/// V-09). Rotation is weekly; an hour keeps a long-running app within an hour of it.
+const PREKEY_UPKEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// How often our groups are looked through for devices their accounts revoked, and (as an admin) for
+/// members that said they left and are still in (`remove_revoked_and_departed_from_groups`): the device
+/// that revokes takes it out at once; this catches a revocation that reached us otherwise, and a
+/// farewell whose Commit failed.
+const REVOKED_DEVICES_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Serverless-rendezvous presence-refresh / cross-network reach cadence in the autoconnect
 /// worker. Far longer than `MESH_AUTOCONNECT_INTERVAL_SECS` because each sweep publishes
@@ -48,7 +57,7 @@ const RENDEZVOUS_SWEEP_INTERVAL_SECS: u64 = 90;
 /// R7 metadata hygiene — publish jitter. The sweep cadence is randomized within
 /// `[INTERVAL, INTERVAL + JITTER]` so a rendezvous-channel observer can't fingerprint a node by a
 /// regular, clock-aligned 90 s publish tick. (The beacon TTL is 300 s, so even the longest jittered
-/// gap keeps the presence beacon valid between publishes.) See the rendezvous design notes R7.
+/// gap keeps the presence beacon valid between publishes.) See docs/decisions/bt-dht-rendezvous-courier.md (R7).
 const RENDEZVOUS_SWEEP_JITTER_SECS: u64 = 30;
 
 /// One jittered sweep interval (seconds): `INTERVAL + rand(0..=JITTER)`. Best-effort crypto randomness;
@@ -110,18 +119,27 @@ const BOOTSTRAP_WINDOW_MS: i64 = 2 * 60 * 60 * 1000;
 /// active, user-is-waiting flow — but still gentle, and it only runs while ≥1 invite is outstanding
 /// (normally 0). An immediate attempt also fires on generate/import, so this is just the retry.
 const BOOTSTRAP_SWEEP_INTERVAL_SECS: u64 = 30;
+/// How often the courier's counters go into the trace (`rendezvous/stats`).
+const RENDEZVOUS_STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// One outstanding first-contact bootstrap rendezvous (registry keyed by invite nonce hex). `secret`
 /// is the blinded-topic/beacon key both sides derive from the nonce
-/// (`omni_crypto::derive_rendezvous_bootstrap_secret`). `inviter_node` is set on the IMPORTER side
-/// (it learns the inviter's node from the invite pubkey) so the entry is pruned once that link is up;
-/// it's None on the INVITER side (it doesn't yet know who will connect, so it self-expires).
-/// `expires_at_ms` is the bootstrap window cap. See docs/decisions/invite-bootstrap-rendezvous.md.
+/// (`omni_crypto::derive_rendezvous_bootstrap_secret`). `seal` is our side of the invite: the
+/// IMPORTER knows the inviter's node (from the invite pubkey), so the entry is pruned once that link is
+/// up; the INVITER doesn't yet know who will connect, so its entry self-expires. `expires_at_ms` is the
+/// bootstrap window cap. See docs/decisions/invite-bootstrap-rendezvous.md.
 #[derive(Clone)]
 pub(crate) struct MeshBootstrapInvite {
     pub(crate) secret: [u8; 32],
-    pub(crate) inviter_node: Option<MeshNodeAddress>,
+    pub(crate) seal: InviteSeal,
     pub(crate) expires_at_ms: i64,
+}
+
+impl MeshBootstrapInvite {
+    /// The inviter's node, on the importer's side.
+    pub(crate) fn inviter_node(&self) -> Option<MeshNodeAddress> {
+        self.seal.only().map(MeshNodeAddress::from_bytes)
+    }
 }
 
 /// The single privacy axis for HOW a node connects — orthogonal to E2E encryption (always on) and
@@ -263,9 +281,10 @@ impl LinkCarrier {
     fn observe(runtime: &MeshRuntime, node: &MeshNodeAddress) -> Option<Self> {
         let kind = runtime.peer_best_carrier(node)?;
         // Про дверь спрашиваем ТОЛЬКО у UDP-несущей: у остальных этот вопрос не имеет смысла, а
-        // лишний вызов брал бы замок карты путей ещё раз.
+        // лишний вызов брал бы замок карты путей ещё раз. Дверь — в любую сторону: и наш туннель в
+        // дверь пира, и его соединение в нашу (у хозяина двери оно подписывалось «QUIC»).
         let indirect = match kind {
-            MeshInterfaceKind::QuicOverUdp => runtime.peer_on_door(node),
+            MeshInterfaceKind::QuicOverUdp => runtime.peer_through_a_door(node),
             _ => false,
         };
         Some(Self::classify(kind, indirect))
@@ -312,6 +331,10 @@ pub enum CannotReachReason {
     AddressStale,
     /// Not an approved contact — a relationship gate, not a network failure.
     NotApproved,
+    /// What we publish and what the contact publishes share no address family (only IPv6 on one
+    /// side, only IPv4 on the other): no dial can join the pair, only a relay. The families are in
+    /// `ContactConnectionState::address_family_gap`.
+    NoCommonAddressFamily,
     /// The identity challenge mismatched (possible impersonation). NOT derived here yet.
     VerificationFailed,
 }
@@ -355,6 +378,36 @@ pub struct ContactConnectionState {
     /// Couriers of ours, turned off (or only read), that would give us one — what the card suggests.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub couriers_to_enable: Vec<String>,
+    /// The contact's own servers that would give us one, not allowed yet — what the card asks (V-13).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub couriers_to_allow: Vec<String>,
+    /// Only for our own request still waiting for an answer: whether it has reached the contact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<ContactRequestProgress>,
+    /// Present with `NoCommonAddressFamily`: which families each side publishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_family_gap: Option<AddressFamilyGap>,
+}
+
+/// How far our outgoing contact request got. A request travels only over a live link (the signal
+/// rides the session handshake; no courier carries it), so "created" is not "delivered" — the
+/// shell used to say "sent" for both, and a request that never left read as one the contact ignored
+/// (docs/bugs/contact-request-said-sent-without-a-link.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactRequestProgress {
+    /// No secure session with the contact yet: the request is waiting for the first link.
+    WaitingForLink,
+    /// A session with the contact was set up over a link (a forget deletes sessions, so it is this
+    /// request's): the contact's node has the request.
+    Delivered,
+}
+
+/// The address families each side of a pair publishes, as labels ("IPv4", "IPv6", "IPv4 и IPv6").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AddressFamilyGap {
+    pub ours: String,
+    pub theirs: String,
 }
 
 /// The aggregate honest connection-state DTO: our node + per-contact links. One round-trip; the
@@ -820,9 +873,16 @@ pub(crate) fn courier_entries(storage: &omni_storage::Storage) -> Vec<String> {
             omni_rendezvous::courier_entry(&row.url, courier_use)
         })
         .collect();
-    // A courier we turned off stays off, for every pair; the DHT has no operator to differ by.
+    // A courier we turned off stays off, for every pair; the DHT has no operator to differ by. A
+    // contact's own server is used only once the user said yes to it (V-13): our address and the
+    // times we look go to whoever runs it.
+    let allowed = storage.list_allowed_pair_couriers().unwrap_or_default();
     for url in storage.list_peer_courier_urls().unwrap_or_default() {
-        if is_valid_provider_url(&url) && !url.starts_with("dht://") && !rows.iter().any(|row| row.url == url) {
+        if is_valid_provider_url(&url)
+            && !url.starts_with("dht://")
+            && !rows.iter().any(|row| row.url == url)
+            && allowed.contains(&url)
+        {
             entries.push(omni_rendezvous::courier_entry(&url, CourierUse::PairOnly));
         }
     }
@@ -878,6 +938,31 @@ pub(crate) fn contact_courier_gap(storage: &omni_storage::Storage, account_id: &
         }
     }
     (gap, to_enable)
+}
+
+/// Servers of `account_id`'s devices that are not ours and not allowed yet, which would give a
+/// device we share no courier with one: what the card asks the user to allow (V-13).
+pub(crate) fn contact_couriers_to_allow(storage: &omni_storage::Storage, account_id: &AccountId) -> Vec<String> {
+    let rows = storage.list_rendezvous_providers().unwrap_or_default();
+    let allowed = storage.list_allowed_pair_couriers().unwrap_or_default();
+    let mut to_allow: Vec<String> = Vec::new();
+    for bundle in storage.list_remote_prekey_bundles_for_account(account_id).unwrap_or_default() {
+        let pair = pair_couriers(storage, account_id, &bundle.device_id);
+        if !pair.known || (pair.publish_common && pair.read_common) {
+            continue;
+        }
+        let Ok(Some(theirs)) = storage.get_peer_courier_set(account_id, &bundle.device_id) else {
+            continue;
+        };
+        let wanted = (!pair.read_common).then_some(&theirs.publish).into_iter().chain((!pair.publish_common).then_some(&theirs.read));
+        for url in wanted.flatten() {
+            let foreign = !rows.iter().any(|row| row.url == *url) && !url.starts_with("dht://");
+            if foreign && !allowed.contains(url) && omni_rendezvous::is_public_courier_url(url) && !to_allow.contains(url) {
+                to_allow.push(url.clone());
+            }
+        }
+    }
+    to_allow
 }
 
 pub(crate) fn pair_couriers(
@@ -967,7 +1052,13 @@ pub(crate) struct MeshDialogMap {
 
 impl MeshDialogMap {
     fn insert(&mut self, dialog_key: String, node: MeshNodeAddress) {
-        self.by_node.insert(node, dialog_key.clone());
+        // The node's dialog it named before goes: kept, every hello naming a new instance id left one
+        // more entry for good (blind audit 2026-11-11, K1).
+        if let Some(previous) = self.by_node.insert(node, dialog_key.clone()) {
+            if previous != dialog_key && self.by_dialog.get(&previous) == Some(&node) {
+                self.by_dialog.remove(&previous);
+            }
+        }
         self.by_dialog.insert(dialog_key, node);
     }
 
@@ -1370,6 +1461,12 @@ impl OmniApp {
             }
             let dialog = dialogs.lock().ok().and_then(|map| map.dialog_for_node(&peer));
             if let Some(dialog) = dialog {
+                // A 1:1 call's datagrams are sealed end to end: one that does not open with the
+                // peer's key (forged, altered, replayed, from another call) goes no further.
+                let Some(payload) = crate::open_direct_call_datagram(&db_path, &dialog, &payload) else {
+                    note_unopened_call_datagram(&dialog);
+                    return;
+                };
                 // Remote screen control shares the plane with RTP but never reaches the media
                 // engine: the core verifies it and hands it to the shell's injector.
                 if crate::app_screen_control::handle_incoming_screen_control_datagram(
@@ -1410,7 +1507,11 @@ impl OmniApp {
         let hello_reply_throttle_for_wire = Arc::clone(&hello_reply_throttle);
         let transport_for_hello_reply = self.transport.clone();
         let mesh_for_hello_reply = Arc::clone(&self.mesh);
-        let on_wire: MeshWireCallback = Arc::new(move |peer, bytes| {
+        // One handler for both lanes: a live frame (`durable` = None) and a durable one, which is
+        // answered once the app is done with it (`MeshDurableDone`, see omni-mesh-runtime). Every
+        // way out of a durable frame answers it: dropped unanswered, it would stay unhandled.
+        let handle_wire = Arc::new(move |peer: MeshNodeAddress, bytes: Vec<u8>, durable: Option<MeshDurableDone>| {
+            let mut durable = durable;
             let frame: omni_transport::TransportRequestEnvelopeV1 =
                 match serde_json::from_slice(&bytes) {
                     Ok(frame) => frame,
@@ -1419,6 +1520,7 @@ impl OmniApp {
                             "mesh_wire/in",
                             &format!("peer={peer} parse_error={error} bytes={}", bytes.len()),
                         );
+                        answer_durable(&mut durable, MeshDurableOutcome::Handled);
                         return;
                     }
                 };
@@ -1437,6 +1539,31 @@ impl OmniApp {
                         .lock()
                         .map(|set| set.contains(&peer))
                         .unwrap_or(false);
+                    // Checked before anything else, the reply too: a hello refused got ours back
+                    // all the same (blind audit 2026-11-11, H4). A hello naming a contact's dialog
+                    // is that contact's, or it registers nothing: the instance id it names is
+                    // anyone's to claim (F1). One from a device of a blocked account — a device we
+                    // did not know of, its certificate vouching for it — is refused, and its node
+                    // joins the refused ones: they were the account's known devices only (H3).
+                    if let Ok(storage) = omni_storage::Storage::open(&wire_db_path) {
+                        // Whose the hello is, first: a bundle that is not the sending node's ties
+                        // nothing to it. Checked after the block, a blocked account's bundle carried by
+                        // another node had its owner's known nodes refused, and the node that sent it
+                        // kept its link (blind audit 2026-11-11, J6).
+                        if let Err(reason) = hello_speaks_for_its_node(&storage, peer, &hello) {
+                            omni_app_trace_log("mesh_wire/in", &format!("peer={peer} hello refused: {reason}"));
+                            answer_durable(&mut durable, MeshDurableOutcome::Handled);
+                            return;
+                        }
+                        if hello_is_from_a_blocked_accounts_device(&storage, &hello) {
+                            omni_app_trace_log("mesh_wire/in", &format!("peer={peer} hello refused: a blocked account's device"));
+                            if let Some(mesh_rt) = mesh_for_wire.lock().ok().and_then(|guard| guard.as_ref().map(Arc::clone)) {
+                                refuse_direct_links_with_blocked(&storage, &mesh_rt);
+                            }
+                            answer_durable(&mut durable, MeshDurableOutcome::Handled);
+                            return;
+                        }
+                    }
                     // Symmetric-hello reply (bug A/B, 2026-07-20). SessionHello is sent from
                     // `register_link` on link-up and from `dial_mesh_pairing_targets` when we
                     // want to pair. If a peer dials us as part of its own add-by-Omni-ID
@@ -1458,15 +1585,7 @@ impl OmniApp {
                     {
                         let should_reply = {
                             let mut throttle = hello_reply_throttle_for_wire.lock().unwrap_or_else(|p| p.into_inner());
-                            let now = std::time::Instant::now();
-                            let due = throttle
-                                .get(&peer)
-                                .map(|last| now.duration_since(*last).as_secs() >= 5)
-                                .unwrap_or(true);
-                            if due {
-                                throttle.insert(peer, now);
-                            }
-                            due
+                            hello_reply_due(&mut throttle, peer, std::time::Instant::now())
                         };
                         if should_reply {
                             if let Some(mesh_rt) = mesh_for_hello_reply
@@ -1474,10 +1593,18 @@ impl OmniApp {
                                 .ok()
                                 .and_then(|guard| guard.as_ref().map(Arc::clone))
                             {
-                                let hello_bytes = serde_json::to_vec(
-                                    &transport_for_hello_reply.build_local_session_hello_envelope(),
-                                )
-                                .unwrap_or_default();
+                                let pairing_target = pairing_targets.lock().map(|set| set.contains(&peer)).unwrap_or(false);
+                                let reply = omni_storage::Storage::open(&wire_db_path).ok().and_then(|storage| {
+                                    hello_reply_for(
+                                        &storage,
+                                        peer,
+                                        pairing_target,
+                                        transport_for_hello_reply.build_local_session_hello_envelope(),
+                                    )
+                                });
+                                let hello_bytes = reply
+                                    .and_then(|reply| serde_json::to_vec(&reply).ok())
+                                    .unwrap_or_default();
                                 if !hello_bytes.is_empty() {
                                     match mesh_rt.send_wire(peer, &hello_bytes) {
                                         Ok(()) => omni_app_trace_log(
@@ -1524,10 +1651,15 @@ impl OmniApp {
                             }
                             // Refresh the persisted node↔dialog bridge on every
                             // link-up so durable delivery stays correct across a
-                            // re-pair / instance change (overwrites stale routes).
+                            // re-pair / instance change (overwrites stale routes). Only for a
+                            // node we know — a contact's dialog, or a device of ours: a row for
+                            // every node that ever said hello grew the table for good (K1).
                             if let Ok(storage) = omni_storage::Storage::open(&wire_db_path) {
-                                let _ = storage
-                                    .set_mesh_dialog_route(peer.as_bytes(), &ctx.dialog_key);
+                                let known = storage.resolve_contact_for_dialog(&ctx.dialog_key).ok().flatten().is_some()
+                                    || own_device_nodes_for(&wire_db_path).contains(peer.as_bytes());
+                                if known {
+                                    let _ = storage.set_mesh_dialog_route(peer.as_bytes(), &ctx.dialog_key);
+                                }
                             }
                             if let Ok(mut ctxs) = node_ctx.lock() {
                                 ctxs.insert(peer, ctx);
@@ -1551,17 +1683,19 @@ impl OmniApp {
                             );
                         }
                     }
+                    answer_durable(&mut durable, MeshDurableOutcome::Handled);
                 }
                 omni_transport::TransportRequestPayloadV1::GroupFeed { feed: _, item_json } => {
                     // Group durable-feed frame (G3): sender-key crypto replaces the
                     // pairwise ctx, so ingest straight from storage. Same path for
                     // live gossip and store-and-forward delivery.
-                    if let Ok(storage) = omni_storage::Storage::open(&wire_db_path) {
-                        if let Err(error) = crate::app_groups::ingest_group_feed_item(
+                    let ingested = omni_storage::Storage::open(&wire_db_path).map(|storage| {
+                        let ingested = crate::app_groups::ingest_group_feed_item(
                             &storage,
                             &transport_for_wire,
                             &item_json,
-                        ) {
+                        );
+                        if let Err(error) = &ingested {
                             omni_app_trace_log(
                                 "mesh_wire/in",
                                 &format!("peer={peer} group_feed ingest error={error}"),
@@ -1572,7 +1706,9 @@ impl OmniApp {
                         if let Some(mesh) = mesh_for_wire.lock().ok().and_then(|g| g.as_ref().map(Arc::clone)) {
                             crate::app_groups::flush_group_feed_outbox(&storage, &mesh);
                         }
-                    }
+                        ingested
+                    });
+                    answer_durable(&mut durable, durable_outcome_for(&ingested.and_then(|result| result)));
                 }
                 omni_transport::TransportRequestPayloadV1::WireEnvelope { envelope } => {
                     let ctx = node_ctx.lock().ok().and_then(|map| map.get(&peer).cloned());
@@ -1585,7 +1721,7 @@ impl OmniApp {
                                     ctx.dialog_key
                                 ),
                             );
-                            transport_for_wire.inject_inbound_wire_envelope(envelope, ctx);
+                            inject_wire_envelope(&transport_for_wire, envelope, ctx, durable.take());
                         }
                         None => {
                             // No active node-ctx: we never linked this peer this
@@ -1611,7 +1747,7 @@ impl OmniApp {
                                     );
                                     let ctx = transport_for_wire
                                         .received_context_for_dialog_key(&dialog_key);
-                                    transport_for_wire.inject_inbound_wire_envelope(envelope, ctx);
+                                    inject_wire_envelope(&transport_for_wire, envelope, ctx, durable.take());
                                 }
                                 None => {
                                     // First-contact self-contained bootstrap (2026-07-20): a
@@ -1629,19 +1765,48 @@ impl OmniApp {
                                         }
                                         _ => None,
                                     };
+                                    // An unknown node binds the dialog to itself only with a bootstrap
+                                    // of its own device (V-01): one that proves the account and device it
+                                    // names, sent by that device's node — not a real one relayed by another.
+                                    let verified_storage = match &envelope.payload {
+                                        omni_types::WirePayloadV1::SessionBootstrap(message) => {
+                                            omni_storage::Storage::open(&wire_db_path).and_then(|storage| {
+                                                let (_profile, _account, device) =
+                                                    active_profile_context(&storage)?;
+                                                verify_first_contact_bootstrap(
+                                                    &storage,
+                                                    message,
+                                                    &device.device_id,
+                                                    &peer,
+                                                )?;
+                                                Ok(storage)
+                                            })
+                                        }
+                                        _ => Err(OmniError::InvalidInput("not a bootstrap".to_string())),
+                                    };
+                                    let bootstrap_ctx = match (bootstrap_ctx, verified_storage) {
+                                        (Some(Some(ctx)), Err(error)) => {
+                                            omni_app_trace_log(
+                                                "mesh_wire/in",
+                                                &format!(
+                                                    "peer={peer} first-contact bootstrap DROPPED: {error} dialog_key={}",
+                                                    ctx.dialog_key
+                                                ),
+                                            );
+                                            answer_durable(&mut durable, MeshDurableOutcome::Handled);
+                                            return;
+                                        }
+                                        (Some(Some(ctx)), Ok(storage)) => Some(Some((ctx, storage))),
+                                        (Some(None), _) => Some(None),
+                                        (None, _) => None,
+                                    };
                                     match bootstrap_ctx {
-                                        Some(Some(ctx)) => {
+                                        Some(Some((ctx, storage))) => {
                                             if let Ok(mut map) = wire_dialogs.lock() {
                                                 map.insert(ctx.dialog_key.clone(), peer);
                                             }
-                                            if let Ok(storage) =
-                                                omni_storage::Storage::open(&wire_db_path)
-                                            {
-                                                let _ = storage.set_mesh_dialog_route(
-                                                    peer.as_bytes(),
-                                                    &ctx.dialog_key,
-                                                );
-                                            }
+                                            let _ = storage
+                                                .set_mesh_dialog_route(peer.as_bytes(), &ctx.dialog_key);
                                             omni_app_trace_log(
                                                 "mesh_wire/in",
                                                 &format!(
@@ -1649,21 +1814,28 @@ impl OmniApp {
                                                     ctx.dialog_key
                                                 ),
                                             );
-                                            transport_for_wire
-                                                .inject_inbound_wire_envelope(envelope, ctx);
+                                            inject_wire_envelope(&transport_for_wire, envelope, ctx, durable.take());
                                         }
-                                        Some(None) => omni_app_trace_log(
-                                            "mesh_wire/in",
-                                            &format!(
-                                                "peer={peer} bootstrap DROPPED (no initiator_instance_id — pre-fix sender)"
-                                            ),
-                                        ),
-                                        None => omni_app_trace_log(
-                                            "mesh_wire/in",
-                                            &format!(
-                                                "peer={peer} wire-envelope DROPPED (no node_ctx, no persisted route)"
-                                            ),
-                                        ),
+                                        Some(None) => {
+                                            omni_app_trace_log(
+                                                "mesh_wire/in",
+                                                &format!(
+                                                    "peer={peer} bootstrap DROPPED (no initiator_instance_id — pre-fix sender)"
+                                                ),
+                                            );
+                                            answer_durable(&mut durable, MeshDurableOutcome::Handled);
+                                        }
+                                        None => {
+                                            omni_app_trace_log(
+                                                "mesh_wire/in",
+                                                &format!(
+                                                    "peer={peer} wire-envelope DROPPED (no node_ctx, no persisted route)"
+                                                ),
+                                            );
+                                            // The route may come with this peer's hello: a durable
+                                            // frame is offered again then.
+                                            answer_durable(&mut durable, MeshDurableOutcome::Retry);
+                                        }
                                     }
                                 }
                             }
@@ -1672,11 +1844,35 @@ impl OmniApp {
                 }
             }
         });
+        let on_wire: MeshWireCallback = {
+            let handle_wire = Arc::clone(&handle_wire);
+            Arc::new(move |peer, bytes| handle_wire(peer, bytes, None))
+        };
+        let on_durable_wire: MeshDurableWireCallback =
+            Arc::new(move |peer, bytes, done| handle_wire(peer, bytes, Some(done)));
 
         // Outbound app-hello: our SessionHello sent as the first reliable frame
-        // on link-up (the facade ships these bytes from its async context).
+        // on link-up (the facade ships these bytes from its async context) — on a link we brought
+        // up, and to a peer we know: one we dialed (a contact, an invite's or a search's target), a
+        // contact's device, a pairing target. A hello carries our account's Omni-ID, device name, addresses and prekey bundle;
+        // anyone else who brings a link up (a relay, a neighbour, whoever learned our address) gets it
+        // only in answer to its own (the symmetric reply in `on_wire`), having said who it is first.
+        // Every peer that means to reach us knows us and sends its hello on its own link-up, so
+        // nothing that pairs or talks waits on ours
+        // (docs/bugs/an-invite-importer-dialed-another-importer.md, «Что остаётся»).
         let transport_for_hello = self.transport.clone();
-        let make_hello: MeshHelloMaker = Arc::new(move |_peer| {
+        let dialed_for_hello = Arc::clone(&self.mesh_locally_dialed);
+        let dialogs_for_hello = Arc::clone(&self.mesh_dialogs);
+        let targets_for_hello = Arc::clone(&self.mesh_pairing_targets);
+        let make_hello: MeshHelloMaker = Arc::new(move |peer, dialed_by_us| {
+            let known = dialed_by_us
+                || dialed_for_hello.lock().is_ok_and(|set| set.contains(&peer))
+                || dialogs_for_hello.lock().is_ok_and(|map| map.dialog_for_node(&peer).is_some())
+                || targets_for_hello.lock().is_ok_and(|set| set.contains(&peer));
+            if !known {
+                omni_app_trace_log("mesh_wire/hello", &format!("peer={peer} not known: our hello waits for theirs"));
+                return Vec::new();
+            }
             serde_json::to_vec(&transport_for_hello.build_local_session_hello_envelope())
                 .unwrap_or_default()
         });
@@ -1693,6 +1889,10 @@ impl OmniApp {
             if let Ok(mut ctxs) = node_ctx_for_down.lock() {
                 ctxs.remove(&peer);
             }
+            // The node's dialog stays in the map: a frame that comes before its next hello (a link
+            // that flickered) is delivered by it. Dropping it for a node not yet a contact lost such
+            // frames — the full run caught a download stuck so (K1 went that far first; one node holds
+            // one entry in it, `MeshDialogMap::insert`).
             // Presence event for the daemon's event plane: the link to this peer is down.
             record_link_state_event(&down_db_path, &peer.to_string(), false);
             omni_app_trace_log("mesh/peer_down", &format!("peer={peer} cleared stale session state"));
@@ -1772,6 +1972,33 @@ impl OmniApp {
                     }
                     return;
                 }
+                Ok(crate::app_group_attachments::InboundBulk::Git(bulk)) => {
+                    let db_path = bulk_storage
+                        .lock()
+                        .map(|storage| storage.db_path().to_string_lossy().into_owned());
+                    if let Ok(db_path) = db_path {
+                        crate::app_git_bridge::serve_git_stream(&db_path, peer, bulk);
+                    }
+                    return;
+                }
+                Ok(crate::app_group_attachments::InboundBulk::Content(bulk)) => {
+                    let db_path = bulk_storage
+                        .lock()
+                        .map(|storage| storage.db_path().to_string_lossy().into_owned());
+                    if let Ok(db_path) = db_path {
+                        crate::app_workspace::content::serve_content_stream(&db_path, peer, bulk);
+                    }
+                    return;
+                }
+                Ok(crate::app_group_attachments::InboundBulk::Blocks(bulk)) => {
+                    let db_path = bulk_storage
+                        .lock()
+                        .map(|storage| storage.db_path().to_string_lossy().into_owned());
+                    if let Ok(db_path) = db_path {
+                        crate::app_workspace::content::serve_blocks_stream(&db_path, peer, bulk);
+                    }
+                    return;
+                }
                 Err(error) => {
                     omni_app_trace_log(
                         "attachment/bulk-in",
@@ -1834,6 +2061,7 @@ impl OmniApp {
 
         let callbacks = MeshCallbacks {
             on_wire: Some(on_wire),
+            on_durable_wire: Some(on_durable_wire),
             on_media,
             make_hello: Some(make_hello),
             on_peer_down: Some(on_peer_down),
@@ -1974,11 +2202,12 @@ impl OmniApp {
         // contact can't learn our IP. The sidecar is the source of truth, re-read on every start;
         // `set_connection_privacy_mode` flips it live thereafter. See docs/decisions/connection-privacy-modes.md.
         crate::app_pinned_relay::apply_direct_gate(&self.storage, &runtime, &db_path_string);
+        // Our carriers from the start: unnamed until the first tick, every verified neighbour was one
+        // (blind audit 2026-11-11, J3).
+        runtime.set_durable_carriers(durable_carrier_nodes(&self.storage));
         // Friend-proxy (Axis 2): re-seed the runtime's in-memory per-friend consent set from the
         // persisted per-contact flags (the runtime set is per-run; storage is the source of truth).
-        for node in friend_relay_consented_nodes {
-            runtime.consent_to_relay_for(node);
-        }
+        runtime.set_relay_consents(friend_relay_consented_nodes.into_iter().collect());
         // Restore store-and-forward durable frames persisted before the last stop,
         // so frames held for offline peers survive a restart (best-effort: a
         // storage error just means we start with an empty store). P4 durable.
@@ -2030,7 +2259,7 @@ impl OmniApp {
         // bootstrap entries that carry a PINNED identity) so they come up as entry points right after
         // start. Endpoint-only entries (no pinned node) are skipped until anonymous learn-on-connect
         // lands. Off-thread (dial_at blocks on the mesh executor) + no-op if already linked; endpoints
-        // are hints, the dial challenge is the authority. See docs/notes/roadmap-CONTINUE.md.
+        // are hints, the dial challenge is the authority. See docs/decisions/community-volunteer-nodes.md.
         let registry_nodes = self.storage.list_network_nodes().unwrap_or_default();
         if !registry_nodes.is_empty() {
             let relay_runtime = Arc::clone(&runtime);
@@ -2089,7 +2318,9 @@ impl OmniApp {
         // destination so inbound group frames deliver and our sends gossip to
         // co-members. Done after the runtime is installed so the facade exists.
         // Groups that lost their rows come back first (docs/bugs/old-build-wiped-groups.md).
-        crate::app_groups::restore_groups_without_rows(&self.storage);
+        if let Some(runtime) = self.mesh_runtime() {
+            crate::app_groups::restore_groups_without_rows(&self.storage, &runtime.node_address());
+        }
         self.resubscribe_all_groups();
         omni_app_trace_log(
             "mesh/start",
@@ -2226,17 +2457,49 @@ impl OmniApp {
                 continue; // no remote account → nothing to address
             };
             let verified = contact.has_met;
-            // (link kind, relay hops if relayed, reason if unreachable).
+            let awaiting_our_request = contact.relationship_state
+                == omni_identity::ContactRelationshipState::Pending
+                && contact.pending_request_direction
+                    == Some(omni_identity::ContactRequestDirection::Outgoing);
+            let request = if awaiting_our_request {
+                Some(if self.storage.get_latest_session_for_remote_account(&account_id)?.is_some() {
+                    ContactRequestProgress::Delivered
+                } else {
+                    ContactRequestProgress::WaitingForLink
+                })
+            } else {
+                None
+            };
+            // Families each side publishes, when they share none and no link is up anyway.
+            let family_gap = |node: &MeshNodeAddress| {
+                if runtime.has_link(node) {
+                    return None;
+                }
+                crate::app_nat_class::address_family_gap(&db_path, node.as_bytes())
+            };
+            let mut address_family_gap = None;
             // (link kind, relay hops if relayed, reason if unreachable, carrier if linked).
             let (link, relay_hops, cannot_reach_reason, carrier) = if contact.relationship_state
                 != omni_identity::ContactRelationshipState::Approved
             {
-                (
-                    ContactLinkKind::CannotReach,
-                    None,
-                    Some(CannotReachReason::NotApproved),
-                    None,
-                )
+                // A request that cannot leave because no dial can join the pair says why, instead
+                // of a bare "not approved" (the request needs a link — see ContactRequestProgress).
+                let gap = if request == Some(ContactRequestProgress::WaitingForLink) {
+                    self.mesh_node_for_account(&account_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|node| family_gap(&node))
+                        .filter(|_| !any_relay_reachable(&self.storage, &runtime))
+                } else {
+                    None
+                };
+                let reason = if gap.is_some() {
+                    CannotReachReason::NoCommonAddressFamily
+                } else {
+                    CannotReachReason::NotApproved
+                };
+                address_family_gap = gap;
+                (ContactLinkKind::CannotReach, None, Some(reason), None)
             } else {
                 match self.mesh_node_for_account(&account_id)? {
                     // No stored prekey bundle yet → can't derive a node to dial.
@@ -2306,10 +2569,7 @@ impl OmniApp {
                                 Some(CannotReachReason::RendezvousDisabled),
                                 None,
                             )
-                        } else if rendezvous_peers_for_account(&self.storage, &account_id)
-                            .iter()
-                            .any(|peer| peer.node == node_addr)
-                        {
+                        } else if node_has_rendezvous_secret(&self.storage, &account_id, &node_addr) {
                             // Phase C honest surface: if a direct link is genuinely impossible (both
                             // ends symmetric AND neither advertises a forward or a TCP door), an endless
                             // "searching" is a lie. If no relay is currently reachable to backstop the
@@ -2318,8 +2578,20 @@ impl OmniApp {
                             // The class alone is NOT enough — a forward on either side is reachable
                             // outbound from behind any NAT; see app_nat_class::direct_is_impossible_for_pair.
                             // См. docs/decisions/connectivity-upgrade-via-peer-relay.md (Phase C).
-                            if crate::app_nat_class::direct_is_impossible_for_pair(&db_path, node_addr.as_bytes())
-                                && !any_relay_reachable(&self.storage, &runtime)
+                            // No common address family is the plainer case of the same verdict, and
+                            // the one the user can act on (turn IPv4 / IPv6 on, or add a relay).
+                            let relay_reachable = any_relay_reachable(&self.storage, &runtime);
+                            let gap = family_gap(&node_addr).filter(|_| !relay_reachable);
+                            if gap.is_some() {
+                                address_family_gap = gap;
+                                (
+                                    ContactLinkKind::CannotReach,
+                                    None,
+                                    Some(CannotReachReason::NoCommonAddressFamily),
+                                    None,
+                                )
+                            } else if crate::app_nat_class::direct_is_impossible_for_pair(&db_path, node_addr.as_bytes())
+                                && !relay_reachable
                             {
                                 (
                                     ContactLinkKind::CannotReach,
@@ -2345,6 +2617,7 @@ impl OmniApp {
             };
             let trace = connection_trace_for(&db_path, &account_id.0);
             let (no_common_courier, couriers_to_enable) = contact_courier_gap(&self.storage, &account_id);
+            let couriers_to_allow = contact_couriers_to_allow(&self.storage, &account_id);
             contacts.push(ContactConnectionState {
                 account_id: account_id.0,
                 link,
@@ -2355,6 +2628,12 @@ impl OmniApp {
                 trace,
                 no_common_courier,
                 couriers_to_enable,
+                couriers_to_allow,
+                request,
+                address_family_gap: address_family_gap.map(|(ours, theirs)| AddressFamilyGap {
+                    ours: ours.label().to_string(),
+                    theirs: theirs.label().to_string(),
+                }),
             });
         }
 
@@ -2754,12 +3033,16 @@ impl OmniApp {
             .map_err(|_| OmniError::Internal("bootstrap nonce must be 32 bytes".to_string()))?;
         let bootstrap_nonce_hex = hex::encode(nonce);
         let secret = omni_crypto::derive_rendezvous_bootstrap_secret(&nonce)?;
-        self.register_bootstrap_invite(&bootstrap_nonce_hex, secret, None, now + BOOTSTRAP_WINDOW_MS);
+        let (seed, _) = crate::app_screen_control::local_signing_identity(&self.storage)?;
+        let (reply, reply_public) = omni_crypto::derive_invite_reply_key(&seed, &nonce)?;
+        let seal = InviteSeal::Inviter { reply };
+        self.register_bootstrap_invite(&bootstrap_nonce_hex, secret, seal, now + BOOTSTRAP_WINDOW_MS);
         let token = encode_mesh_pairing_invite(&omni_types::MeshPairingInviteV1 {
             version: omni_types::MESH_PAIRING_INVITE_VERSION_V1,
             source_instance_id,
             signing_pubkey_hex: bundle.account.identity_signing_public_key,
             bootstrap_nonce_hex,
+            reply_key_hex: hex::encode(reply_public),
             // The friend gets where we can be met — URLs only, how we use them is our own business,
             // and a courier we only know from another contact is not ours to hand on.
             rendezvous_providers: self
@@ -2775,7 +3058,7 @@ impl OmniApp {
         })?;
         // Make ourselves findable immediately (publish a bootstrap beacon now), not only on the
         // next worker sweep — best-effort, a no-op until the mesh is started.
-        let _ = self.spawn_one_bootstrap_dial(secret);
+        let _ = self.spawn_one_bootstrap_dial(secret, seal);
         Ok(token)
     }
 
@@ -2818,40 +3101,36 @@ impl OmniApp {
         // If the invite carries a bootstrap nonce, seed the first-contact rendezvous so we can
         // reach the inviter even on another network (no shared LAN, no session yet). Best-effort:
         // a malformed nonce just falls back to announce/manual pairing — it doesn't fail the import.
-        if let Some(nonce) = hex::decode(invite.bootstrap_nonce_hex.trim())
-            .ok()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        {
+        // Without the inviter's reply key our beacon would be readable by everyone holding the invite,
+        // so there is no rendezvous then either.
+        let nonce = hex::decode(invite.bootstrap_nonce_hex.trim()).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+        let inviter_key = hex::decode(invite.reply_key_hex.trim()).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+        if let (Some(nonce), Some(inviter_key)) = (nonce, inviter_key) {
             let secret = omni_crypto::derive_rendezvous_bootstrap_secret(&nonce)?;
             let window = current_unix_ms() + BOOTSTRAP_WINDOW_MS;
             let expires = window.min(invite.expires_at_unix_ms);
-            self.register_bootstrap_invite(&invite.bootstrap_nonce_hex, secret, Some(node), expires);
+            let seal = importer_seal(node, inviter_key)?;
+            self.register_bootstrap_invite(&invite.bootstrap_nonce_hex, secret, seal, expires);
             // Try to reach the inviter right now, then the worker retries until the link is up.
-            let _ = self.spawn_one_bootstrap_dial(secret);
+            let _ = self.spawn_one_bootstrap_dial(secret, seal);
         }
         Ok(node)
     }
 
     /// Record (or refresh) an outstanding first-contact bootstrap rendezvous entry. Best-effort: a
     /// poisoned registry lock is ignored (the worker sweep + the immediate kick both retry).
-    fn register_bootstrap_invite(
-        &self,
-        nonce_hex: &str,
-        secret: [u8; 32],
-        inviter_node: Option<MeshNodeAddress>,
-        expires_at_ms: i64,
-    ) {
+    fn register_bootstrap_invite(&self, nonce_hex: &str, secret: [u8; 32], seal: InviteSeal, expires_at_ms: i64) {
         if let Ok(mut map) = self.mesh_bootstrap_invites.lock() {
-            map.insert(
-                nonce_hex.to_string(),
-                MeshBootstrapInvite { secret, inviter_node, expires_at_ms },
-            );
+            map.insert(nonce_hex.to_string(), MeshBootstrapInvite { secret, seal, expires_at_ms });
         }
         // Persist (nonce, not the derived secret) so a restart mid-window re-arms this bootstrap
         // rendezvous — `reload_persisted_bootstrap_invites` on mesh-start re-derives the secret from
         // the nonce. Best-effort: a storage error just loses the restart-survival, not the live entry.
-        let node_bytes = inviter_node.map(|node| *node.as_bytes());
-        let _ = self.storage.upsert_bootstrap_invite(nonce_hex, node_bytes, expires_at_ms);
+        let inviter_key = match seal {
+            InviteSeal::Importer { inviter_key, .. } => Some(inviter_key),
+            InviteSeal::None | InviteSeal::Inviter { .. } => None,
+        };
+        let _ = self.storage.upsert_bootstrap_invite(nonce_hex, seal.only(), inviter_key, expires_at_ms);
     }
 
     /// Repopulate the in-memory bootstrap-invite + pairing-target sets from storage on mesh-start, so a
@@ -2883,15 +3162,29 @@ impl OmniApp {
                     targets.insert(node);
                 }
             }
+            // Our side of it: the inviter re-derives its reply key from the nonce; the importer takes
+            // a fresh key of its own (the old one was never stored). An imported row without the
+            // inviter's key has no rendezvous, as at import.
+            let seal = match (inviter_node, row.inviter_reply_key) {
+                (None, _) => crate::app_screen_control::local_signing_identity(&self.storage)
+                    .and_then(|(seed, _)| omni_crypto::derive_invite_reply_key(&seed, &nonce))
+                    .map(|(reply, _)| InviteSeal::Inviter { reply }),
+                (Some(node), Some(inviter_key)) => importer_seal(node, inviter_key),
+                (Some(_), None) => continue,
+            };
+            let Ok(seal) = seal else {
+                continue;
+            };
             // register_bootstrap_invite re-persists idempotently (upsert) — a harmless no-op on reload.
-            self.register_bootstrap_invite(&row.nonce_hex, secret, inviter_node, row.expires_at_ms);
+            self.register_bootstrap_invite(&row.nonce_hex, secret, seal, row.expires_at_ms);
         }
     }
 
     /// Fire ONE bootstrap rendezvous dial under `secret` off the hot path (publish my endpoints to
     /// the blinded bootstrap topic + fetch/dial the other side). No-op until the mesh is started —
-    /// the autoconnect worker's bootstrap sweep then keeps retrying. Best-effort.
-    fn spawn_one_bootstrap_dial(&self, secret: [u8; 32]) -> OmniResult<()> {
+    /// the autoconnect worker's bootstrap sweep then keeps retrying. Best-effort. `inviter` — the
+    /// importer's side: only the inviter's beacon on the topic is dialed, not another importer's.
+    fn spawn_one_bootstrap_dial(&self, secret: [u8; 32], seal: InviteSeal) -> OmniResult<()> {
         let Some(runtime) = self.mesh_runtime() else {
             return Ok(());
         };
@@ -2911,8 +3204,20 @@ impl OmniApp {
         let rendezvous = self.ensure_rendezvous_runtime()?;
         // No relay bundle on a BOOTSTRAP beacon (R1c): first contact, pre-approval — see the sweep
         // note below. The bundle rides only the approved per-pair beacon.
-        spawn_rendezvous_dial(rendezvous, runtime, secret, PairCouriers::default(), my_node, Vec::new(), None, None, None, None)
-            .map_err(|error| OmniError::Internal(format!("spawn bootstrap dial thread: {error}")))
+        spawn_rendezvous_dial(
+            rendezvous,
+            runtime,
+            secret,
+            PairCouriers::default(),
+            my_node,
+            Vec::new(),
+            seal,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| OmniError::Internal(format!("spawn bootstrap dial thread: {error}")))
     }
 
     /// The active profile's connection-privacy mode (Auto by default). Auto allows third-party
@@ -2925,6 +3230,7 @@ impl OmniApp {
     /// Set the active profile's connection-privacy mode (persisted in the sidecar). Takes effect on
     /// the next rendezvous sweep / bootstrap attempt — the autoconnect worker re-reads it each sweep.
     pub fn set_connection_privacy_mode(&self, mode: ConnectionPrivacyMode) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("set_connection_privacy_mode")?;
         let path = connection_privacy_mode_sidecar_path(&self.storage.db_path().to_string_lossy());
         std::fs::write(&path, mode.as_db_value()).map_err(|error| {
             OmniError::Storage(format!(
@@ -2960,6 +3266,7 @@ impl OmniApp {
     /// take TCP or Auto live while the relay answers on TCP; it restarts, the way it was started.
     /// See docs/decisions/connection-quality-ladder.md.
     pub fn set_carrier_policy(&self, policy: omni_types::CarrierPolicy) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("set_carrier_policy")?;
         let db_path = self.storage.db_path().to_string_lossy().to_string();
         let path = carrier_policy_sidecar_path(&db_path);
         std::fs::write(&path, policy.as_db_value()).map_err(|error| {
@@ -2997,6 +3304,7 @@ impl OmniApp {
     /// Persist the active profile's fixed direct-TCP front-door port. `None`/`Some(0)` clears it back
     /// to ephemeral. A restart / mesh reconnect applies it (the listener binds at mesh start).
     pub fn set_direct_tcp_bind_port(&self, port: Option<u16>) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("set_direct_tcp_bind_port")?;
         let path = direct_tcp_port_sidecar_path(&self.storage.db_path().to_string_lossy());
         match port.filter(|p| *p != 0) {
             Some(port) => std::fs::write(&path, port.to_string()).map_err(|error| {
@@ -3032,19 +3340,11 @@ impl OmniApp {
             self.storage
                 .set_contact_friend_relay_consent(contact_id, consent, current_unix_ms())?;
         if let Some(runtime) = self.mesh_runtime() {
-            // A contact without a stored prekey bundle (no secure session yet) has no resolvable
-            // NodeAddress — the persisted flag still holds and seeds a later mesh start.
-            if let Some(node) = snapshot
-                .remote_account_id
-                .as_ref()
-                .and_then(|account_id| self.mesh_node_for_account(account_id).ok().flatten())
-            {
-                if consent {
-                    runtime.consent_to_relay_for(node);
-                } else {
-                    runtime.revoke_relay_consent(&node);
-                }
-            }
+            // The whole set, as the contacts stand now — not one node given or taken: a consent
+            // taken back stayed with the device it was given to while another was the one picked
+            // for dialing (blind audit 2026-11-11, L4). A contact without a stored prekey bundle (no
+            // secure session yet) has no node — the persisted flag still holds and counts later.
+            runtime.set_relay_consents(friend_relay_nodes(&self.storage));
             runtime.set_friend_relay_advertised(
                 !self
                     .storage
@@ -3060,12 +3360,7 @@ impl OmniApp {
     /// what mesh start seeds the runtime consent set from. Consents whose contact has no stored
     /// prekey bundle yet are skipped (unresolvable until a secure session exists).
     fn friend_relay_consented_nodes(&self) -> Vec<MeshNodeAddress> {
-        self.storage
-            .list_friend_relay_consented_account_ids()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|account_id| self.mesh_node_for_account(account_id).ok().flatten())
-            .collect()
+        friend_relay_nodes(&self.storage).into_iter().collect()
     }
 
     fn mesh_lock(&self) -> OmniResult<std::sync::MutexGuard<'_, Option<Arc<MeshRuntime>>>> {
@@ -3077,7 +3372,7 @@ impl OmniApp {
     /// Cheap clone of the running mesh runtime, if any. Locks only long enough to
     /// clone the `Arc`; the (blocking) dial/send then runs off the lock so it
     /// can't stall the live media/wire send path that needs the same handle.
-    fn mesh_runtime(&self) -> Option<Arc<MeshRuntime>> {
+    pub(crate) fn mesh_runtime(&self) -> Option<Arc<MeshRuntime>> {
         self.mesh
             .lock()
             .ok()
@@ -3129,12 +3424,28 @@ impl OmniApp {
         // see dial_mesh_pairing_targets). Same builder as the on-link-up `make_hello` above.
         let hello_maker: MeshHelloMaker = {
             let transport = self.transport.clone();
-            Arc::new(move |_peer| {
+            Arc::new(move |_peer, _| {
                 serde_json::to_vec(&transport.build_local_session_hello_envelope())
                     .unwrap_or_default()
             })
         };
-        std::thread::spawn(move || {
+        // After a signed-prekey rotation the bundle our hello carries is the old one: put the new one in.
+        let republish_bundle: PrekeyBundleRepublisher = {
+            let transport = self.transport.clone();
+            Arc::new(move |storage: &Storage| {
+                let Some(device) = storage.get_local_device().ok().flatten() else {
+                    return;
+                };
+                let Ok(bundle) = storage.build_local_prekey_bundle(current_unix_ms()) else {
+                    return;
+                };
+                if let Ok(json) = serde_json::to_string(&prekey_bundle_v1_from_raw(&bundle, device.device_label)) {
+                    transport.set_local_prekey_bundle_json(Some(json));
+                }
+            })
+        };
+        let spawn_worker = std::thread::Builder::new().name("omni-mesh-tick".to_string());
+        let _ = spawn_worker.spawn(move || {
             run_mesh_autoconnect_worker(
                 db_path,
                 mesh,
@@ -3142,11 +3453,15 @@ impl OmniApp {
                 pairing_targets,
                 bootstrap_invites,
                 hello_maker,
+                republish_bundle,
                 stop_rx,
             );
         });
     }
 }
+
+/// Puts a fresh prekey bundle into the hello the transport sends (see `spawn_mesh_autoconnect`).
+type PrekeyBundleRepublisher = Arc<dyn Fn(&Storage) + Send + Sync>;
 
 /// Background loop: every `MESH_AUTOCONNECT_INTERVAL_SECS`, dial any approved
 /// contact that isn't yet mesh-linked. Opens its own `Storage` handle (rusqlite
@@ -3159,6 +3474,7 @@ fn run_mesh_autoconnect_worker(
     pairing_targets: Arc<Mutex<std::collections::HashSet<MeshNodeAddress>>>,
     bootstrap_invites: Arc<Mutex<std::collections::HashMap<String, MeshBootstrapInvite>>>,
     hello_maker: MeshHelloMaker,
+    republish_bundle: PrekeyBundleRepublisher,
     stop_rx: mpsc::Receiver<()>,
 ) {
     let storage = match Storage::open(&db_path) {
@@ -3184,6 +3500,7 @@ fn run_mesh_autoconnect_worker(
     // Воркер ЗАПУЩЕН (не первый такт): от этой точки отсчитывается льготное окно до первого цикла
     // рандеву, и именно она отделяет «долго стартовало приложение» от «долго ждали окна».
     omni_app_trace_log("mesh/worker", "started");
+    let mut last_rendezvous_stats = std::time::Instant::now();
     // Узлы, дозвон до которых сейчас идёт в фоне. Живёт у воркера: других пользователей нет.
     let dials_in_flight: Arc<Mutex<std::collections::HashSet<MeshNodeAddress>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -3256,18 +3573,44 @@ fn run_mesh_autoconnect_worker(
     // Push wake-ups: courier subscriptions on the topics of the contacts without a direct link and on
     // the account topic — see `BeaconWatches`.
     let mut beacon_watches = BeaconWatches::new();
+    // What knocks for a TCP hole punch have cost us lately (app_tcp_knock.rs).
+    let mut knock_limit = KnockLimit::default();
     let mut last_durable_persist = std::time::Instant::now();
     let mut persisted_durable_marks: u64 = 0;
+    // The profile's start already did it (`ensure_local_crypto_foundation`).
+    let mut last_prekey_upkeep = std::time::Instant::now();
+    // When revoked devices were last looked for in our groups (a revocation another device of ours
+    // made, or a contact told us of, reaches the groups here).
+    let mut last_revoked_sweep: Option<std::time::Instant> = None;
     loop {
-        match stop_rx.recv_timeout(std::time::Duration::from_secs(MESH_AUTOCONNECT_INTERVAL_SECS)) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        // A tick every MESH_AUTOCONNECT_INTERVAL_SECS — or at once when a subscription saw a beacon: the
+        // other side of an invite, or a contact, is publishing right now and waits for our dial
+        // (live 2026-10-27: a whole second of the first meeting went to waiting for the tick).
+        let tick_due = std::time::Instant::now() + std::time::Duration::from_secs(MESH_AUTOCONNECT_INTERVAL_SECS);
+        loop {
+            let left = tick_due.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || beacon_watches.has_pending() {
+                break;
+            }
+            match stop_rx.recv_timeout(left.min(BEACON_WAKE_POLL)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
         // Snapshot the running runtime (brief lock) so the dials below run off
         // the start/stop lock. None → mesh stopped → exit.
         let Some(runtime) = mesh.lock().ok().and_then(|guard| guard.as_ref().map(Arc::clone)) else {
             return;
         };
+        // The account took this device back and its profile is erased: the mesh goes too (pass 20).
+        if crate::take_taken_back(&db_path) {
+            drop(runtime);
+            if let Some(runtime) = mesh.lock().ok().and_then(|mut guard| guard.take()) {
+                runtime.shutdown();
+            }
+            omni_app_trace_log("mesh", "stopped: this device was taken back by its account");
+            return;
+        }
         // ЦИКЛ ОБСЛУЖИВАНИЯ ОБЯЗАН ГОВОРИТЬ, КОГДА ОН ЗАСТРЯЛ.
         //
         // Такт объявлен трёхсекундным, и ВСЁ, что живёт на нём, молча наследует его длину: и
@@ -3277,35 +3620,71 @@ fn run_mesh_autoconnect_worker(
         // до таймаута, поэтому кандидат на растяжение очевиден — но пока он не измерен пофазно,
         // это догадка. Строка ниже делает его фактом или снимает.
         let tick_at = std::time::Instant::now();
+        crate::tick_cost::begin();
         // First, before any dial can stall the tick: our video passport to the calls we are in.
         crate::app_group_calls::send_due_group_passports(&db_path, &runtime);
+        crate::app_group_calls::rekey_due_group_calls(&storage);
+        crate::tick_cost::mark("passports");
         // Dial imported pairing targets (strangers we want to pair with) first,
         // then maintain links to already-approved contacts.
         dial_mesh_pairing_targets(&runtime, &pairing_targets, &locally_dialed, &hello_maker);
         let after_pairing_ms = tick_at.elapsed().as_millis();
+        crate::tick_cost::mark("pairing");
         // Keep the pinned relay/bootstrap registry links alive — re-dial any whose Link
         // dropped (mobile outage / relay restart) so a both-NAT pair's only path self-heals
         // (the dial discards a dead cached connection and reconnects). Before approved-contact
         // dials, since those peers may only be reachable THROUGH a relay.
         autoconnect_redial_network_nodes(&storage, &runtime);
         crate::app_pinned_relay::tend_pinned_relay(&storage, &runtime, &db_path);
+        refuse_direct_links_with_blocked(&storage, &runtime);
+        runtime.set_durable_carriers(durable_carrier_nodes(&storage));
+        runtime.set_relay_consents(friend_relay_nodes(&storage));
         let after_nodes_ms = tick_at.elapsed().as_millis();
+        crate::tick_cost::mark("relays");
         // Group feed messages queued while no mesh handle was at hand (the 1:1 receive path, an
         // offline moment): publish them.
         crate::app_groups::resubscribe_all_groups_via(&storage, &runtime);
+        crate::tick_cost::mark("group-subscribe");
         // A group that went on in two branches: ask to be put back, or put a member back.
         crate::app_group_branches::group_branch_tick(&storage, current_unix_ms());
+        crate::tick_cost::mark("group-branches");
+        if last_revoked_sweep.is_none_or(|at| at.elapsed() >= REVOKED_DEVICES_SWEEP_EVERY) {
+            last_revoked_sweep = Some(std::time::Instant::now());
+            crate::app_groups::remove_revoked_and_departed_from_groups(&storage);
+            crate::app_groups::refresh_own_cards_in_groups(&storage);
+            crate::tick_cost::mark("group-revoked");
+        }
+        // Before the flush: an announcement of changed workspace branches goes out this tick.
+        crate::app_workspace::workspace_tick(&storage, &runtime);
+        crate::tick_cost::mark("workspace-rest");
         crate::app_groups::flush_group_feed_outbox(&storage, &runtime);
+        crate::tick_cost::mark("group-outbox");
         crate::app_group_attachments::pull_requested_group_attachments(&storage, &runtime);
+        crate::tick_cost::mark("group-files");
+        if last_prekey_upkeep.elapsed() >= PREKEY_UPKEEP_EVERY {
+            last_prekey_upkeep = std::time::Instant::now();
+            match storage.maintain_local_prekeys(current_unix_ms()) {
+                Ok(true) => {
+                    omni_app_trace_log("crypto/prekeys", "signed prekey rotated; hello bundle republished");
+                    republish_bundle(&storage);
+                }
+                Ok(false) => {}
+                Err(error) => omni_app_trace_log("crypto/prekeys", &format!("upkeep failed: {error}")),
+            }
+        }
         if last_durable_persist.elapsed() >= DURABLE_PERSIST_EVERY {
             last_durable_persist = std::time::Instant::now();
-            let rows = runtime.export_durable_rows();
-            let marks = durable_rows_marks(&rows);
-            if marks != persisted_durable_marks && storage.replace_durable_frames(&rows).is_ok() {
+            // Up to thousands of frames: copied and encoded only when something changed.
+            let marks = runtime.durable_export_marks();
+            if marks != persisted_durable_marks
+                && storage.replace_durable_frames(&runtime.export_durable_rows()).is_ok()
+            {
                 persisted_durable_marks = marks;
             }
         }
+        crate::tick_cost::mark("durable-persist");
         active_circle.refresh_if_due(&storage);
+        crate::tick_cost::mark("active-circle");
         let _ = autoconnect_dial_approved_contacts(
             &storage,
             &runtime,
@@ -3316,12 +3695,14 @@ fn run_mesh_autoconnect_worker(
         );
         dial_group_call_members(&db_path, &runtime, &dials_in_flight, &dial_tx);
         let after_contacts_ms = tick_at.elapsed().as_millis();
+        crate::tick_cost::mark("contact-dials");
         // Full-sweep duplicate-contact merge: used to run inside every UI `list_contacts` call,
         // which put a write on the read path and blocked the UI thread on the WAL busy timeout.
         // Runs here in the background instead, so the UI stays a pure read. Best-effort — a
         // transient sqlite error just retries next tick; write-time `find_*` merges cover
         // mutations in the meantime so no duplicate lingers past its next relevant lookup.
         let _ = storage.merge_duplicate_contacts_for_active_profile(current_unix_ms());
+        crate::tick_cost::mark("merge-contacts");
         // Serverless-rendezvous fallback for contacts LAN/announce dialing can't reach
         // (they're on another network). Throttled to RENDEZVOUS_SWEEP_INTERVAL_SECS —
         // independent of the 3 s autoconnect cadence — because it hits free providers.
@@ -3329,6 +3710,7 @@ fn run_mesh_autoconnect_worker(
         // bootstrap — is gated by the profile's connection-privacy choice. Direct-only means we never
         // touch a public provider; connectivity is then LAN + router port-mapping + manual exchange.
         let allow_rendezvous = load_connection_privacy_mode(&db_path).uses_rendezvous();
+        crate::tick_cost::mark("privacy-mode");
         // A carrier switch just closed links that are being redialed over the new carrier; looking
         // for those contacts through the providers meanwhile only spends their quota. The sweep and
         // the early rendezvous wait it out (`MeshRuntime::carrier_switch_settling`).
@@ -3360,6 +3742,7 @@ fn run_mesh_autoconnect_worker(
                 &hello_maker,
             );
         }
+        crate::tick_cost::mark("rendezvous-sweep");
         // Early rendezvous between sweeps, every 3 s tick: a contact whose link just DEGRADED is
         // rendezvoused at once (per-peer flap-floored) — so a relay→direct upgrade on a UDP-hostile
         // network happens in seconds, not up to a full ~90 s sweep later — and one the last attempt
@@ -3383,14 +3766,28 @@ fn run_mesh_autoconnect_worker(
                         omni_app_trace_log("rendezvous/watch", "wake own account: a device of ours not met yet");
                         rendezvous_own_account_now(&storage, &runtime, &db_path);
                     }
+                    BeaconWake::Invite(secret) => {
+                        let seal = bootstrap_invites.lock().ok().and_then(|map| {
+                            map.values().find(|entry| entry.secret == secret).map(|entry| entry.seal)
+                        });
+                        if let Some(seal) = seal {
+                            omni_app_trace_log("rendezvous/watch", "wake invite: the other side published");
+                            bootstrap_dial(&runtime, &db_path, secret, seal);
+                        }
+                    }
+                    BeaconWake::Knock { node, punch } => {
+                        on_knock(&runtime, &db_path, &mut knock_limit, node, punch);
+                    }
                 }
             }
-            if beacon_watches.reconcile_due(now) {
-                reconcile_beacon_watches(&storage, &runtime, &db_path, &mut beacon_watches, now);
+            let invites = live_invite_watches(&bootstrap_invites);
+            if beacon_watches.reconcile_due(now) || beacon_watches.invites != invites {
+                reconcile_beacon_watches(&storage, &runtime, &db_path, &mut beacon_watches, invites, now);
             }
         } else {
             beacon_watches.stop_all();
         }
+        crate::tick_cost::mark("beacon-watches");
         if allow_rendezvous && !switch_settling {
             early_rendezvous_contacts(
                 &storage,
@@ -3401,6 +3798,7 @@ fn run_mesh_autoconnect_worker(
                 &mut rendezvous_episodes,
             );
         }
+        crate::tick_cost::mark("early-rendezvous");
         // First-contact bootstrap: while an invite is outstanding, keep publishing our endpoints
         // to its blinded bootstrap topic + dialing the other side until the link forms / it expires.
         if allow_rendezvous
@@ -3408,6 +3806,17 @@ fn run_mesh_autoconnect_worker(
         {
             last_bootstrap_sweep = std::time::Instant::now();
             bootstrap_rendezvous_sweep(&bootstrap_invites, &runtime, &db_path);
+        }
+        // What rendezvous costs the providers, per courier, into the trace — the measure the courier
+        // work is checked against (docs/decisions/rendezvous-courier-connections.md).
+        if allow_rendezvous
+            && !runtime.quic_addr().ip().is_loopback()
+            && last_rendezvous_stats.elapsed() >= RENDEZVOUS_STATS_EVERY
+        {
+            last_rendezvous_stats = std::time::Instant::now();
+            if let Ok(rendezvous) = profile_rendezvous_runtime(&db_path) {
+                rendezvous.helper.trace_stats();
+            }
         }
         // Warm-rejoin cache (G3): refresh the live DIRECT endpoints so the NEXT start re-dials known
         // peers immediately (start_mesh_internal seeds dial_at from here). Upsert (not wholesale) — a
@@ -3427,6 +3836,8 @@ fn run_mesh_autoconnect_worker(
             }
             saved_peer_endpoints = live_peer_endpoints;
         }
+        crate::tick_cost::mark("peer-book-and-rest");
+        crate::tick_cost::report_if_due("mesh/tick-cost");
         // Печатаем только ПЕРЕБОР — такт, который не уложился в свой же интервал. Нормальный такт
         // молчит, иначе строка раз в три секунды утопит трассу и её перестанут читать. Разбивка
         // кумулятивная: видно не только «застряли», но и на чём.
@@ -3440,6 +3851,31 @@ fn run_mesh_autoconnect_worker(
                 ),
             );
         }
+    }
+}
+
+/// Answer a durable frame (nothing to do for a live one).
+fn answer_durable(durable: &mut Option<MeshDurableDone>, outcome: MeshDurableOutcome) {
+    if let Some(done) = durable.take() {
+        done(outcome);
+    }
+}
+
+/// Hand a wire-envelope to the app's receive dispatcher. A durable one is answered from there, once
+/// the app has handled it — this call only queues it.
+fn inject_wire_envelope(
+    transport: &TransportManager,
+    envelope: omni_types::WireEnvelopeV1,
+    ctx: ReceivedChatContext,
+    durable: Option<MeshDurableDone>,
+) {
+    match durable {
+        Some(done) => transport.inject_inbound_durable_wire_envelope(
+            envelope,
+            ctx,
+            Box::new(move |result| done(durable_outcome_for(result))),
+        ),
+        None => transport.inject_inbound_wire_envelope(envelope, ctx),
     }
 }
 
@@ -3466,7 +3902,7 @@ fn dial_mesh_pairing_targets(
             // SessionHello over the EXISTING link so a mutually-importing peer completes the
             // handshake. Idempotent (the peer just re-registers the connection) and self-limiting:
             // the one-shot pairing claim removes the target once it pairs, so this stops.
-            let _ = runtime.send_wire(node, &hello_maker(node));
+            let _ = runtime.send_wire(node, &hello_maker(node, true));
             continue;
         }
         // Record initiator intent before dialing so the peer's hello registers
@@ -3535,6 +3971,7 @@ impl OmniApp {
     /// list the «Узлы сети / Релеи» GUI shows and the mesh dials when LAN + invite don't reach. An empty
     /// list is valid (LAN + invite still connect; no node is privileged).
     pub fn list_network_nodes(&self) -> OmniResult<Vec<NetworkNodeView>> {
+        let _ = self.ensure_runtime_profile_active("list_network_nodes")?;
         let runtime = self.mesh_runtime();
         Ok(self
             .storage
@@ -3586,6 +4023,7 @@ impl OmniApp {
     /// connection-quality ladder). The GUI/CLI assemble the suffix from a separate field; an absent
     /// suffix → UDP-only relay. `cert_spki_pin` has no surface yet (it lands with R2 fronting).
     pub fn add_network_node(&self, endpoint: &str, label: &str) -> OmniResult<i64> {
+        let _ = self.ensure_runtime_profile_active("add_network_node")?;
         let raw = endpoint.trim();
         let label = label.trim();
         // Optional TLS-over-TCP bridge address (rung-0 carrier target), validated up front.
@@ -3635,6 +4073,7 @@ impl OmniApp {
     /// `shared` bundle, the published set changed → bump my bundle version so the rotation propagates
     /// (R1c inc.3b).
     pub fn remove_network_node(&self, id: i64) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("remove_network_node")?;
         let was_shared = self
             .storage
             .list_shared_network_nodes()
@@ -3652,6 +4091,7 @@ impl OmniApp {
     /// first — the «Провайдеры рандеву» GUI list. These are the public pub/sub brokers the helper fans
     /// publish/fetch across to MEET a peer; distinct from `list_network_nodes` (mesh transport relays).
     pub fn list_rendezvous_providers(&self) -> OmniResult<Vec<RendezvousProviderView>> {
+        let _ = self.ensure_runtime_profile_active("list_rendezvous_providers")?;
         adopt_legacy_dht_switch(&self.storage);
         let db_path = self.storage.db_path().to_string_lossy().to_string();
         let helper = rendezvous_runtime_registry()
@@ -3687,6 +4127,7 @@ impl OmniApp {
     /// `read` (we only look), `off`. At least one courier must stay `publish_read` — with none, nobody
     /// could find us. Applies at once: the rendezvous runtime restarts with the new set.
     pub fn set_rendezvous_provider_mode(&self, id: i64, mode: &str) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("set_rendezvous_provider_mode")?;
         let rows = self.storage.list_rendezvous_providers()?;
         if !rows.iter().any(|row| row.id == id) {
             return Err(OmniError::InvalidInput(format!("no courier with id {id}")));
@@ -3712,10 +4153,28 @@ impl OmniApp {
         crate::note_courier_set_changed();
     }
 
+    /// Let us meet contacts through a server one of their devices named (V-13): asked on the contact's
+    /// card, only for a server a device of a contact actually named and that leads to the internet.
+    /// Used only for the pairs that name it (`#pair`). Applies at once.
+    pub fn allow_contact_courier(&self, url: &str) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("allow_contact_courier")?;
+        let url = url.trim();
+        if !self.storage.list_peer_courier_urls()?.iter().any(|named| named == url) {
+            return Err(OmniError::InvalidInput(format!("no contact's device named the courier '{url}'")));
+        }
+        if !is_valid_provider_url(url) || !omni_rendezvous::is_public_courier_url(url) {
+            return Err(OmniError::InvalidInput(format!("'{url}' does not lead to the internet")));
+        }
+        self.storage.allow_pair_courier(url, current_unix_ms())?;
+        self.restart_rendezvous_with_new_couriers();
+        Ok(())
+    }
+
     /// Add a rendezvous provider URL by hand (GUI). Validates the scheme (`http(s)://` ntfy /
     /// `ws(s)://` Nostr relay / `dht://` BT-DHT), rejects a duplicate. Applies at once: the rendezvous
     /// runtime restarts with the new set.
     pub fn add_rendezvous_provider(&self, url: &str) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("add_rendezvous_provider")?;
         let url = url.trim();
         if !is_valid_provider_url(url) {
             return Err(OmniError::InvalidInput(format!(
@@ -3740,6 +4199,7 @@ impl OmniApp {
     /// its row, so it can come back). The last courier we post to is not removed. No-op if the id is
     /// already gone.
     pub fn remove_rendezvous_provider(&self, id: i64) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("remove_rendezvous_provider")?;
         let rows = self.storage.list_rendezvous_providers()?;
         let Some(row) = rows.iter().find(|row| row.id == id) else {
             return Ok(());
@@ -3834,6 +4294,7 @@ impl OmniApp {
     /// MANUAL path the user pastes the token from a trusted channel; the per-pair beacon path (phase 3)
     /// adds the approved-contact gate before calling this.
     pub fn import_relay_bundle(&self, token: &str) -> OmniResult<usize> {
+        let _ = self.ensure_runtime_profile_active("import_relay_bundle")?;
         // Manual paste: no propagating contact to bind to — the issuer signature is the sole authority.
         apply_relay_bundle(&self.storage, token, None)
     }
@@ -3858,6 +4319,7 @@ impl OmniApp {
     /// rotated set propagates strictly-newer. GUI checkbox + FFI toggle call this; no-op for an unknown
     /// id. See docs/decisions/r1c-rotatable-white-relay.md.
     pub fn set_relay_node_shared(&self, id: i64, shared: bool) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("set_relay_node_shared")?;
         // First-party-only (owner decision #1 + the R1b no-transitive invariant): I may share only
         // relays I added myself — NEVER re-propagate a friend's IMPORTED bundle. A row carrying a
         // `bundle_id` was imported from a friend, so refuse to flag it as mine (it would get re-signed
@@ -3920,6 +4382,11 @@ impl OmniApp {
                 if !runtime.has_link(&node) {
                     continue; // not linked → the unlinked per-pair beacon fallback reaches them
                 }
+                // Read, sent and stored under the session lock (B02, audit 2026-11-09 #6): a stale
+                // copy's write was refused and the update lost.
+                let Ok(_session_guard) = lock_app_session_guard(&self.session_lock) else {
+                    return;
+                };
                 let session = match self.storage.get_session_record(&omni_crypto::SessionAddress {
                     remote_account_id: account_id.clone(),
                     remote_device_id: bundle.device_id.clone(),
@@ -3968,6 +4435,7 @@ impl OmniApp {
     /// as before). This is what `build_self_beacon` attaches so an approved friend's mesh auto-learns my
     /// (possibly rotated) relay set on the next sweep. See docs/decisions/r1c-rotatable-white-relay.md.
     pub fn my_relay_bundle_token(&self) -> OmniResult<Option<String>> {
+        let _ = self.ensure_runtime_profile_active("my_relay_bundle_token")?;
         build_my_relay_bundle_token(&self.storage, &self.storage.db_path().to_string_lossy())
     }
 }
@@ -4212,6 +4680,28 @@ fn parse_mesh_node_hex(node_hex: &str) -> OmniResult<MeshNodeAddress> {
     Ok(MeshNodeAddress::from_bytes(bytes))
 }
 
+/// V-01: a first-contact bootstrap from a node we have no route for is taken only if that node is
+/// the bootstrap's own device (its address is the hash of the device's signing key, which the
+/// certificate chain vouches for). A real bootstrap relayed by another node — a holder of the
+/// contact's durable frames, a relay on the path — would otherwise bind the contact's dialog route to
+/// the relayer: it cannot read the session, but every frame to the contact would go to it.
+fn verify_first_contact_bootstrap(
+    storage: &omni_storage::Storage,
+    message: &omni_types::SessionBootstrapMessageV1,
+    local_device_id: &DeviceId,
+    peer: &MeshNodeAddress,
+) -> OmniResult<()> {
+    let (bootstrap, _) = verify_inbound_session_bootstrap_message(storage, message, local_device_id)?;
+    let device_node = node_address_from_ed25519_pubkey(bootstrap.initiator_identity_signing_key.0)
+        .map_err(|error| OmniError::InvalidInput(format!("bootstrap device key: {error}")))?;
+    if device_node != *peer {
+        return Err(OmniError::InvalidInput(format!(
+            "the bootstrap is of node {device_node}, relayed by another"
+        )));
+    }
+    Ok(())
+}
+
 /// Build a `ReceivedChatContext` from a SELF-CONTAINED `SessionBootstrapMessageV1`, so the receiver
 /// can process a FIRST-CONTACT bootstrap that arrived WITHOUT a preceding `SessionHello` (durable
 /// store-and-forward over a lossy link — the mobile-UDP-drop path). The `dialog_key` is derived from
@@ -4325,6 +4815,15 @@ fn finish_mesh_pairing_from_hello(
         }
     };
     let now_unix_ms = current_unix_ms();
+    // The invite we imported from this peer, if we came by one (find-by-ID targets have none): its
+    // nonce lets the request prove it answers that invite, and the inviter approves it.
+    let invite_nonce = storage
+        .list_active_bootstrap_invites(now_unix_ms)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|invite| invite.inviter_node == Some(*peer.as_bytes()))
+        .and_then(|invite| hex::decode(invite.nonce_hex.trim()).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
     // The invite is spent once we hold its peer — never re-arm it on the next start.
     let _ = storage.remove_bootstrap_invites_for_inviter(peer.as_bytes());
 
@@ -4382,7 +4881,7 @@ fn finish_mesh_pairing_from_hello(
             return;
         }
     };
-    let bootstrap = match bootstrap_session_for_remote_bundle(&storage, &domain_bundle, now_unix_ms) {
+    let mut bootstrap = match bootstrap_session_for_remote_bundle(&storage, &domain_bundle, now_unix_ms) {
         Ok((_, bootstrap, _)) => bootstrap,
         Err(error) => {
             omni_app_trace_log(
@@ -4392,6 +4891,15 @@ fn finish_mesh_pairing_from_hello(
             return;
         }
     };
+    if let Some(nonce) = invite_nonce {
+        bootstrap.invite_claim_hex = omni_crypto::invite_claim(
+            &nonce,
+            &bootstrap.initiator_identity_signing_public_key,
+            &bootstrap.initiator_ephemeral_public_key,
+        )
+        .ok()
+        .map(hex::encode);
+    }
 
     // Install the dialog→node route now, so the bootstrap send below (and any
     // later wire send) resolves this mesh Link via the dialog map — the mesh
@@ -4474,7 +4982,7 @@ fn finish_mesh_pairing_from_hello(
 /// is a no-op when already linked and now discards a dead cached connection before
 /// re-dialing (warm-rejoin), so this self-heals the relay link within one autoconnect tick.
 /// Endpoint-only (hint) entries with no pinned identity are skipped. See
-/// docs/bugs/relay-pairing-approval-gap.md + docs/notes/roadmap-CONTINUE.md.
+/// docs/bugs/relay-pairing-approval-gap.md + docs/decisions/community-volunteer-nodes.md.
 fn autoconnect_redial_network_nodes(storage: &Storage, runtime: &MeshRuntime) {
     for node in storage.list_network_nodes().unwrap_or_default() {
         let (Some(endpoint), Some(node_bytes)) = (node.endpoint, node.node_address) else {
@@ -5019,7 +5527,12 @@ pub(crate) struct BeaconWatches {
     running: Vec<Arc<std::sync::atomic::AtomicBool>>,
     wake_tx: mpsc::Sender<BeaconWake>,
     wake_rx: mpsc::Receiver<BeaconWake>,
+    /// Taken off `wake_rx` by `has_pending`, not handed out yet.
+    pending: Vec<BeaconWake>,
     last_reconcile: Option<std::time::Instant>,
+    /// The invites watched since the last reconcile: a new one is watched at once, not on the next
+    /// reconcile — someone may be importing it right now.
+    invites: Vec<([u8; 32], InviteSeal)>,
     last_wake: std::collections::HashMap<BeaconWake, std::time::Instant>,
 }
 
@@ -5028,6 +5541,8 @@ const BEACON_WATCH_RECONCILE_EVERY: std::time::Duration = std::time::Duration::f
 /// A contact that keeps publishing (a new address, a restart) wakes us at most this often — each
 /// wake costs one rendezvous.
 const BEACON_WAKE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the worker, between its ticks, looks whether a subscription woke it.
+const BEACON_WAKE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl BeaconWatches {
     pub(crate) fn new() -> Self {
@@ -5037,15 +5552,24 @@ impl BeaconWatches {
             running: Vec::new(),
             wake_tx,
             wake_rx,
+            pending: Vec::new(),
             last_reconcile: None,
+            invites: Vec::new(),
             last_wake: std::collections::HashMap::new(),
         }
     }
 
     /// Wake-ups that arrived since the last call, each at most once per `BEACON_WAKE_FLOOR`.
+    /// Whether a wake-up arrived that the next `woken` hands out (kept, not lost, by looking).
+    fn has_pending(&mut self) -> bool {
+        self.pending.extend(self.wake_rx.try_iter());
+        !self.pending.is_empty()
+    }
+
     fn woken(&mut self, now: std::time::Instant) -> Vec<BeaconWake> {
         let mut woken: Vec<BeaconWake> = Vec::new();
-        for wake in self.wake_rx.try_iter() {
+        self.pending.extend(self.wake_rx.try_iter());
+        for wake in std::mem::take(&mut self.pending) {
             let floored = self
                 .last_wake
                 .get(&wake)
@@ -5098,9 +5622,11 @@ fn reconcile_beacon_watches(
     runtime: &Arc<MeshRuntime>,
     db_path: &str,
     watches: &mut BeaconWatches,
+    invites: Vec<([u8; 32], InviteSeal)>,
     now: std::time::Instant,
 ) {
     watches.last_reconcile = Some(now);
+    watches.invites = invites.clone();
     // Cross-network only, like the sweep.
     if runtime.quic_addr().ip().is_loopback() {
         watches.stop_all();
@@ -5111,7 +5637,7 @@ fn reconcile_beacon_watches(
         .filter(|peer| !rendezvous_link_is_the_destination(runtime, &peer.node))
         .map(|peer| BeaconWatchTarget {
             secret: peer.secret,
-            node: Some(*peer.node.as_bytes()),
+            awaits: Awaited::Contact(*peer.node.as_bytes()),
             exclude: Vec::new(),
             read_from: peer.couriers.read_from.clone(),
         })
@@ -5119,10 +5645,20 @@ fn reconcile_beacon_watches(
     if let Ok(Some(secret)) = storage.get_account_rendezvous_secret() {
         targets.push(BeaconWatchTarget {
             secret,
-            node: None,
+            awaits: Awaited::OwnAccount,
             exclude: linked_own_device_nodes(storage, runtime),
             read_from: None,
         });
+    }
+    // First contact: the other side's beacon on the invite's topic is met when it is published, not
+    // on the next 30 s bootstrap sweep (which stays as the fallback).
+    for (secret, seal) in invites {
+        targets.push(BeaconWatchTarget { secret, awaits: Awaited::Invite(seal), exclude: Vec::new(), read_from: None });
+    }
+    // Findable by ID: a finder's knock for a TCP hole punch is met when it is posted — the finder's
+    // punch window is already running (app_tcp_knock.rs).
+    if let Some(knocks) = own_knock_watch(storage, runtime) {
+        targets.push(knocks);
     }
     let groups = watches.set_targets(targets);
     let my_node = *runtime.node_address().as_bytes();
@@ -5142,6 +5678,204 @@ fn reconcile_beacon_watches(
         }
         watches.running.push(stop);
     }
+}
+
+/// What we answer a hello from `peer` with (maintainers' decision 2026-11-11, the rest of H4). A node of ours, of a
+/// contact of ours, or one we are pairing with, gets our hello as it is. A node we do not know gets it
+/// without our device's name: our hello told anyone who linked our device's name too. It is answered
+/// all the same — answering only while our Omni-ID was findable or an invitation was out left a new
+/// device of ours, a contact's new device and pairing without our hello (the whole run caught it).
+/// Always `Some`; an `Option` for a policy that may withhold it.
+pub(crate) fn hello_reply_for(
+    storage: &Storage,
+    peer: MeshNodeAddress,
+    pairing_target: bool,
+    ours: omni_transport::TransportRequestEnvelopeV1,
+) -> Option<omni_transport::TransportRequestEnvelopeV1> {
+    let known = pairing_target
+        || own_device_nodes_for(&storage.db_path().to_string_lossy()).contains(peer.as_bytes())
+        || storage.list_contacts().unwrap_or_default().iter().any(|contact| {
+            // Approved: a pending contact is no contact yet (blind audit 2026-11-11, J4).
+            !contact.is_blocked
+                && contact.relationship_state == omni_identity::ContactRelationshipState::Approved
+                && contact.remote_account_id.as_ref().is_some_and(|account| {
+                    storage
+                        .list_remote_prekey_bundles_for_account(account)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|bundle| node_address_from_ed25519_pubkey(bundle.identity_signing_key.0).ok() == Some(peer))
+                })
+        });
+    if known {
+        return Some(ours);
+    }
+    let mut ours = ours;
+    if let omni_transport::TransportRequestPayloadV1::SessionHello(hello) = &mut ours.payload {
+        hello.device_name = String::new();
+    }
+    Some(ours)
+}
+
+/// Whether a hello carries the bundle of a device of an account we blocked (declined), its device
+/// certificate vouching for it — the account id is the master key's hash, so the chain proves it. Such
+/// a device's bundle is kept: the refused nodes are made from the blocked accounts' bundles we hold,
+/// and a device we did not know of was not among them (blind audit 2026-11-11, H3).
+pub(crate) fn hello_is_from_a_blocked_accounts_device(storage: &Storage, hello: &omni_types::SessionHelloV1) -> bool {
+    let Ok(Some(bundle)) = omni_transport::validate_remote_prekey_bundle(hello.prekey_bundle_json.as_deref()) else {
+        return false;
+    };
+    let account = AccountId(bundle.account.account_id.clone());
+    let blocked = storage.find_contact_by_remote_account_id(&account).ok().flatten().is_some_and(|contact| {
+        contact.is_blocked || contact.relationship_state == omni_identity::ContactRelationshipState::Declined
+    });
+    if !blocked || bundle.device_certificate_chain_json.is_none() || crate::bundle_certificate_vouches_for_its_keys(&bundle).is_err() {
+        return false;
+    }
+    // Kept within a bound: devices are its owner's to make, and each hello of a new one wrote a row
+    // (blind audit 2026-11-11, I4). Past it the hello is refused all the same; its node is not kept.
+    let held = storage.list_every_remote_prekey_bundle_of_account(&account).map(|bundles| bundles.len()).unwrap_or(usize::MAX);
+    if held < BLOCKED_ACCOUNT_DEVICES_KEPT_MAX {
+        if let Ok(domain) = crate::prekey_bundle_from_protocol(&bundle) {
+            let _ = storage.record_remote_prekey_bundle(&domain, None, Some(&bundle.device.device_label), bundle.generated_at_unix_ms);
+        }
+    }
+    true
+}
+
+/// How many devices of a blocked account its hellos may add to the ones we hold (and refuse).
+pub(crate) const BLOCKED_ACCOUNT_DEVICES_KEPT_MAX: usize = 32;
+
+/// Whether to answer a hello from `peer` with ours now: at most once per [`HELLO_REPLY_EVERY`] per
+/// node. What is past the window is forgotten — a node a hello came from once stayed in the table for
+/// good, and nodes are anyone's to make (blind audit 2026-11-11, G5).
+pub(crate) fn hello_reply_due(
+    throttle: &mut std::collections::HashMap<MeshNodeAddress, std::time::Instant>,
+    peer: MeshNodeAddress,
+    now: std::time::Instant,
+) -> bool {
+    throttle.retain(|_, last| now.duration_since(*last) < HELLO_REPLY_EVERY);
+    if throttle.contains_key(&peer) {
+        return false;
+    }
+    throttle.insert(peer, now);
+    true
+}
+
+/// How often a node's hello is answered with ours at most.
+pub(crate) const HELLO_REPLY_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a SessionHello speaks for the node it came from (blind audit 2026-11-11, F1). The link
+/// proves which node sent it; the dialog it names (its instance id) and the bundle it carries are
+/// only claims. A bundle must be the sending node's own: the node is its signing key. A hello naming
+/// the dialog of a contact we know must come from a node of that contact's: one we know of it, or one
+/// whose bundle is of its account and carries a device certificate vouching for it. Otherwise a
+/// stranger took the contact's route — what we sent the contact went to it — and, with a session of
+/// his own, wrote into the contact's chat.
+pub(crate) fn hello_speaks_for_its_node(
+    storage: &Storage,
+    peer: MeshNodeAddress,
+    hello: &omni_types::SessionHelloV1,
+) -> Result<(), String> {
+    let bundle = omni_transport::validate_remote_prekey_bundle(hello.prekey_bundle_json.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(bundle) = bundle.as_ref() {
+        let key: Option<[u8; 32]> = hex::decode(bundle.account.identity_signing_public_key.trim())
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok());
+        if key.and_then(|key| node_address_from_ed25519_pubkey(key).ok()) != Some(peer) {
+            return Err("the bundle it carries is not the sending node's".to_string());
+        }
+    }
+    let dialog_key = omni_types::dialog_key_from_instance_id(&hello.instance_id);
+    let Some(contact) = storage.resolve_contact_for_dialog(&dialog_key).map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    let Some(account) = contact.remote_account_id.as_ref() else {
+        return Ok(());
+    };
+    let node_of = |key: [u8; 32]| node_address_from_ed25519_pubkey(key).ok();
+    let mut known = storage
+        .list_account_devices(account)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|record| node_of(record.chain.device.identity_signing_public_key.0))
+        .chain(
+            storage
+                .get_latest_remote_prekey_bundle_for_account(account)
+                .ok()
+                .flatten()
+                .and_then(|stored| node_of(stored.identity_signing_key.0)),
+        );
+    if known.any(|node| node == peer) {
+        return Ok(());
+    }
+    if let Some(bundle) = bundle.as_ref() {
+        if bundle.account.account_id != account.0 {
+            return Err(format!("it names the dialog of account {}, its bundle is another's", account.0));
+        }
+        let device = DeviceId(bundle.device.device_id.clone());
+        let stored = storage.get_remote_prekey_bundle(account, &device).ok().flatten();
+        if stored.is_some_and(|stored| node_of(stored.identity_signing_key.0) == Some(peer)) {
+            return Ok(());
+        }
+        if bundle.device_certificate_chain_json.is_some() && crate::bundle_certificate_vouches_for_its_keys(bundle).is_ok() {
+            return Ok(());
+        }
+        return Err(format!("not a device of account {} we know or one its certificate vouches for", account.0));
+    }
+    Err(format!("no bundle, and not a node of account {} we know", account.0))
+}
+
+/// The nodes trusted to carry our 1:1 durable frames (maintainers' decision 2026-11-11, blind audit E7):
+/// our own devices and the devices of our approved contacts. Anti-entropy offers a 1:1 frame to
+/// these, to its addressee and to nodes forwarding our traffic — no longer to every verified neighbour.
+pub(crate) fn durable_carrier_nodes(storage: &Storage) -> std::collections::HashSet<MeshNodeAddress> {
+    let mut carriers: std::collections::HashSet<MeshNodeAddress> = own_device_nodes_for(&storage.db_path().to_string_lossy())
+        .into_iter()
+        .map(MeshNodeAddress::from_bytes)
+        .collect();
+    for contact in storage.list_contacts().unwrap_or_default() {
+        // Approved ones only: a pending contact — a request we never answered — carried our talk with
+        // others (blind audit 2026-11-11, J4).
+        if contact.is_blocked || contact.relationship_state != omni_identity::ContactRelationshipState::Approved {
+            continue;
+        }
+        let Some(account) = contact.remote_account_id.as_ref() else {
+            continue;
+        };
+        for bundle in storage.list_remote_prekey_bundles_for_account(account).unwrap_or_default() {
+            if let Ok(node) = node_address_from_ed25519_pubkey(bundle.identity_signing_key.0) {
+                carriers.insert(node);
+            }
+        }
+    }
+    carriers
+}
+
+/// The nodes we carry traffic for (friend relay): every device in good standing of each approved
+/// contact, not blocked, that we gave the consent to. The runtime's set is this one, whole — at the
+/// start, when a consent changes, and on every tick: a device its account took back, a contact
+/// blocked or removed, and a consent taken back while another device was the one dialed all kept
+/// their place in a set changed one node at a time (blind audit 2026-11-11, L4).
+pub(crate) fn friend_relay_nodes(storage: &Storage) -> std::collections::HashSet<MeshNodeAddress> {
+    let mut nodes = std::collections::HashSet::new();
+    for contact in storage.list_contacts().unwrap_or_default() {
+        if !contact.friend_relay_consent
+            || contact.is_blocked
+            || contact.relationship_state != omni_identity::ContactRelationshipState::Approved
+        {
+            continue;
+        }
+        let Some(account) = contact.remote_account_id.as_ref() else {
+            continue;
+        };
+        for bundle in storage.list_remote_prekey_bundles_for_account(account).unwrap_or_default() {
+            if let Ok(node) = node_address_from_ed25519_pubkey(bundle.identity_signing_key.0) {
+                nodes.insert(node);
+            }
+        }
+    }
+    nodes
 }
 
 /// The mesh nodes of every device of ours (linked or not) — the DHT leg asks them first.
@@ -5438,7 +6172,7 @@ fn retry_unlinked_outgoing_id_pendings(
                 "find_by_id/retry",
                 &format!("re-dialing account={} node={node}", account_id.0),
             );
-            let hello_bytes = hello_maker(node);
+            let hello_bytes = hello_maker(node, true);
             dial_identity_beacon_target(
                 runtime,
                 storage,
@@ -5489,12 +6223,12 @@ fn rendezvous_sweep_unlinked_contacts(
     let my_relay_bundle = build_my_relay_bundle_token(storage, db_path).ok().flatten();
     // Model A (MA2): if I opted into findable-by-ID, publish my signed identity beacon
     // under the Omni-ID-keyed topic this sweep (independent of the per-contact loop below).
-    if load_discoverability_mode(db_path).is_public() {
+    if load_discoverability_mode(storage).is_public() {
         publish_identity_beacon(storage, runtime, db_path, my_relay_bundle.clone());
-    } else if identity_withdrawal_pending(db_path)
+    } else if identity_withdrawal_pending(storage)
         && publish_identity_beacon_withdrawal(storage, runtime, db_path)
     {
-        clear_identity_withdrawal(db_path);
+        clear_identity_withdrawal(storage);
     }
     // Find by name: published, re-published, or withdrawn — the module decides from the switch.
     if let Ok(rendezvous) = profile_rendezvous_runtime(db_path) {
@@ -5607,6 +6341,7 @@ fn rendezvous_own_account(
         PairCouriers::default(),
         my_node,
         skip,
+        InviteSeal::None,
         my_relay_bundle.map(str::to_string),
         None,
         Some(db_path.to_string()),
@@ -5676,6 +6411,29 @@ pub(crate) fn rendezvous_peers(storage: &Storage) -> Vec<RendezvousPeer> {
     }
     crate::trace_rendezvous_skips_on_change(&storage.db_path().to_string_lossy(), skips);
     peers
+}
+
+/// Whether rendezvous can reach this node of a contact. The state screen asks it for every contact
+/// out of reach, many times a minute: it looks at the one device and opens no secret, where collecting
+/// `rendezvous_peers` opened them all, once per contact.
+fn node_has_rendezvous_secret(storage: &Storage, account_id: &AccountId, node: &MeshNodeAddress) -> bool {
+    storage
+        .list_remote_prekey_bundles_for_account(account_id)
+        .unwrap_or_default()
+        .iter()
+        .filter(|bundle| {
+            node_address_from_ed25519_pubkey(bundle.identity_signing_key.0).is_ok_and(|address| address == *node)
+        })
+        .any(|bundle| {
+            storage
+                .get_session_record(&omni_crypto::SessionAddress {
+                    remote_account_id: account_id.clone(),
+                    remote_device_id: bundle.device_id.clone(),
+                })
+                .ok()
+                .flatten()
+                .is_some_and(|session| session.protected_rendezvous_secret.is_some())
+        })
 }
 
 /// The devices of one account rendezvous is for — a contact's, or our own other devices when
@@ -5804,6 +6562,7 @@ fn rendezvous_dial_one_peer(
         peer.couriers.clone(),
         my_node,
         Vec::new(),
+        InviteSeal::None,
         my_relay_bundle.map(str::to_string),
         peer.revocation_notice.clone(),
         Some(db_path.to_string()),
@@ -5838,42 +6597,87 @@ fn bootstrap_rendezvous_sweep(
         return;
     }
     let now = current_unix_ms();
-    let my_node = *runtime.node_address().as_bytes();
+    // An invite of ours answered by its first importer was spent where the request was taken (the
+    // row removed, `approve_request_answering_our_invite`); stop publishing it here too.
+    let still_ours: Option<std::collections::HashSet<String>> = Storage::open(db_path)
+        .and_then(|storage| storage.list_active_bootstrap_invites(now))
+        .ok()
+        .map(|rows| rows.into_iter().map(|row| row.nonce_hex).collect());
     // Prune dead entries + snapshot the live secrets under a brief lock; run the slow dials after.
-    let secrets: Vec<[u8; 32]> = {
+    let secrets: Vec<([u8; 32], InviteSeal)> = {
         let Ok(mut map) = bootstrap_invites.lock() else {
             return;
         };
-        map.retain(|_, entry| {
+        map.retain(|nonce_hex, entry| {
             if now >= entry.expires_at_ms {
                 return false;
             }
+            if entry.inviter_node().is_none() && still_ours.as_ref().is_some_and(|rows| !rows.contains(nonce_hex)) {
+                return false;
+            }
             // Importer entry: drop it once the inviter's link is up (pairing can finish from here).
-            !matches!(entry.inviter_node, Some(node) if runtime.has_link(&node))
+            !matches!(entry.inviter_node(), Some(node) if runtime.has_link(&node))
         });
-        map.values().map(|entry| entry.secret).collect()
+        map.values().map(|entry| (entry.secret, entry.seal)).collect()
     };
-    for secret in secrets {
-        let Ok(rendezvous) = profile_rendezvous_runtime(db_path) else {
-            continue;
-        };
-        // No relay bundle on a BOOTSTRAP beacon (R1c): this is FIRST contact (invite-nonce keyed, the
-        // peer isn't an approved contact yet), and relay-set propagation is approved-only — leaking my
-        // relays to whoever holds the invite would leak relay addresses to whoever holds it. The bundle
-        // rides only the per-pair (approved) beacon. See docs/decisions/r1c-rotatable-white-relay.md.
-        let _ = spawn_rendezvous_dial(
-            rendezvous,
-            Arc::clone(runtime),
-            secret,
-            PairCouriers::default(),
-            my_node,
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-        );
+    for (secret, seal) in secrets {
+        bootstrap_dial(runtime, db_path, secret, seal);
     }
+}
+
+/// One first-contact rendezvous on an invite's bootstrap topic: publish our beacon there, read the
+/// other side's, dial it. From the bootstrap sweep, and from a watch that saw the other side publish.
+fn bootstrap_dial(runtime: &Arc<MeshRuntime>, db_path: &str, secret: [u8; 32], seal: InviteSeal) {
+    let Ok(rendezvous) = profile_rendezvous_runtime(db_path) else {
+        return;
+    };
+    // No relay bundle on a BOOTSTRAP beacon (R1c): this is FIRST contact (invite-nonce keyed, the
+    // peer isn't an approved contact yet), and relay-set propagation is approved-only — leaking my
+    // relays to whoever holds the invite would leak relay addresses to whoever holds it. The bundle
+    // rides only the per-pair (approved) beacon. See docs/decisions/r1c-rotatable-white-relay.md.
+    let _ = spawn_rendezvous_dial(
+        rendezvous,
+        Arc::clone(runtime),
+        secret,
+        PairCouriers::default(),
+        *runtime.node_address().as_bytes(),
+        Vec::new(),
+        // The importer addresses its beacon to the inviter and dials only it: everyone who imported
+        // the same invite publishes on this topic too.
+        seal,
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// The invites a subscription should watch: every live one, with our side of it. Sorted, so the
+/// worker sees a change by comparing.
+fn live_invite_watches(
+    bootstrap_invites: &Arc<Mutex<std::collections::HashMap<String, MeshBootstrapInvite>>>,
+) -> Vec<([u8; 32], InviteSeal)> {
+    let now = current_unix_ms();
+    let mut invites: Vec<([u8; 32], InviteSeal)> = bootstrap_invites
+        .lock()
+        .map(|map| {
+            map.values()
+                .filter(|entry| now < entry.expires_at_ms)
+                .map(|entry| (entry.secret, entry.seal))
+                .collect()
+        })
+        .unwrap_or_default();
+    invites.sort_by_key(|(secret, _)| *secret);
+    invites
+}
+
+/// The importer's side of an invite from `inviter`: a fresh X25519 key of ours for this invite, kept in
+/// memory, and the inviter's reply key our beacon is sealed to.
+fn importer_seal(inviter: MeshNodeAddress, inviter_key: [u8; 32]) -> OmniResult<InviteSeal> {
+    let own: [u8; 32] = omni_crypto::random_bytes(32)?
+        .try_into()
+        .map_err(|_| OmniError::Internal("invite key must be 32 bytes".to_string()))?;
+    Ok(InviteSeal::Importer { inviter: *inviter.as_bytes(), own, inviter_key })
 }
 
 #[cfg(test)]
@@ -6094,10 +6898,10 @@ mod invite_provider_tests {
     /// worker at most once per floor.
     #[test]
     fn beacon_watches_group_the_targets_and_floor_repeated_wakes() {
-        use super::{BeaconWake, BeaconWatchTarget, BeaconWatches, BEACON_WAKE_FLOOR};
+        use super::{Awaited, BeaconWake, BeaconWatchTarget, BeaconWatches, BEACON_WAKE_FLOOR};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
-        let target = |n: u8| BeaconWatchTarget { secret: [n; 32], node: Some([n; 20]), exclude: Vec::new(), read_from: None };
+        let target = |n: u8| BeaconWatchTarget { secret: [n; 32], awaits: Awaited::Contact([n; 20]), exclude: Vec::new(), read_from: None };
         let mut watches = BeaconWatches::new();
         assert_eq!(watches.set_targets((0..40).map(target).collect()), 3, "40 targets, 16 per group");
         assert_eq!(watches.groups.lock().unwrap()[2].len(), 8);
@@ -6255,6 +7059,7 @@ mod invite_provider_tests {
             source_instance_id: "inst-1".into(),
             signing_pubkey_hex: "ab".repeat(32),
             bootstrap_nonce_hex: "cd".repeat(32),
+            reply_key_hex: String::new(),
             rendezvous_providers: providers,
             dht_bootstrap_nodes: Vec::new(),
             exported_at_unix_ms: 1_700_000_000_000,
@@ -6303,12 +7108,28 @@ mod invite_provider_tests {
     }
 }
 
-/// Which `(feed, seq)` entries a durable snapshot holds — the periodic persist skips an unchanged set.
-pub(crate) fn durable_rows_marks(rows: &[(Vec<u8>, i64, Vec<u8>)]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut keys: Vec<(&[u8], i64)> = rows.iter().map(|(feed, seq, _)| (feed.as_slice(), *seq)).collect();
-    keys.sort_unstable();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    keys.hash(&mut hasher);
-    hasher.finish()
+/// A blocked contact holds no direct link with us (owner, 2026-11-10): the link up is closed and its
+/// dial refused, on each of its devices' nodes, so it neither relays for us nor we for it. Traffic
+/// that must still flow with it — a group both are in — goes through other nodes where there are any;
+/// with no third path (a group of two, no relay) it stops. Decided by state on every tick, so a block
+/// made on another device of ours counts the same, and an unblock lets it in again. Nothing changes
+/// when the contacts cannot be read.
+pub(crate) fn refuse_direct_links_with_blocked(storage: &Storage, runtime: &MeshRuntime) {
+    if let Some(blocked) = blocked_contact_nodes(storage) {
+        runtime.refuse_direct_links_with(blocked);
+    }
+}
+
+/// The mesh nodes of every device of every blocked contact (declined, or marked blocked).
+pub(crate) fn blocked_contact_nodes(storage: &Storage) -> Option<std::collections::HashSet<MeshNodeAddress>> {
+    let contacts = storage.list_contacts().ok()?;
+    Some(
+        contacts
+            .iter()
+            .filter(|c| c.is_blocked || c.relationship_state == omni_identity::ContactRelationshipState::Declined)
+            .filter_map(|c| c.remote_account_id.as_ref())
+            .flat_map(|account| storage.list_every_remote_prekey_bundle_of_account(account).unwrap_or_default())
+            .filter_map(|bundle| node_address_from_ed25519_pubkey(bundle.identity_signing_key.0).ok())
+            .collect(),
+    )
 }

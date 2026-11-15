@@ -91,4 +91,32 @@ impl Storage {
         urls.sort();
         Ok(urls)
     }
+
+    /// Let a courier a contact's device named be used for the pairs that name it (V-13: never
+    /// without the user's yes). Idempotent.
+    pub fn allow_pair_courier(&self, url: &str, now_unix_ms: i64) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO allowed_pair_couriers (profile_id, url, allowed_at_unix_ms) VALUES (?1, ?2, ?3)",
+                params![profile_id.0.as_str(), url, now_unix_ms],
+            )
+            .map(|_| ())
+            .map_err(map_sqlite_error)
+    }
+
+    /// The couriers of contacts the user allowed, sorted.
+    pub fn list_allowed_pair_couriers(&self) -> OmniResult<Vec<String>> {
+        let profile_id = self.require_active_profile_id()?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT url FROM allowed_pair_couriers WHERE profile_id = ?1 ORDER BY url")
+            .map_err(map_sqlite_error)?;
+        let urls = statement
+            .query_map(params![profile_id.0.as_str()], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        Ok(urls)
+    }
 }

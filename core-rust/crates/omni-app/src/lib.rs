@@ -380,6 +380,7 @@ impl OmniApp {
                         handle_session_closed(
                             &runtime_event_storage_for_callback,
                             &transport_handle_for_callback,
+                            &session_lock_for_callback,
                             &receive_context,
                         ),
                     );
@@ -395,6 +396,17 @@ impl OmniApp {
                             &receive_context,
                         ),
                     );
+                }
+                ReceivedTransportEvent::DurableWireEnvelope(envelope, receive_context, done) => {
+                    let result = handle_incoming_wire_envelope(
+                        &runtime_event_storage_for_callback,
+                        &transport_handle_for_callback,
+                        &session_lock_for_callback,
+                        envelope,
+                        &receive_context,
+                    );
+                    done(&result);
+                    trace_receive_dispatch("durable_wire_envelope", result);
                 }
                 ReceivedTransportEvent::AttachmentTransferFrame(frame, receive_context) => {
                     trace_receive_dispatch(
@@ -442,14 +454,17 @@ impl OmniApp {
         let queue_db_path = db_path.to_string();
         let queue_transport = transport.clone();
         let queue_session_lock = Arc::clone(&session_lock);
-        let queue_handle = thread::spawn(move || {
-            run_queue_worker(
-                queue_db_path,
-                queue_transport,
-                queue_stop_rx,
-                queue_session_lock,
-            );
-        });
+        let queue_handle = thread::Builder::new()
+            .name("omni-queue".to_string())
+            .spawn(move || {
+                run_queue_worker(
+                    queue_db_path,
+                    queue_transport,
+                    queue_stop_rx,
+                    queue_session_lock,
+                );
+            })
+            .expect("the queue worker's thread");
 
         let app = Self {
             storage,
@@ -509,14 +524,15 @@ impl OmniApp {
         &self,
         destination_path: impl AsRef<str>,
     ) -> OmniResult<()> {
-        self.storage
-            .export_database_backup(destination_path.as_ref())
+        let _ = self.ensure_runtime_profile_active("export_current_database_backup")?;
+        export_plain_profile_copy(&self.storage, Path::new(destination_path.as_ref())).map(|_| ())
     }
 
     pub fn export_current_database_backup_bundle(
         &self,
         destination_path: impl AsRef<Path>,
     ) -> OmniResult<()> {
+        let _ = self.ensure_runtime_profile_active("export_current_database_backup_bundle")?;
         let destination_path = destination_path.as_ref();
         ensure_distinct_paths(
             self.storage.db_path(),
@@ -530,8 +546,9 @@ impl OmniApp {
         {
             return write_encrypted_backup(&self.storage, destination_path);
         }
-        self.storage.export_database_backup(destination_path)?;
-        export_backup_bundle_contents(self.storage.db_path(), destination_path)
+        ensure_backup_bundle_destination_is_free(destination_path)?;
+        let own_files = export_plain_profile_copy(&self.storage, destination_path)?;
+        export_backup_bundle_contents(self.storage.db_path(), destination_path, Some(&own_files))
     }
 
     pub fn export_database_backup_bundle_at_path(
@@ -556,9 +573,10 @@ impl OmniApp {
             destination_path,
             "backup destination must not match the current database",
         )?;
+        ensure_backup_bundle_destination_is_free(destination_path)?;
         let storage = Storage::open(source_db_path)?;
         storage.export_database_backup(destination_path)?;
-        export_backup_bundle_contents(source_db_path, destination_path)
+        export_backup_bundle_contents(source_db_path, destination_path, None)
     }
 
     pub fn import_database_backup_bundle(
@@ -604,8 +622,28 @@ impl OmniApp {
         let staged_import = create_staged_backup_bundle_import(destination_path, source_db_path)?;
         let import_result = (|| -> OmniResult<()> {
             validate_staged_backup_bundle_import(&staged_import.staged_db_path)?;
-            Storage::delete_local_data_at_path(destination_path)?;
-            copy_local_storage_bundle(&staged_import.staged_db_path, destination_path)
+            ensure_restore_replaces_no_other_profile(destination_path, &staged_import.staged_db_path)?;
+            // On the staged copy, before it takes the profile's place: the restored database never
+            // holds a ratchet session of the copy's that is not marked as one.
+            Storage::open(&staged_import.staged_db_path)?.mark_ratchet_sessions_of_a_restored_copy()?;
+            // The profile's data is set aside, not deleted, until the copy has taken its place: a
+            // copy that failed half way used to leave neither (blind audit 2026-11-10).
+            let previous = Storage::set_aside_local_data_at_path(destination_path)?;
+            let brought = copy_local_storage_bundle(&staged_import.staged_db_path, destination_path)
+                // The rows name the files where the copy was made; they are here now.
+                .and_then(|()| Storage::open(destination_path)?.rehome_attachment_files().map(|_| ()));
+            match brought {
+                Ok(()) => {
+                    let _ = previous.discard();
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Err(put_back) = previous.put_back(destination_path) {
+                        omni_app_trace_log("backup/restore", &format!("the previous data was not put back: {put_back}"));
+                    }
+                    Err(error)
+                }
+            }
         })();
         let cleanup_result = cleanup_staged_backup_bundle_import(&staged_import);
         import_result?;
@@ -672,9 +710,13 @@ include!("app_realtime_media.rs");
 
 include!("app_connection_trace.rs");
 
+mod tick_cost;
+mod app_serve_right;
 include!("app_mesh.rs");
 
 include!("app_rendezvous.rs");
+
+include!("app_tcp_knock.rs");
 
 include!("app_discoverability.rs");
 
@@ -691,8 +733,20 @@ mod app_attachment_preparation;
 mod app_upload_slots;
 mod app_download_scheduler;
 pub use app_profile_folder_lock::PROFILE_ALREADY_OPEN;
+mod app_group_mentions;
+mod app_message_actions;
+mod app_message_reactions;
 mod app_groups;
 mod app_group_attachments;
+mod app_git_bridge;
+mod app_workspace;
+pub use app_workspace::{
+    WorkspaceFilesCommand, WorkspaceFilesDetails, WorkspaceLeaveNotice,
+    WorkspaceCommitView, WorkspaceFolder, WorkspaceDeviceBranchView, WorkspaceFilesSync, WorkspaceLocalBranchView, WorkspaceMainState, WorkspacePullOutcome, WorkspaceRepoView, WorkspaceSaveVersion, WorkspaceTipView,
+    WorkspaceView, WorkspaceViewSnapshot,
+    AgentInbox, AgentInboxItem, AgentInboxPlace, AgentSelf, WorkspaceAgentsCommand, WorkspaceAgentAskView, WorkspaceAgentReviewView, WorkspaceAgentView, WorkspaceAgentsView,
+};
+pub use app_workspace::agents::{AGENT_BRANCH_PREFIX, AGENT_CODE_FILE, AGENT_MESSAGES_PER_MINUTE, AGENT_TURNS_WITHOUT_HUMAN};
 mod app_group_history;
 mod app_group_branches;
 mod app_group_rejoin;
@@ -813,26 +867,76 @@ pub(crate) fn profile_sidecar_path(db_path: &str, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{file_name}.{suffix}"))
 }
 
-fn export_backup_bundle_contents(source_db_path: &Path, backup_db_path: &Path) -> OmniResult<()> {
-    // TM-006 follow-up (2026-05-21): the bundle sibling directory
-    // (`<backup_db_path>.bundle/`) is about to be recursively
-    // deleted and re-created. Without confinement a caller-supplied
-    // `backup_db_path = C:\Windows\foo.db` would resolve to
-    // `C:\Windows\foo.db.bundle/` being wiped + re-populated.
-    // Validation-only: the actual ops keep the original path.
+/// A setting of one profile, in a file beside the database named for that profile:
+/// `<db file name>.<profile id>.<suffix>`. `None` with no profile active. The settings that say who
+/// we are to the world (findable by Omni-ID, by name, what is still to be withdrawn) were one file
+/// per database: one profile's «findable» published another profile of the same database
+/// (blind audit 2026-11-13, pass 23). Legacy files have no owner. Each profile must opt in again.
+pub(crate) fn active_profile_sidecar_path(storage: &omni_storage::Storage, suffix: &str) -> Option<PathBuf> {
+    let profile = storage.get_active_profile_id().ok()??;
+    let db_path = storage.db_path().to_string_lossy().into_owned();
+    Some(profile_sidecar_path(&db_path, &format!("{}.{suffix}", profile.0)))
+}
+
+/// The profile's own setting files ([`active_profile_sidecar_path`]), removed with the profile.
+pub(crate) fn remove_profile_sidecars(db_path: &Path, profile_id: &omni_identity::LocalProfileId) {
+    let file_name = db_path.file_name().and_then(|name| name.to_str()).filter(|name| !name.is_empty()).unwrap_or("omni.db");
+    let prefix = format!("{file_name}.{}.", profile_id.0);
+    let Some(dir) = db_path.parent() else { return };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// V-24 (review 2026-10-18): a plain copy goes only where its `<name>.bundle/` folder is not yet (the
+/// database, its journals and key file are checked by `Storage::export_database_backup`). Checked
+/// before anything is written, so a refused copy leaves nothing behind; the copy deletes nothing it
+/// did not create.
+fn ensure_backup_bundle_destination_is_free(backup_db_path: &Path) -> OmniResult<()> {
+    let bundle_directory = backup_bundle_directory(backup_db_path);
+    if bundle_directory.exists() {
+        return Err(OmniError::InvalidInput(format!(
+            "backup destination already has '{}': choose a new file name or an empty folder",
+            bundle_directory.display()
+        )));
+    }
+    Ok(())
+}
+
+/// `only`: the attachment files to take (a copy of one profile); `None` takes the whole folder (the
+/// plain copy of an install the dev tools make).
+fn export_backup_bundle_contents(source_db_path: &Path, backup_db_path: &Path, only: Option<&[PathBuf]>) -> OmniResult<()> {
+    // TM-006: confine the caller-supplied path before writing `<backup_db_path>.bundle/`.
     // See docs/decisions/tm-006-destructive-path-confinement.md.
     Storage::confine_destructive_path_for_callers(backup_db_path)?;
+    ensure_backup_bundle_destination_is_free(backup_db_path)?;
     let bundle_directory = backup_bundle_directory(backup_db_path);
-    delete_directory_if_exists(&bundle_directory)?;
 
     let mut bundle_created = false;
     let source_attachments_directory = attachments_directory_for_db_path(source_db_path)?;
-    if source_attachments_directory.exists() {
-        copy_directory_recursive(
-            &source_attachments_directory,
-            &bundle_directory.join("attachments"),
-        )?;
-        bundle_created = true;
+    match only {
+        Some(files) => {
+            for file in files {
+                // A file outside the folder is the person's own (sent from where it lies): not ours to pack.
+                let Some(inside) = path_inside_folder(file, &source_attachments_directory) else {
+                    continue;
+                };
+                if file.is_file() {
+                    copy_file_with_parent(file, &bundle_directory.join("attachments").join(inside))?;
+                    bundle_created = true;
+                }
+            }
+        }
+        None if source_attachments_directory.exists() => {
+            copy_directory_recursive(
+                &source_attachments_directory,
+                &bundle_directory.join("attachments"),
+            )?;
+            bundle_created = true;
+        }
+        None => {}
     }
 
     for (source_sidecar_path, bundle_file_name) in backup_bundle_sidecar_sources(source_db_path)? {
@@ -852,6 +956,30 @@ fn export_backup_bundle_contents(source_db_path: &Path, backup_db_path: &Path) -
     }
 
     Ok(())
+}
+
+/// `file` as a path relative to `folder`, when it lies inside it. The names differ only by letter
+/// case where the file system does not tell them apart.
+fn path_inside_folder(file: &Path, folder: &Path) -> Option<PathBuf> {
+    if let Ok(inside) = file.strip_prefix(folder) {
+        return Some(inside.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let mut file_parts = file.components();
+        for part in folder.components() {
+            let same = file_parts
+                .next()
+                .is_some_and(|other| other.as_os_str().to_string_lossy().to_lowercase() == part.as_os_str().to_string_lossy().to_lowercase());
+            if !same {
+                return None;
+            }
+        }
+        let inside: PathBuf = file_parts.collect();
+        (!inside.as_os_str().is_empty()).then_some(inside)
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 fn import_backup_bundle_contents(
@@ -942,8 +1070,51 @@ fn validate_staged_backup_bundle_import(staged_db_path: &Path) -> OmniResult<()>
     Ok(())
 }
 
+/// A restore puts the copy in the place of everything the install holds. A copy is one profile's
+/// (pass 14), so a restore over an install with other profiles would delete them: it is refused
+/// while the install holds a profile the copy does not. A database this machine cannot open (a
+/// folder brought from another one) names no profile that works here, and is replaced as before.
+fn ensure_restore_replaces_no_other_profile(destination_db_path: &Path, staged_db_path: &Path) -> OmniResult<()> {
+    if !destination_db_path.exists()
+        || Storage::database_lock_state(destination_db_path)? != omni_storage::DatabaseLockState::Openable
+    {
+        return Ok(());
+    }
+    let in_copy: std::collections::HashSet<String> = Storage::open(staged_db_path)?
+        .list_local_profiles()?
+        .profiles
+        .into_iter()
+        .map(|profile| profile.account_id.0)
+        .collect();
+    let here = Storage::open(destination_db_path)?.list_local_profiles()?.profiles;
+    if here.iter().any(|profile| !in_copy.contains(&profile.account_id.0)) {
+        return Err(OmniError::InvalidInput(
+            "this device holds other profiles the backup does not: restoring would delete them. Save their backups and remove them first".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Tests: the destinations whose next restore fails right after its database is copied (a disk that
+/// filled up half way).
+#[cfg(test)]
+static RESTORE_COPY_FAILS_FOR: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn fail_the_next_restore_copy_to(destination_db_path: &Path) {
+    RESTORE_COPY_FAILS_FOR.lock().unwrap().push(destination_db_path.to_path_buf());
+}
+
 fn copy_local_storage_bundle(source_db_path: &Path, destination_db_path: &Path) -> OmniResult<()> {
     copy_file_with_parent(source_db_path, destination_db_path)?;
+    #[cfg(test)]
+    {
+        let mut armed = RESTORE_COPY_FAILS_FOR.lock().unwrap();
+        if let Some(at) = armed.iter().position(|path| path == destination_db_path) {
+            armed.remove(at);
+            return Err(OmniError::Storage("no space left on the disk (test)".to_string()));
+        }
+    }
     Storage::copy_database_key_file(source_db_path, destination_db_path)?;
 
     let source_attachments_directory = attachments_directory_for_db_path(source_db_path)?;

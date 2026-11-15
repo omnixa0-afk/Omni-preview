@@ -1367,22 +1367,29 @@ fn compute_fingerprint(identity_key: Option<&str>) -> Option<String> {
     Some(hex::encode(sha256(&payload)))
 }
 
+/// Groups of five digits in a safety number: 30 digits, ~99.7 bits.
+const SAFETY_NUMBER_GROUPS: usize = 6;
+
+/// The safety number of a fingerprint: `SAFETY_NUMBER_GROUPS` groups of five digits from SHA-512,
+/// each group a 40-bit slice mod 100000. It was 12 digits — the fingerprint's hex digits mod 10,
+/// about 36 bits — and a key with the same code could be found on a GPU (security review 2026-10-18,
+/// V-10). At ~100 bits no search reaches it, so the hash is not iterated (Signal's 5200 rounds would
+/// add ~12 bits and cost every contact-list refresh, where the number is computed per contact). The
+/// shell compares keys, not these digits; the number is for people reading it to each other.
 fn fingerprint_to_safety_number(fingerprint: &str) -> String {
-    let numeric = fingerprint
-        .chars()
-        .filter_map(|character| character.to_digit(16))
-        .fold(String::new(), |mut acc, value| {
-            acc.push(char::from(b'0' + (value % 10) as u8));
-            acc
-        });
-
-    let digits = if numeric.len() >= 12 {
-        numeric[..12].to_string()
-    } else {
-        format!("{numeric:0<12}")
-    };
-
-    format!("{} {} {}", &digits[0..4], &digits[4..8], &digits[8..12])
+    use sha2::Sha512;
+    let hash = Sha512::new()
+        .chain_update(b"omni-safety-number-v3|")
+        .chain_update(fingerprint.as_bytes())
+        .finalize();
+    hash.chunks(5)
+        .take(SAFETY_NUMBER_GROUPS)
+        .map(|chunk| {
+            let value = chunk.iter().fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+            format!("{:05}", value % 100_000)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -1690,5 +1697,18 @@ mod tests {
         assert!(material.fingerprint.is_some());
         assert!(material.safety_number.is_some());
         assert_eq!(material, super::verification_material_for_identity_key(Some("acct-1")));
+    }
+
+    /// V-10: a safety number is six groups of five digits (30 digits), stable for a key and
+    /// different for another.
+    #[test]
+    fn a_safety_number_is_thirty_digits_stable_and_key_bound() {
+        let number = |key: &str| super::verification_material_for_identity_key(Some(key)).safety_number.unwrap();
+        let alice = number("acct-alice");
+        let groups: Vec<&str> = alice.split(' ').collect();
+        assert_eq!(groups.len(), 6, "{alice}");
+        assert!(groups.iter().all(|g| g.len() == 5 && g.chars().all(|c| c.is_ascii_digit())), "{alice}");
+        assert_eq!(alice, number("acct-alice"), "stable");
+        assert_ne!(alice, number("acct-bob"), "bound to the key");
     }
 }

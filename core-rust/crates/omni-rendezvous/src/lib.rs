@@ -18,7 +18,7 @@
 //!
 //! Trust model: the channel is an **untrusted courier** of opaque blobs under opaque topics — it can
 //! drop/replay/observe (DoS / metadata), but never deceive (AEAD auth + blinded topic + identity-bound
-//! trust completed later by the QUIC connect-time challenge).
+//! trust completed later by the QUIC connect-time challenge, bound to its own TLS session — TM-022).
 
 #![forbid(unsafe_code)]
 
@@ -304,6 +304,12 @@ pub struct Beacon {
     /// and for publishers without a direct-TCP front door. See docs/decisions/tcp-direct-peer-fallback.md.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tcp_direct: Vec<String>,
+    /// The publisher's door as its NAT shows it to everyone (`host:port`), for a TCP hole punch: no
+    /// port forward, but two STUN servers saw the door's port mapped to this same address, so the
+    /// contact can use it too. Published only without a `tcp_direct` door. See
+    /// docs/decisions/tcp-hole-punch.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_punch: Option<String>,
     pub nat_type: NatType,
     /// Unix epoch ms when published.
     pub ts_ms: u64,
@@ -434,6 +440,17 @@ fn identity_topic_for_bucket(omni_id: &[u8; 20], bucket: u64) -> Topic {
     Topic(hkdf32(omni_id, &info))
 }
 
+const HKDF_KNOCK_SECRET_INFO: &[u8] = b"omni.identity.knock.v1";
+
+/// The topic secret of an Omni-ID's knocks: someone who found a device by the ID and wants a TCP
+/// hole punch posts its own punch address there, as a [`Beacon`] sealed with [`seal_beacon_to`] to the
+/// device's [`IdentityBeacon::knock_key`] (the topics are [`rendezvous_topics`] of this secret). The
+/// secret comes from the public ID, so anyone can post; only the device reads what was posted. See
+/// docs/decisions/tcp-hole-punch.md.
+pub fn knock_secret(omni_id: &[u8; 20]) -> PairSecret {
+    hkdf32(omni_id, HKDF_KNOCK_SECRET_INFO)
+}
+
 /// The identity-discovery topics to publish-to / poll-on right now for an Omni-ID:
 /// current bucket + previous (rotation-boundary tolerance), mirroring
 /// [`rendezvous_topics`].
@@ -498,6 +515,12 @@ pub struct IdentityBeacon {
     pub reflexive: Vec<String>,
     pub tcp_direct: Vec<String>,
     pub relay_bundle: Option<String>,
+    /// The device's door as its NAT shows it to everyone, for a TCP hole punch (tcp-hole-punch.md):
+    /// a finder knocks — seals its own punch address to [`Self::knock_key`] on the
+    /// [`knock_secret`] topics — and both sides punch.
+    pub tcp_punch: Option<String>,
+    /// The device's X25519 key for knocks (omni-crypto `derive_knock_key`); with `tcp_punch`.
+    pub knock_key: Option<[u8; 32]>,
     pub ts_ms: u64,
     pub ttl_secs: u32,
     /// Monotone per-publisher sequence (freshest wins on fetch; anti-rollback).
@@ -507,8 +530,8 @@ pub struct IdentityBeacon {
     pub signature: Vec<u8>,
 }
 
-const IDENTITY_BEACON_MAGIC: &[u8; 4] = b"OIB2";
-const IDENTITY_BEACON_SIGNING_CONTEXT: &[u8] = b"omni-identity-beacon-v2\0";
+const IDENTITY_BEACON_MAGIC: &[u8; 4] = b"OIB3";
+const IDENTITY_BEACON_SIGNING_CONTEXT: &[u8] = b"omni-identity-beacon-v3\0";
 /// Endpoints a beacon lists at most, per kind.
 const IDENTITY_BEACON_MAX_ENDPOINTS: usize = 16;
 
@@ -517,9 +540,10 @@ impl IdentityBeacon {
         self.prekey_compact.is_empty()
     }
 
-    /// Layout: magic «OIB2» · omni_id 20 · chain (u16 len) · node 20 · bundle (u16 len) · label (u8 len)
-    /// · reflexive (u8 count, each u8 len) · tcp_direct (same) · relay bundle (u16 len, 0 — none) · ts u64
-    /// · ttl u32 · seq u64 · signature (u8 len). Little-endian.
+    /// Layout: magic «OIB3» · omni_id 20 · chain (u16 len) · node 20 · bundle (u16 len) · label (u8 len)
+    /// · reflexive (u8 count, each u8 len) · tcp_direct (same) · relay bundle (u16 len, 0 — none)
+    /// · tcp punch (u8 len, 0 — none) · knock key (u8 len: 0 or 32) · ts u64 · ttl u32 · seq u64
+    /// · signature (u8 len). Little-endian.
     pub fn to_wire(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(256 + self.chain_compact.len() + self.prekey_compact.len());
         out.extend_from_slice(IDENTITY_BEACON_MAGIC);
@@ -536,6 +560,8 @@ impl IdentityBeacon {
             }
         }
         push_u16_len(&mut out, self.relay_bundle.as_deref().unwrap_or("").as_bytes());
+        push_u8_len(&mut out, self.tcp_punch.as_deref().unwrap_or("").as_bytes());
+        push_u8_len(&mut out, self.knock_key.as_ref().map(|key| key.as_slice()).unwrap_or(&[]));
         out.extend_from_slice(&self.ts_ms.to_le_bytes());
         out.extend_from_slice(&self.ttl_secs.to_le_bytes());
         out.extend_from_slice(&self.seq.to_le_bytes());
@@ -566,6 +592,11 @@ impl IdentityBeacon {
             lists.push(list);
         }
         let relay = String::from_utf8(take_u16_len(&mut rest)?.to_vec()).ok()?;
+        let tcp_punch = String::from_utf8(take_u8_len(&mut rest)?.to_vec()).ok()?;
+        let knock_key = match take_u8_len(&mut rest)? {
+            [] => None,
+            key => Some(<[u8; 32]>::try_from(key).ok()?),
+        };
         let ts_ms = u64::from_le_bytes(take_bytes(&mut rest, 8)?.try_into().ok()?);
         let ttl_secs = u32::from_le_bytes(take_bytes(&mut rest, 4)?.try_into().ok()?);
         let seq = u64::from_le_bytes(take_bytes(&mut rest, 8)?.try_into().ok()?);
@@ -584,6 +615,8 @@ impl IdentityBeacon {
             reflexive,
             tcp_direct,
             relay_bundle: (!relay.is_empty()).then_some(relay),
+            tcp_punch: (!tcp_punch.is_empty()).then_some(tcp_punch),
+            knock_key,
             ts_ms,
             ttl_secs,
             seq,
@@ -714,6 +747,13 @@ impl DhtSlotClaimer {
 
 pub mod wire;
 
+// Bounded reads of the helper line IPC (V-12).
+pub mod helper_ipc;
+// Public, internet-routable addresses (V-22).
+mod public_ip;
+pub use omni_net_primitives::is_public_ip;
+pub use public_ip::is_public_courier_url;
+
 // Find by name — signed pointers from a name to an Omni-ID (docs/decisions/find-by-name.md).
 pub mod name_discovery;
 pub mod relay_directory;
@@ -721,6 +761,7 @@ pub mod relay_directory;
 const BEACON_WIRE_VERSION: u8 = 1;
 const BEACON_HAS_RELAY_BUNDLE: u8 = 1;
 const BEACON_HAS_REVOCATION_MARK: u8 = 2;
+const BEACON_HAS_TCP_PUNCH: u8 = 4;
 /// The relay bundle as its raw bytes (`om3relay:` + base64url of them) …
 const RELAY_BUNDLE_RAW: u8 = 1;
 /// … or, if it is not such a token, as text.
@@ -763,6 +804,9 @@ pub fn encode_beacon(beacon: &Beacon) -> Option<Vec<u8>> {
     if beacon.revoked_through_ms.is_some() {
         flags |= BEACON_HAS_REVOCATION_MARK;
     }
+    if beacon.tcp_punch.is_some() {
+        flags |= BEACON_HAS_TCP_PUNCH;
+    }
     out.push(flags);
     for list in [&beacon.forwarded, &beacon.reflexive, &beacon.tcp_direct] {
         out.push(u8::try_from(list.len()).ok()?);
@@ -772,6 +816,9 @@ pub fn encode_beacon(beacon: &Beacon) -> Option<Vec<u8>> {
     }
     if let Some(mark) = beacon.revoked_through_ms {
         out.extend_from_slice(&mark.to_be_bytes());
+    }
+    if let Some(punch) = beacon.tcp_punch.as_deref() {
+        wire::put_endpoint(&mut out, punch)?;
     }
     if let Some(token) = beacon.relay_bundle.as_deref() {
         let engine = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -810,6 +857,7 @@ pub fn decode_beacon(bytes: &[u8]) -> Option<Beacon> {
         }
     }
     let revoked_through_ms = if flags & BEACON_HAS_REVOCATION_MARK != 0 { Some(reader.u64()?) } else { None };
+    let tcp_punch = if flags & BEACON_HAS_TCP_PUNCH != 0 { Some(reader.endpoint()?) } else { None };
     let relay_bundle = if flags & BEACON_HAS_RELAY_BUNDLE != 0 {
         let kind = reader.u8()?;
         let len = reader.u16()? as usize;
@@ -829,7 +877,18 @@ pub fn decode_beacon(bytes: &[u8]) -> Option<Beacon> {
         return None;
     }
     let [forwarded, reflexive, tcp_direct] = lists;
-    Some(Beacon { node, forwarded, reflexive, tcp_direct, nat_type, ts_ms, ttl_secs, relay_bundle, revoked_through_ms })
+    Some(Beacon {
+        node,
+        forwarded,
+        reflexive,
+        tcp_direct,
+        tcp_punch,
+        nat_type,
+        ts_ms,
+        ttl_secs,
+        relay_bundle,
+        revoked_through_ms,
+    })
 }
 
 fn aead(secret: &PairSecret) -> ChaCha20Poly1305 {
@@ -862,6 +921,17 @@ pub fn open_beacon(
     now_ms: u64,
     guard: &mut ReplayGuard,
 ) -> Result<Beacon, RvError> {
+    open_sealed(&aead(secret), topic, sealed, now_ms, guard)
+}
+
+/// [`open_beacon`] under a given AEAD — the topic's own, or an addressed beacon's.
+fn open_sealed(
+    aead: &ChaCha20Poly1305,
+    topic: &Topic,
+    sealed: &SealedBeacon,
+    now_ms: u64,
+    guard: &mut ReplayGuard,
+) -> Result<Beacon, RvError> {
     if sealed.nonce.len() != 12 {
         return Err(RvError::Forged);
     }
@@ -869,7 +939,7 @@ pub fn open_beacon(
         return Err(RvError::Replay);
     }
     let nonce = Nonce::from_slice(&sealed.nonce);
-    let plaintext = aead(secret)
+    let plaintext = aead
         .decrypt(nonce, Payload { msg: &sealed.ciphertext, aad: topic.as_bytes() })
         .map_err(|_| RvError::Forged)?;
     let encoded = unpad_plaintext(&plaintext).ok_or(RvError::Malformed)?;
@@ -880,6 +950,100 @@ pub fn open_beacon(
     }
     guard.record(topic, &sealed.nonce);
     Ok(beacon)
+}
+
+/// HKDF info of an addressed beacon's AEAD key ([`seal_beacon_to`]).
+const HKDF_ADDRESSED_INFO: &[u8] = b"omni-rendezvous-addressed-v1";
+
+/// Bytes in front of an addressed beacon's wire: its sender's X25519 public key.
+const ADDRESSED_KEY_BYTES: usize = 32;
+
+/// Who opens an addressed beacon ([`open_addressed_beacon`]).
+#[derive(Clone, Copy)]
+pub enum BeaconReader<'a> {
+    /// The one it is addressed to, by its X25519 secret.
+    Addressee(&'a [u8; 32]),
+    /// Its sender reading its own back (did it reach the courier?): the sender's X25519 secret and
+    /// the addressee's public key.
+    Sender { secret: &'a [u8; 32], addressee: &'a [u8; 32] },
+}
+
+/// The AEAD of a beacon from `sender` to `addressee`: keyed by the topic secret AND their X25519
+/// agreement, so holding the topic secret alone opens nothing.
+fn addressed_aead(secret: &PairSecret, agreed: &[u8; 32], sender: &[u8; 32], addressee: &[u8; 32]) -> ChaCha20Poly1305 {
+    let mut ikm = hkdf32(secret, HKDF_AEAD_INFO).to_vec();
+    ikm.extend_from_slice(agreed);
+    let mut info = HKDF_ADDRESSED_INFO.to_vec();
+    info.extend_from_slice(sender);
+    info.extend_from_slice(addressee);
+    ChaCha20Poly1305::new(Key::from_slice(&hkdf32(&ikm, &info)))
+}
+
+/// [`seal_beacon`] that only `addressee` (an X25519 public key) — and the sender, by its own
+/// `sender_secret` — can open: for a topic whose secret several people hold. An invite given to two
+/// people seats both importers on its topic; each one's beacon is addressed to the inviter, so the
+/// other importer cannot read its addresses (docs/bugs/an-invite-importer-dialed-another-importer.md).
+/// Returns the wire: `sender public key (32) || nonce (12) || ciphertext`. `None` for an addressee
+/// key that yields no agreement (a low-order point).
+pub fn seal_beacon_to(
+    secret: &PairSecret,
+    topic: &Topic,
+    beacon: &Beacon,
+    sender_secret: &[u8; 32],
+    addressee: &[u8; 32],
+) -> Option<Vec<u8>> {
+    let own = x25519_dalek::StaticSecret::from(*sender_secret);
+    let sender = x25519_dalek::PublicKey::from(&own).to_bytes();
+    let agreed = own.diffie_hellman(&x25519_dalek::PublicKey::from(*addressee));
+    if !agreed.was_contributory() {
+        return None;
+    }
+    let plaintext = pad_plaintext_from(&encode_beacon(beacon).unwrap_or_default(), BEACON_PAD_FLOOR);
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let ciphertext = addressed_aead(secret, agreed.as_bytes(), &sender, addressee)
+        .encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: &plaintext, aad: topic.as_bytes() })
+        .expect("AEAD encryption of a bounded payload does not fail");
+    let mut wire = sender.to_vec();
+    wire.extend_from_slice(&nonce_bytes);
+    wire.extend_from_slice(&ciphertext);
+    Some(wire)
+}
+
+/// Open a wire of [`seal_beacon_to`] as `reader`, validated like [`open_beacon`]. A beacon sealed only
+/// to the topic does not open here (nor this one in [`open_beacon`]): `Forged`.
+pub fn open_addressed_beacon(
+    secret: &PairSecret,
+    topic: &Topic,
+    wire: &[u8],
+    reader: BeaconReader<'_>,
+    now_ms: u64,
+    guard: &mut ReplayGuard,
+) -> Result<Beacon, RvError> {
+    if wire.len() < ADDRESSED_KEY_BYTES + 12 + 16 {
+        return Err(RvError::Forged);
+    }
+    let (sender, rest) = wire.split_at(ADDRESSED_KEY_BYTES);
+    let sender: [u8; 32] = sender.try_into().map_err(|_| RvError::Forged)?;
+    let (agreed, addressee) = match reader {
+        BeaconReader::Addressee(own) => {
+            let own = x25519_dalek::StaticSecret::from(*own);
+            let addressee = x25519_dalek::PublicKey::from(&own).to_bytes();
+            (own.diffie_hellman(&x25519_dalek::PublicKey::from(sender)), addressee)
+        }
+        BeaconReader::Sender { secret: own, addressee } => {
+            let own = x25519_dalek::StaticSecret::from(*own);
+            if x25519_dalek::PublicKey::from(&own).to_bytes() != sender {
+                return Err(RvError::Forged);
+            }
+            (own.diffie_hellman(&x25519_dalek::PublicKey::from(*addressee)), *addressee)
+        }
+    };
+    if !agreed.was_contributory() {
+        return Err(RvError::Forged);
+    }
+    let sealed = SealedBeacon::from_wire(rest).ok_or(RvError::Forged)?;
+    open_sealed(&addressed_aead(secret, agreed.as_bytes(), &sender, &addressee), topic, &sealed, now_ms, guard)
 }
 
 /// Bounded per-topic set of accepted nonces — the cheap anti-replay memory (TM-011). Caps growth so
@@ -959,10 +1123,12 @@ pub trait RendezvousChannel {
     }
 
     /// Push model: hold a subscription on `topics` for up to `wait` and return the blob(s) published
-    /// under any of them AFTER the call began — early, on the first arrival; empty on timeout. Lets the
-    /// core learn a contact's fresh beacon the moment it is published instead of on its next poll
-    /// (90 s – 30 min). Only couriers with a native subscription implement it (ntfy's stream, a Nostr
-    /// `REQ` held open); BT-DHT has none, so the default is "unsupported".
+    /// under any of them AFTER the call began — early, on the first arrival; empty on timeout. A
+    /// courier that keeps the subscription between calls (a Nostr relay) also returns at once what
+    /// arrived since the previous call on the same topics, so nothing published while the core renews
+    /// its watch is lost. Lets the core learn a contact's fresh beacon the moment it is published
+    /// instead of on its next poll (90 s – 30 min). Only couriers with a native subscription implement
+    /// it (ntfy's stream, a Nostr `REQ` held open); BT-DHT has none, so the default is "unsupported".
     fn watch(&self, topics: &[Topic], wait: std::time::Duration) -> Result<Vec<Vec<u8>>, ChannelError> {
         let _ = (topics, wait);
         Err(ChannelError("watch: this courier has no subscription".to_string()))
@@ -971,6 +1137,14 @@ pub trait RendezvousChannel {
     /// Whether [`watch`](RendezvousChannel::watch) is implemented.
     fn supports_watch(&self) -> bool {
         false
+    }
+
+    /// End now the [`watch`](RendezvousChannel::watch) calls waiting on `topics` with nothing taken:
+    /// another courier answered first, and what arrives here next is kept for the next call instead of
+    /// being taken by a call whose answer nobody reads. Only a courier that keeps a subscription
+    /// between calls (a Nostr relay's held `REQ`) has anything to do.
+    fn release_watch(&self, topics: &[Topic]) {
+        let _ = topics;
     }
 
     /// Whether this courier meters publishing and little of the allowance is left (ntfy.sh: 250 a day
@@ -984,6 +1158,13 @@ pub trait RendezvousChannel {
     /// record: [`DHT_MAX_BLOB`]). A beacon over it goes to this courier as its slim copy — the same
     /// beacon without the relay bundle — so the addresses always get there.
     fn max_blob(&self) -> Option<usize> {
+        None
+    }
+
+    /// How many connections this courier has opened since it was made, if it knows (a Nostr relay —
+    /// each is a TCP + TLS + WebSocket handshake the relay counts against our address). `None`: the
+    /// courier does not count them (ntfy's HTTP agent pools its own). For the courier's `stats`.
+    fn connections_opened(&self) -> Option<u64> {
         None
     }
 }
@@ -1384,6 +1565,7 @@ mod tests {
             forwarded: vec!["[2001:db8::1]:51820".into(), "203.0.113.9:6000".into()],
             reflexive: vec!["198.51.100.7:51820".into()],
             tcp_direct: vec!["door.example:443".into()],
+            tcp_punch: None,
             nat_type: NatType::Symmetric,
             ts_ms: 1_791_000_000_123,
             ttl_secs: 46_800,
@@ -1425,12 +1607,65 @@ mod tests {
             forwarded: vec!["[2001:db8::1]:51820".into()],
             reflexive: vec!["203.0.113.7:51820".into()],
             tcp_direct: vec![],
+            tcp_punch: None,
             nat_type: NatType::Cone,
             ts_ms: now,
             ttl_secs: 300,
             relay_bundle: None,
             revoked_through_ms: None,
         }
+    }
+
+    /// A beacon addressed to the inviter opens for it and for its sender — not for another holder of
+    /// the topic secret (a second importer of the same invite), and not as a topic-only beacon.
+    #[test]
+    fn an_addressed_beacon_opens_only_for_its_addressee_and_its_sender() {
+        let s = secret(9);
+        let now = 1_700_000_000_000;
+        let topic = rendezvous_topics(&s, now)[0];
+        let inviter = [21u8; 32];
+        let inviter_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(inviter)).to_bytes();
+        let (importer, other_importer) = ([22u8; 32], [23u8; 32]);
+        let wire = seal_beacon_to(&s, &topic, &sample_beacon(now), &importer, &inviter_pub).expect("sealed");
+
+        let open = |reader| open_addressed_beacon(&s, &topic, &wire, reader, now, &mut ReplayGuard::new());
+        assert_eq!(open(BeaconReader::Addressee(&inviter)).map(|b| b.node), Ok([1u8; 20]));
+        assert!(open(BeaconReader::Sender { secret: &importer, addressee: &inviter_pub }).is_ok());
+        assert_eq!(open(BeaconReader::Addressee(&other_importer)).err(), Some(RvError::Forged));
+        assert_eq!(
+            open(BeaconReader::Sender { secret: &other_importer, addressee: &inviter_pub }).err(),
+            Some(RvError::Forged)
+        );
+        let as_topic_only = SealedBeacon::from_wire(&wire).expect("wire shape");
+        assert_eq!(open_beacon(&s, &topic, &as_topic_only, now, &mut ReplayGuard::new()).err(), Some(RvError::Forged));
+        // Under another topic (another invite) it does not open either.
+        let elsewhere = rendezvous_topics(&secret(10), now)[0];
+        assert!(open_addressed_beacon(&s, &elsewhere, &wire, BeaconReader::Addressee(&inviter), now, &mut ReplayGuard::new()).is_err());
+    }
+
+    /// A knock: the finder's punch address, sealed on the Omni-ID's knock topic to the device's knock
+    /// key. The device opens it; another reader who computes the same topic from the public ID does not,
+    /// and the knock topics are neither the ID's identity topics nor another ID's knock topics.
+    #[test]
+    fn a_knock_opens_only_for_the_device_whose_knock_key_it_names() {
+        let now = 1_700_000_000_000;
+        let omni_id = [0xAAu8; 20];
+        let s = knock_secret(&omni_id);
+        let topic = rendezvous_topics(&s, now)[0];
+        assert_ne!(topic.id(), identity_topics(&omni_id, now)[0].id());
+        assert_ne!(topic.id(), rendezvous_topics(&knock_secret(&[0xBBu8; 20]), now)[0].id());
+
+        let device = [41u8; 32];
+        let device_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(device)).to_bytes();
+        let mut knock = sample_beacon(now);
+        knock.tcp_punch = Some("198.51.100.20:40001".into());
+        let wire = seal_beacon_to(&s, &topic, &knock, &[42u8; 32], &device_pub).expect("sealed");
+        assert!(wire.len() < DHT_MAX_BLOB, "a knock is small: {} B", wire.len());
+
+        let opened = open_addressed_beacon(&s, &topic, &wire, BeaconReader::Addressee(&device), now, &mut ReplayGuard::new());
+        assert_eq!(opened.map(|b| b.tcp_punch), Ok(Some("198.51.100.20:40001".into())));
+        let stranger = open_addressed_beacon(&s, &topic, &wire, BeaconReader::Addressee(&[43u8; 32]), now, &mut ReplayGuard::new());
+        assert_eq!(stranger.err(), Some(RvError::Forged));
     }
 
     /// BT-DHT courier (R7): the per-bucket DHT key seed is deterministic, secret-derived, rotates per
@@ -1506,6 +1741,29 @@ mod tests {
         let legacy = r#"{"node":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"reflexive":[],"nat_type":"Cone","ts_ms":1,"ttl_secs":300}"#;
         let parsed: Beacon = serde_json::from_str(legacy).expect("legacy beacon decodes");
         assert!(parsed.tcp_direct.is_empty(), "missing field defaults to empty");
+    }
+
+    /// The TCP punch address survives seal → open next to the other optional fields, and a beacon
+    /// without one opens without one. See docs/decisions/tcp-hole-punch.md.
+    #[test]
+    fn beacon_carries_the_tcp_punch_address() {
+        let s = secret(13);
+        let now = 1_700_000_000_000;
+        let topic = rendezvous_topics(&s, now)[0];
+        let mut guard = ReplayGuard::new();
+        let beacon = Beacon {
+            tcp_punch: Some("198.51.100.9:47500".into()),
+            revoked_through_ms: Some(42),
+            relay_bundle: Some("om3relay:AAEC".into()),
+            ..sample_beacon(now)
+        };
+        let opened = open_beacon(&s, &topic, &seal_beacon(&s, &topic, &beacon), now, &mut guard).expect("opens");
+        assert_eq!(opened.tcp_punch.as_deref(), Some("198.51.100.9:47500"));
+        assert_eq!(opened.revoked_through_ms, Some(42));
+        assert_eq!(opened.relay_bundle.as_deref(), Some("om3relay:AAEC"));
+        let plain = sample_beacon(now);
+        let opened = open_beacon(&s, &topic, &seal_beacon(&s, &topic, &plain), now, &mut guard).expect("opens");
+        assert_eq!(opened.tcp_punch, None);
     }
 
     /// `forwarded` survives seal -> open, and a beacon WITHOUT the key (an older publisher, whose
@@ -1871,6 +2129,8 @@ mod tests {
             reflexive: vec!["203.0.113.5:51820".to_string()],
             tcp_direct: vec![],
             relay_bundle: None,
+            tcp_punch: Some("203.0.113.5:47500".to_string()),
+            knock_key: Some([5u8; 32]),
             ts_ms: now,
             ttl_secs: 600,
             seq: 7,

@@ -182,6 +182,29 @@ impl Storage {
     }
 
     /// The prekey bundle of every device of `account_id` we know — one per device.
+    /// Every bundle we hold of the account's devices, revoked ones too: what a block refuses is every
+    /// key of the account we know — a revoked device's key is still its owner's to dial us with
+    /// (blind audit 2026-11-11, I5).
+    pub fn list_every_remote_prekey_bundle_of_account(&self, account_id: &AccountId) -> OmniResult<Vec<PrekeyBundle>> {
+        let device_ids: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT remote_device_id FROM remote_prekey_bundles WHERE remote_account_id = ?1")
+                .map_err(map_sqlite_error)?;
+            let rows = statement
+                .query_map(params![account_id.0.as_str()], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_error)?
+        };
+        let mut bundles = Vec::new();
+        for device_id in device_ids {
+            if let Some(bundle) = self.get_remote_prekey_bundle(account_id, &DeviceId(device_id))? {
+                bundles.push(bundle);
+            }
+        }
+        Ok(bundles)
+    }
+
     pub fn list_remote_prekey_bundles_for_account(
         &self,
         account_id: &AccountId,
@@ -230,7 +253,7 @@ impl Storage {
                     message_id, remote_device_id, delivered_at_unix_ms, profile_id
                 )
                 VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(message_id, remote_device_id) DO NOTHING
+                ON CONFLICT(profile_id, message_id, remote_device_id) DO NOTHING
                 ",
                 params![message_id, device_id.0.as_str(), delivered_at_unix_ms, profile_id.0.as_str()],
             )
@@ -280,10 +303,10 @@ impl Storage {
     pub fn message_delivered_devices(&self, message_id: &str) -> OmniResult<Vec<DeviceId>> {
         let mut statement = self
             .connection
-            .prepare("SELECT remote_device_id FROM message_device_receipts WHERE message_id = ?1")
+            .prepare("SELECT remote_device_id FROM message_device_receipts WHERE message_id = ?1 AND profile_id = ?2")
             .map_err(map_sqlite_error)?;
         let rows = statement
-            .query_map(params![message_id], |row| row.get::<_, String>(0).map(DeviceId))
+            .query_map(params![message_id, self.resolve_transition_profile_id()?.0], |row| row.get::<_, String>(0).map(DeviceId))
             .map_err(map_sqlite_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_error)
     }

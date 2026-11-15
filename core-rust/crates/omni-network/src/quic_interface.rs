@@ -32,6 +32,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+/// How long a peer's new bulk stream may take to say [`BULK_STREAM_PREFACE`]. The preface is read
+/// before the stream reaches the bulk workers and their caps, and a peer that opened streams and
+/// never sent it held a task each for as long as the connection lived (blind audit 2026-11-12,
+/// pass 15).
+const BULK_PREFACE_LIMIT: Duration = Duration::from_secs(10);
+/// How long a peer's uni-stream (one reliable frame, at most 64 KiB) may take to arrive whole.
+const UNI_STREAM_READ_LIMIT: Duration = Duration::from_secs(30);
+
 /// Marks a QUIC bi-stream as belonging to the BULK plane (attachment transfer). Written by the
 /// opener before any payload and verified by the acceptor, so a bi-stream opened for anything else
 /// is rejected rather than mis-read as transfer data.
@@ -43,6 +51,7 @@ const BULK_STREAM_PREFACE: [u8; 4] = *b"OMNB";
 /// both would re-expose the old value in the list), so every node must run the same value or the TLS
 /// handshake fails on no-common-ALPN. Pre-v1 flag-day (CONTRIBUTING.md: flip together, no legacy) — a node
 /// on this binary cannot reach a peer/relay still on the old ALPN until it is rebuilt.
+/// See docs/decisions/tls-server-name.md §ALPN.
 const OMNI_MESH_ALPN: &[u8] = b"h3";
 
 /// The SNI on every outgoing QUIC/TLS dial. Not a real hostname — the far end uses an accept-any TLS
@@ -217,7 +226,7 @@ impl QuicOverUdpInterface {
         // Bottom byte-pipe per the chosen carrier (see docs/decisions/connection-quality-ladder.md +
         // tcp-relay-fallback.md):
         // - UDP: the native socket (rungs 1–2).
-        // - TCP relay: a `TcpQuicSocket` (rung 0) — QUIC inside a TLS-over-TCP connection.
+        // - TCP relay: a `TcpQuicSocket` (rung 0) — genuine TLS-over-TCP carries opacity.
         let carrier_kind = match &choice {
             CarrierChoice::TcpRelay(_) => InterfaceKind::QuicOverTcp,
             CarrierChoice::Udp(_) => InterfaceKind::QuicOverUdp,
@@ -238,7 +247,7 @@ impl QuicOverUdpInterface {
                 let socket = bind_quic_udp_socket(bind_addr)
                     .map_err(|e| io::Error::other(format!("udp socket: {e}")))?;
                 let raw_socket = runtime.wrap_udp_socket(socket)?;
-                // STUN rides the raw socket: STUN servers speak plain STUN.
+                // STUN rides the raw socket, under the mux.
                 let stun_socket = StunSocket::new(raw_socket)?;
                 stun = Some(Arc::clone(&stun_socket));
                 let base: Arc<dyn quinn::AsyncUdpSocket> = stun_socket;
@@ -486,13 +495,20 @@ impl QuicOverUdpInterface {
                     let inbound_tx = inbound_tx.clone();
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
-                        match stream.read_to_end(64 * 1024).await {
-                            Ok(bytes) => {
+                        // Bounded in time as in size: a stream dripped a byte at a time held its task
+                        // and its share of the connection's streams for good (blind audit
+                        // 2026-11-12, pass 16).
+                        let read = tokio::time::timeout(UNI_STREAM_READ_LIMIT, stream.read_to_end(64 * 1024)).await;
+                        match read {
+                            Ok(Ok(bytes)) => {
                                 buf.extend_from_slice(&bytes);
                                 let _ = inbound_tx.send((neighbor, buf)).await;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 eprintln!("recv stream error: {e}");
+                            }
+                            Err(_) => {
+                                eprintln!("recv stream error: not whole within {UNI_STREAM_READ_LIMIT:?}");
                             }
                         }
                     });
@@ -526,7 +542,7 @@ impl QuicOverUdpInterface {
             // preface read of the first.
             tokio::spawn(async move {
                 let mut preface = [0_u8; BULK_STREAM_PREFACE.len()];
-                if recv.read_exact(&mut preface).await.is_err() {
+                if !matches!(tokio::time::timeout(BULK_PREFACE_LIMIT, recv.read_exact(&mut preface)).await, Ok(Ok(_))) {
                     return;
                 }
                 if preface != BULK_STREAM_PREFACE {
@@ -671,6 +687,15 @@ impl Interface for QuicOverUdpInterface {
         true
     }
 
+    fn channel_binding(&self, neighbor: &NeighborId) -> Option<[u8; crate::cert::CHANNEL_BINDING_BYTES]> {
+        let connection = self.connections.lock().get(neighbor).cloned()?;
+        let mut binding = [0u8; crate::cert::CHANNEL_BINDING_BYTES];
+        connection
+            .export_keying_material(&mut binding, crate::cert::CHANNEL_BINDING_LABEL, b"")
+            .ok()?;
+        Some(binding)
+    }
+
     fn remote_addr(&self, neighbor: &NeighborId) -> Option<std::net::SocketAddr> {
         self.connections
             .lock()
@@ -703,6 +728,18 @@ impl Interface for QuicOverUdpInterface {
         }
     }
 
+    fn route_peer_over_punched(
+        &self,
+        peer: SocketAddr,
+        stream: tokio::net::TcpStream,
+        door_port: u16,
+    ) -> io::Result<()> {
+        match &self.mux {
+            Some(mux) => mux.route_over_punched(peer, stream, &self.sni.resolve(), door_port),
+            None => Err(io::Error::other("interface has no mux router (pure-TCP carrier)")),
+        }
+    }
+
     fn route_peer_over_udp(&self, peer_quic: SocketAddr) {
         if let Some(mux) = &self.mux {
             mux.route_over_udp(peer_quic);
@@ -717,12 +754,12 @@ impl Interface for QuicOverUdpInterface {
         self.mux.as_ref().and_then(|m| m.door_of(peer_quic))
     }
 
-    async fn stun_reflexive(
+    async fn stun_probe(
         &self,
         servers: &[&str],
         timeout: std::time::Duration,
-    ) -> Option<omni_net_primitives::stun::Reflexive> {
-        self.stun.as_ref()?.reflexive(servers, timeout).await
+    ) -> Option<omni_net_primitives::stun::StunProbe> {
+        Some(self.stun.as_ref()?.probe(servers, timeout).await)
     }
 
     async fn send_datagram(&self, neighbor: &NeighborId, payload: &[u8]) -> io::Result<()> {

@@ -86,11 +86,11 @@ Canon: `decisions/serverless-bootstrap-rendezvous.md`, `global-identity-discover
 
 | Class | Topic key | What is published | Who can read it |
 |---|---|---|---|
-| **Pair** (acquaintances) | `HKDF(pair_secret, 10-min bucket)` | `Beacon` (endpoints, NAT type, TTL, optional relay bundle), **AEAD-sealed**, padded to 256 B, topic as AAD | **only the contact** (holder of pair_secret) |
+| **Pair** (acquaintances) | `HKDF(pair_secret, 12-h window)` | `Beacon` (endpoints, NAT type, TTL, optional relay bundle), **AEAD-sealed**, padded to 256 B, topic as AAD | **only the contact** (holder of pair_secret) |
 | **Identity** (lookup by Omni-ID) | derived from the Omni-ID | `IdentityBeacon`, **Ed25519-signed, NOT encrypted**; carries a prekey bundle (X3DH) + endpoints + node | **anyone who knows your Omni-ID** (by design) |
 | **Bootstrap** (first contact via invite) | `HKDF(derive_rendezvous_bootstrap_secret(nonce))` | a beacon sealed under the bootstrap secret | **both sides of the invite** (they know the nonce) |
 
-**Rotation:** pair topics rotate about every 10 minutes (buckets), so long-term linkability of a slot is broken.
+**Rotation:** pair topics rotate every 12 hours (`TOPIC_WINDOW_SECS`), so long-term linkability of a slot is broken.
 **Forgery:** an IdentityBeacon is checked against the commitment `sha256(signing_pub‖dh_pub)[:20] == omni_id` and
 the signature, so a courier can **drop** it but **not forge** it.
 
@@ -173,7 +173,8 @@ Sweep work is proportional to the number of **unlinked** contacts (linked ones a
 - **IdentityBeacon is public by design**: by enabling "Findable by ID" you accept that anyone who knows
   your Omni-ID will see your endpoints + prekey.
 - **Participating in the DHT swarm reveals your IP** to other swarm nodes; this is a property of the BitTorrent DHT, not of the beacon.
-  That is why the DHT is **off by default** with an explicit warning.
+  The DHT is **on by default** since 2026-10-10 (it is what lets contacts find each other with no
+  server at all); the settings say this in one line and let the user turn it off.
 - **An intermediate node (multi-hop)** sees the fact of forwarding, not content; the trust model is in
   `networking-overlay.md`, section "Trust model".
 - The anti-entropy **scope fix** prevents handing out the inventory of group feeds to untrusted peers.

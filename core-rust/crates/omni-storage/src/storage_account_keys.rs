@@ -180,7 +180,7 @@ impl Storage {
         // stores it again.
         Ok(omni_crypto::unprotect_bytes(&protected)
             .ok()
-            .and_then(|bytes| bytes.try_into().ok()))
+            .and_then(|bytes| bytes.as_slice().try_into().ok()))
     }
 
     pub fn get_account_keys(&self, account_id: &AccountId) -> OmniResult<Option<AccountKeysRecord>> {

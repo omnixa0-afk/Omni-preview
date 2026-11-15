@@ -81,12 +81,17 @@ public sealed partial class MainWindow
     private const uint WM_SETICON = 0x0080;
     private const nint ICON_SMALL = 0;
     private const nint ICON_BIG = 1;
+    private nint windowIconSmall;
+    private nint windowIconLarge;
 
     [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
     private static extern uint ExtractIconEx(string file, int index, out nint large, out nint small, uint count);
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern nint SendMessage(nint hwnd, uint message, nint wParam, nint lParam);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool DestroyIcon(nint icon);
 
     /// <summary>
     /// The window's own icon — the title bar takes the small one, the taskbar button and Alt+Tab the
@@ -96,30 +101,67 @@ public sealed partial class MainWindow
     /// </summary>
     private void ApplyWindowIcon()
     {
-        string? exe = Environment.ProcessPath;
-        if (exe is null || ExtractIconEx(exe, 0, out nint large, out nint small, 1) == 0)
+        if (windowIconSmall == 0 && windowIconLarge == 0)
         {
-            return;
+            string? exe = Environment.ProcessPath;
+            if (exe is null || ExtractIconEx(exe, 0, out windowIconLarge, out windowIconSmall, 1) == 0)
+            {
+                AppTrace.Write("ui/icon", "The executable's icon resource could not be loaded.");
+                return;
+            }
         }
 
         nint hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
-        if (small != 0)
+        if (windowIconSmall != 0)
         {
-            _ = SendMessage(hwnd, WM_SETICON, ICON_SMALL, small);
+            _ = SendMessage(hwnd, WM_SETICON, ICON_SMALL, windowIconSmall);
         }
 
-        if (large != 0)
+        if (windowIconLarge != 0)
         {
-            _ = SendMessage(hwnd, WM_SETICON, ICON_BIG, large);
+            _ = SendMessage(hwnd, WM_SETICON, ICON_BIG, windowIconLarge);
         }
+        AppTrace.Write("ui/icon", $"Window icon applied: small={windowIconSmall != 0} large={windowIconLarge != 0}.");
     }
 
-    private void OnAuthenticatedNavigationSelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
+    private void ReapplyWindowIconOnFirstActivation(object sender, WindowActivatedEventArgs args)
     {
-        string? tag = (args.SelectedItem as NavigationViewItem)?.Tag as string;
+        Activated -= ReapplyWindowIconOnFirstActivation;
+        ApplyWindowIcon();
+    }
+
+    private void ReleaseWindowIcons()
+    {
+        if (windowIconSmall != 0) _ = DestroyIcon(windowIconSmall);
+        if (windowIconLarge != 0 && windowIconLarge != windowIconSmall) _ = DestroyIcon(windowIconLarge);
+        windowIconSmall = windowIconLarge = 0;
+    }
+
+    private string DescribeWindowIconForUiTest()
+    {
+        const uint wmGetIcon = 0x007F;
+        nint hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        bool small = windowIconSmall != 0 && SendMessage(hwnd, wmGetIcon, ICON_SMALL, 0) == windowIconSmall;
+        bool large = windowIconLarge != 0 && SendMessage(hwnd, wmGetIcon, ICON_BIG, 0) == windowIconLarge;
+        return $"ok small={small} large={large} exe={Environment.ProcessPath}";
+    }
+
+    private void OnAuthenticatedNavigationSelectionChanged(object? sender, Features.Shared.ShellRailSelectionChangedEventArgs args)
+    {
+        long switchStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        string? tag = args.SelectedItem?.Tag as string;
+        // How long the person looks at the old section: the first frame after the switch, layout included.
+        void OnFirstFrame(object? _, object __)
+        {
+            Microsoft.UI.Xaml.Media.CompositionTarget.Rendering -= OnFirstFrame;
+            AppTrace.Write("ui/section", $"{tag} first frame {System.Diagnostics.Stopwatch.GetElapsedTime(switchStarted).TotalMilliseconds:F0}ms");
+        }
+
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += OnFirstFrame;
         windowState.CurrentSection = tag switch
         {
             "Contacts" => AuthenticatedShellSection.Contacts,
+            "Workspaces" => AuthenticatedShellSection.Workspaces,
             "Settings" => AuthenticatedShellSection.Settings,
             "Diagnostics" => AuthenticatedShellSection.Diagnostics,
             _ => AuthenticatedShellSection.Chats,
@@ -135,6 +177,14 @@ public sealed partial class MainWindow
         ContactsSectionRoot.Visibility = windowState.CurrentSection == AuthenticatedShellSection.Contacts ? Visibility.Visible : Visibility.Collapsed;
         SettingsSectionRoot.Visibility = windowState.CurrentSection == AuthenticatedShellSection.Settings ? Visibility.Visible : Visibility.Collapsed;
         DiagnosticsSectionRoot.Visibility = windowState.CurrentSection == AuthenticatedShellSection.Diagnostics ? Visibility.Visible : Visibility.Collapsed;
+        if (windowState.CurrentSection == AuthenticatedShellSection.Workspaces)
+        {
+            TryRefresh("workspaces.activate", WorkspacesSectionHost.Activate);
+        }
+        else
+        {
+            WorkspacesSectionHost.Deactivate();
+        }
         // The badge on the gear is a new device of the account: that is where the click goes.
         if (windowState.CurrentSection is AuthenticatedShellSection.Settings && HasNewDevicesBadge)
         {
@@ -143,16 +193,16 @@ public sealed partial class MainWindow
 
         // Per-section refresh runs synchronous FFI on the UI thread. A transient core error
         // (e.g. SQLite busy under background write contention) MUST NOT escape into this
-        // NavigationView event handler — WinUI 3 turns an unhandled event-handler exception
+        // rail's event handler — WinUI 3 turns an unhandled event-handler exception
         // into a silent process kill. Each refresh step is guarded; the exception is logged
         // and the section still transitions visually.
         if (windowState.CurrentSection is AuthenticatedShellSection.Contacts)
         {
-            TryRefresh("contacts.transport_status", RefreshTransportStatus);
+            TryRefresh("contacts.transport_status", RefreshTransportStatusAsync);
             // Heavy full-list read OFF the UI thread so switching TO Contacts flips instantly instead of
             // freezing on a blocking FFI read under background write contention (list fills a moment later).
             LoadContactsListAsync(windowState.SelectedContactId);
-            TryRefresh("contacts.selected_card", RefreshSelectedContactCard);
+            TryRefresh("contacts.selected_card", RefreshSelectedContactCardAsync);
             TryRefresh("contacts.identity", UpdateIdentityHeader);
             TryRefresh("contacts.controls", UpdateControlStates);
         }
@@ -160,7 +210,7 @@ public sealed partial class MainWindow
         {
             // Heavy full-list read OFF the UI thread so switching TO Chats flips instantly (see Contacts).
             LoadChatsListAsync(windowState.CurrentPeerKey);
-            TryRefresh("chats.header", RefreshChatHeaderSummary);
+            TryRefresh("chats.header", RefreshChatHeaderSummaryAsync);
             TryRefresh("chats.messages", () => RefreshMessages(force: true));
             TryRefresh("chats.queue", RefreshQueueDiagnostics);
             TryRefresh("chats.identity", UpdateIdentityHeader);
@@ -168,24 +218,53 @@ public sealed partial class MainWindow
         }
         else if (windowState.CurrentSection is AuthenticatedShellSection.Settings or AuthenticatedShellSection.Diagnostics)
         {
-            if (windowState.CurrentSection is AuthenticatedShellSection.Settings)
-            {
-                // First Settings view: populate the HW encode/decode device combos and the camera
-                // list lazily so the capability probe (MF/QSV/NVENC) and camera enumeration (MF
-                // sensor stack) stay off the boot path until the user actually opens Settings.
-                TryRefresh("settings.device_pickers", EnsureCallVideoDevicePickersPopulated);
-                TryRefresh("settings.camera_picker", EnsureCameraPickerPopulated);
-                TryRefresh("settings.audio_devices", RefreshAudioDevicePickers);
-            }
-
-            TryRefresh("settings.transport_status", RefreshTransportStatus);
-            TryRefresh("settings.profile_footprint", RefreshCurrentProfileFootprintIfVisible);
+            TryRefresh("settings.transport_status", RefreshTransportStatusAsync);
             TryRefresh("settings.identity", UpdateIdentityHeader);
             TryRefresh("settings.controls", UpdateControlStates);
         }
 
         TryRefresh("shell.wake_section", () => WakeShellSectionRefresh(windowState.CurrentSection));
         TryRefresh("shell.save_ui_state", SaveUiState);
+        TraceSectionSwitch(windowState.CurrentSection, switchStarted);
+    }
+
+    // What a section switch costs as a person feels it: the handler, then until the second frame after
+    // it (the frame the new section was laid out and drawn in), then the longest the UI thread stood
+    // still in the two seconds after: a refresh applied late hangs the window as much as the layout.
+    private void TraceSectionSwitch(AuthenticatedShellSection section, long started)
+    {
+        if (!AppTrace.IsEnabled)
+        {
+            return;
+        }
+
+        double handler = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        int frames = 0;
+        double drawn = 0, lastFrame = handler, worst = 0, worstAt = 0;
+        EventHandler<object>? onFrame = null;
+        onFrame = (_, _) =>
+        {
+            double now = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (++frames == 2)
+            {
+                drawn = now;
+            }
+            else if (frames > 2 && now - lastFrame > worst)
+            {
+                worst = now - lastFrame;
+                worstAt = now;
+            }
+
+            lastFrame = now;
+            if (now < 2000)
+            {
+                return;
+            }
+
+            Microsoft.UI.Xaml.Media.CompositionTarget.Rendering -= onFrame;
+            AppTrace.Write("ui/switch", $"{section} handler={handler:F0}ms drawn={drawn:F0}ms worst={worst:F0}ms at={worstAt:F0}ms frames={frames}");
+        };
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += onFrame;
     }
 
     /// Run a refresh step and, on failure, log the exception + optionally surface a status message,
@@ -194,9 +273,17 @@ public sealed partial class MainWindow
     /// forget). One-liner for the nav block so a new refresh step cannot forget the guard.
     private void TryRefresh(string operation, System.Action work, string? statusMessage = null)
     {
+        // A step that holds the UI thread long enough to be felt goes to the trace by name: a section
+        // switch that froze for seconds had nothing to point at.
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             work();
+            TimeSpan took = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+            if (took.TotalMilliseconds >= SlowUiStepMs)
+            {
+                AppTrace.Write("ui/slow", $"{operation} {took.TotalMilliseconds:F0}ms");
+            }
         }
         catch (Exception ex)
         {
@@ -208,6 +295,9 @@ public sealed partial class MainWindow
             }
         }
     }
+
+    /// A UI-thread step this long is a visible stutter (three frames at 60 Hz).
+    private const double SlowUiStepMs = 50;
 
     private void AppendNavRefreshLog(string operation, Exception ex)
     {

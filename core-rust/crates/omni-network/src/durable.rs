@@ -24,9 +24,23 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::address::NodeAddress;
 
-/// Identifies an append-only feed = a `(sender, scope)` pair, hashed to 16 bytes
-/// by the app (scope = 1-on-1 dialog or group id). Opaque to the engine.
+/// Identifies an append-only feed = a `(sender, scope)` pair, 16 bytes. Opaque to the engine.
+///
+/// The first 8 bytes are the sender node's address (`feed_is_bound_to`), the rest names the scope
+/// (1-on-1 dialog or group). That binding is what lets a holder refuse a frame that claims a
+/// feed it does not own: the frame is signed by `from` (`DurableDataFrame::verify`), and `from`
+/// must be the feed's owner, so a stranger cannot take a `(feed, seq)` slot of someone else's
+/// feed and crowd the real frame out.
 pub type FeedId = [u8; 16];
+
+/// Bytes of a feed id that name its sender.
+pub const FEED_OWNER_PREFIX_BYTES: usize = 8;
+
+/// True when `feed` belongs to `sender` (its first `FEED_OWNER_PREFIX_BYTES` bytes are the
+/// sender's address). See `FeedId`.
+pub fn feed_is_bound_to(feed: &FeedId, sender: &NodeAddress) -> bool {
+    feed[..FEED_OWNER_PREFIX_BYTES] == sender.as_bytes()[..FEED_OWNER_PREFIX_BYTES]
+}
 
 /// Synthetic mesh destination for a group (G3): `blake3("omni.group.dest|" ‖
 /// group_id)[..20]`. No node owns it — delivery is subscription-based
@@ -43,9 +57,15 @@ pub fn group_destination_address(group_id: &str) -> NodeAddress {
     NodeAddress::from_bytes(bytes)
 }
 
-/// Per-(group, sender) feed id. `domain` separates the chat feed
-/// (`omni.group.feed`) from the membership/keys feed (`omni.group.ops`).
-pub fn group_feed_id(domain: &str, group_id: &str, sender_pub: &str) -> FeedId {
+/// Per-(group, sender node) feed id: the sender node's address prefix (see `FeedId`), then
+/// `blake3(domain | group_id | sender_pub)`. `domain` separates the chat feed (`omni.group.feed`)
+/// from the membership/keys feed (`omni.group.ops`).
+pub fn group_feed_id(
+    domain: &str,
+    group_id: &str,
+    sender_pub: &str,
+    sender_node: &NodeAddress,
+) -> FeedId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain.as_bytes());
     hasher.update(b"|");
@@ -54,7 +74,18 @@ pub fn group_feed_id(domain: &str, group_id: &str, sender_pub: &str) -> FeedId {
     hasher.update(sender_pub.as_bytes());
     let hash = hasher.finalize();
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    bytes[..FEED_OWNER_PREFIX_BYTES]
+        .copy_from_slice(&sender_node.as_bytes()[..FEED_OWNER_PREFIX_BYTES]);
+    bytes[FEED_OWNER_PREFIX_BYTES..]
+        .copy_from_slice(&hash.as_bytes()[..16 - FEED_OWNER_PREFIX_BYTES]);
+    bytes
+}
+
+/// The 1-on-1 feed of `from` toward `to`: `from[..8] ‖ to[..8]`.
+pub fn direct_feed_id(from: &NodeAddress, to: &NodeAddress) -> FeedId {
+    let mut bytes = [0u8; 16];
+    bytes[..FEED_OWNER_PREFIX_BYTES].copy_from_slice(&from.as_bytes()[..FEED_OWNER_PREFIX_BYTES]);
+    bytes[FEED_OWNER_PREFIX_BYTES..].copy_from_slice(&to.as_bytes()[..16 - FEED_OWNER_PREFIX_BYTES]);
     bytes
 }
 
@@ -101,26 +132,48 @@ impl ReconcileState {
     }
 }
 
-/// What we hold for a single feed: the set of seqs present, so we can derive the
-/// contiguous high-water and answer "what is the peer missing".
+/// What we hold for a single feed: every seq up to a contiguous high-water, and the ones past a gap.
+/// Kept as each seq it held, a feed grew with every frame a node ever sent in it, the store's bounds
+/// notwithstanding (blind audit 2026-11-10); the contiguous part is one number now, and what lies
+/// past a gap at most [`SEQS_PAST_A_GAP_MAX`].
 #[derive(Debug, Default)]
 struct FeedHeld {
-    present: BTreeSet<u64>,
+    /// Every seq in `1..=contiguous` is held.
+    contiguous: u64,
+    /// Seqs held past `contiguous + 1` (which is missing).
+    past_gap: BTreeSet<u64>,
 }
+
+/// How many seqs past a gap a feed keeps; past that the farthest are forgotten (taken as new if they
+/// come again).
+pub const SEQS_PAST_A_GAP_MAX: usize = 4096;
 
 impl FeedHeld {
     /// Highest `s` such that every seq in `1..=s` is present. 0 if seq 1 is absent.
     fn high_water(&self) -> u64 {
-        let mut hw = 0u64;
-        for &seq in &self.present {
-            if seq == hw + 1 {
-                hw = seq;
-            } else if seq > hw + 1 {
-                break; // gap — contiguity ends
-            }
-            // seq <= hw can't happen in a sorted set without dup, ignore.
+        self.contiguous
+    }
+
+    fn insert(&mut self, seq: u64) {
+        if seq <= self.contiguous {
+            return;
         }
-        hw
+        self.past_gap.insert(seq);
+        while self.past_gap.remove(&(self.contiguous + 1)) {
+            self.contiguous += 1;
+        }
+        while self.past_gap.len() > SEQS_PAST_A_GAP_MAX {
+            self.past_gap.pop_last();
+        }
+    }
+
+    fn contains(&self, seq: u64) -> bool {
+        (1..=self.contiguous).contains(&seq) || self.past_gap.contains(&seq)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.past_gap.len()
     }
 }
 
@@ -130,7 +183,24 @@ impl FeedHeld {
 #[derive(Debug, Default)]
 pub struct ReconcileEngine {
     feeds: HashMap<FeedId, FeedHeld>,
+    /// Each owner's feeds (by the owner prefix of the feed id), oldest first: at most
+    /// [`FEEDS_PER_OWNER_MAX`] kept.
+    owners: HashMap<[u8; FEED_OWNER_PREFIX_BYTES], std::collections::VecDeque<FeedId>>,
+    /// The owners, oldest first: at most [`OWNERS_MAX`] kept.
+    owner_order: std::collections::VecDeque<[u8; FEED_OWNER_PREFIX_BYTES]>,
 }
+
+/// How many owners the marks keep. Each node is one, and keys are anyone's to make: one neighbour
+/// handing on frames of ever new signers grew the marks for good, the frames themselves long gone
+/// (blind audit 2026-11-11, H2). The oldest owner goes with its feeds; a frame of it that comes again
+/// is taken as new. Far more than the nodes of any group of friends.
+pub const OWNERS_MAX: usize = 16_384;
+
+/// How many feeds the marks keep of one owner. A node has a feed per group it writes in and per
+/// device it writes to; anything past that is a node making feeds up under its own prefix, each
+/// kept for good (blind audit 2026-11-10). Its oldest go first; a frame of a feed forgotten that
+/// comes again is taken as new, which only that node's own traffic risks.
+pub const FEEDS_PER_OWNER_MAX: usize = 1024;
 
 impl ReconcileEngine {
     pub fn new() -> Self {
@@ -142,14 +212,35 @@ impl ReconcileEngine {
         if seq == 0 {
             return; // seq is 1-based; 0 means "nothing"
         }
-        self.feeds.entry(feed).or_default().present.insert(seq);
+        if !self.feeds.contains_key(&feed) {
+            let mut owner = [0u8; FEED_OWNER_PREFIX_BYTES];
+            owner.copy_from_slice(&feed[..FEED_OWNER_PREFIX_BYTES]);
+            if !self.owners.contains_key(&owner) {
+                self.owner_order.push_back(owner);
+                while self.owner_order.len() > OWNERS_MAX {
+                    if let Some(oldest) = self.owner_order.pop_front() {
+                        for gone in self.owners.remove(&oldest).unwrap_or_default() {
+                            self.feeds.remove(&gone);
+                        }
+                    }
+                }
+            }
+            let feeds = self.owners.entry(owner).or_default();
+            feeds.push_back(feed);
+            while feeds.len() > FEEDS_PER_OWNER_MAX {
+                if let Some(oldest) = feeds.pop_front() {
+                    self.feeds.remove(&oldest);
+                }
+            }
+        }
+        self.feeds.entry(feed).or_default().insert(seq);
     }
 
     /// Whether we hold `(feed, seq)`.
     pub fn contains(&self, feed: &FeedId, seq: u64) -> bool {
         self.feeds
             .get(feed)
-            .is_some_and(|held| held.present.contains(&seq))
+            .is_some_and(|held| held.contains(seq))
     }
 
     /// Our high-water vector — the state we advertise to peers (`have`).
@@ -177,7 +268,10 @@ impl ReconcileEngine {
         for feed in feeds {
             let held = &self.feeds[feed];
             let peer_hw = peer.high_water(feed);
-            for &seq in held.present.range((peer_hw + 1)..) {
+            for seq in (peer_hw + 1)..=held.contiguous {
+                out.push((*feed, seq));
+            }
+            for &seq in held.past_gap.range((peer_hw + 1).max(held.contiguous + 1)..) {
                 out.push((*feed, seq));
             }
         }
@@ -201,6 +295,66 @@ impl ReconcileEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blind audit 2026-11-10: a node can make up any number of feeds under its own prefix, and the
+    /// marks kept each for good. At most [`FEEDS_PER_OWNER_MAX`] of one owner are kept, oldest out;
+    /// another owner's are not touched.
+    /// Blind audit 2026-11-10: a feed kept every seq it ever held, the store's bounds notwithstanding.
+    /// A run of seqs is one number now, and what lies past a gap is bounded.
+    #[test]
+    fn a_feed_keeps_its_seqs_in_bounded_room() {
+        let mut engine = ReconcileEngine::new();
+        let feed = [9u8; 16];
+        for seq in 1..=100_000 {
+            engine.insert(feed, seq);
+        }
+        assert_eq!(engine.state().high_water(&feed), 100_000);
+        assert_eq!(engine.feeds[&feed].len(), 0, "a run is one number");
+        for seq in (200_002..).step_by(2).take(SEQS_PAST_A_GAP_MAX + 100) {
+            engine.insert(feed, seq);
+        }
+        assert_eq!(engine.feeds[&feed].len(), SEQS_PAST_A_GAP_MAX, "past a gap, bounded");
+        assert!(engine.contains(&feed, 50_000) && engine.contains(&feed, 200_002));
+        engine.insert(feed, 100_001);
+        assert_eq!(engine.state().high_water(&feed), 100_001);
+    }
+
+    #[test]
+    fn the_marks_keep_a_bounded_number_of_feeds_of_one_owner() {
+        let mut engine = ReconcileEngine::new();
+        let of = |owner: u8, n: u32| {
+            let mut feed = [owner; 16];
+            feed[FEED_OWNER_PREFIX_BYTES..FEED_OWNER_PREFIX_BYTES + 4].copy_from_slice(&n.to_be_bytes());
+            feed
+        };
+        engine.insert(of(2, 0), 1);
+        for n in 0..(FEEDS_PER_OWNER_MAX as u32 + 10) {
+            engine.insert(of(1, n), 1);
+        }
+        assert_eq!(engine.feeds.len(), FEEDS_PER_OWNER_MAX + 1);
+        assert!(!engine.contains(&of(1, 0), 1), "the oldest went");
+        assert!(engine.contains(&of(1, FEEDS_PER_OWNER_MAX as u32 + 9), 1));
+        assert!(engine.contains(&of(2, 0), 1), "another owner's feed stays");
+    }
+
+    /// Blind audit 2026-11-11, H2: the owners in the marks were never forgotten, and owners (keys) are
+    /// anyone's to make. At most [`OWNERS_MAX`] are kept, the oldest going with its feeds.
+    #[test]
+    fn the_marks_keep_a_bounded_number_of_owners() {
+        let mut engine = ReconcileEngine::new();
+        let of = |owner: u32| {
+            let mut feed = [0u8; 16];
+            feed[..4].copy_from_slice(&owner.to_be_bytes());
+            feed
+        };
+        for owner in 0..(OWNERS_MAX as u32 + 10) {
+            engine.insert(of(owner), 1);
+        }
+        assert_eq!(engine.owners.len(), OWNERS_MAX);
+        assert_eq!(engine.feeds.len(), OWNERS_MAX);
+        assert!(!engine.contains(&of(0), 1), "the oldest owner went");
+        assert!(engine.contains(&of(OWNERS_MAX as u32 + 9), 1));
+    }
 
     fn feed(n: u8) -> FeedId {
         let mut f = [0u8; 16];

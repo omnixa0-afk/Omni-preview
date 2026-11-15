@@ -104,9 +104,10 @@ internal static class CallVideoCodecFactory
     internal static IReadOnlyList<CallVideoCodecSupport> RestrictToDevices(
         IReadOnlyList<CallVideoCodecSupport> codecs,
         bool encodeSoftwareOnly,
-        bool decodeSoftwareOnly)
+        bool decodeSoftwareOnly,
+        IReadOnlyCollection<CallVideoCodecKind>? encodeHardwareCodecs = null)
     {
-        if (!encodeSoftwareOnly && !decodeSoftwareOnly)
+        if (!encodeSoftwareOnly && !decodeSoftwareOnly && encodeHardwareCodecs is null)
         {
             return codecs;
         }
@@ -120,6 +121,14 @@ internal static class CallVideoCodecFactory
             // have no software path, so on the processor they drop out and the pair falls to AV1.
             bool software = codec.Kind == CallVideoCodecKind.Av1;
             if (encodeSoftwareOnly && encode == true)
+            {
+                encode = software ? false : null;
+            }
+
+            // A card picked by name in Settings: hardware encode only in the codecs THAT card does
+            // (CallVideoDeviceSelection.HardwareEncodeCodecs). Another card's codec is not offered,
+            // so the sender lands on one this card encodes instead of the other card taking over.
+            if (encodeHardwareCodecs is not null && encode == true && !encodeHardwareCodecs.Contains(codec.Kind))
             {
                 encode = software ? false : null;
             }

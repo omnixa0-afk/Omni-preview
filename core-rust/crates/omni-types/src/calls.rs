@@ -301,6 +301,9 @@ pub struct CallInviteV1 {
     /// is already running, an invite with ITS call id asks to turn that call into a session.
     #[serde(default, skip_serializing_if = "is_false")]
     pub remote_control: bool,
+    /// The caller's half of the call's media keys: 32 random bytes, hex. The invite travels inside
+    /// the pair's ratchet session, so only the callee learns it (`omni_crypto::derive_direct_call_media_keys`).
+    pub media_key_share: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +316,8 @@ pub struct CallRingingV1 {
 pub struct CallAcceptV1 {
     pub call_id: String,
     pub accepted_at_unix_ms: i64,
+    /// The callee's half of the call's media keys: 32 random bytes, hex (see `CallInviteV1`).
+    pub media_key_share: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

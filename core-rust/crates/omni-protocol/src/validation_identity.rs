@@ -333,6 +333,18 @@ pub(crate) fn validate_serialized_json_len<T: Serialize>(
     Ok(())
 }
 
+/// A message id from another node: it names a line and, cleaned, its files here — so no whitespace,
+/// no control characters, no path separators, bounded. Two ids that differ only in such characters
+/// used to name the same file (security review 2026-11-09, F3).
+pub(crate) fn validate_message_id(field_name: &str, value: &str) -> OmniResult<()> {
+    validate_non_empty_field(field_name, value)?;
+    validate_max_utf8_len(field_name, value, crate::CHAT_MESSAGE_ID_MAX_BYTES)?;
+    if value.chars().any(|c| c.is_whitespace() || c.is_control() || c == '/' || c == '\\') {
+        return Err(OmniError::InvalidInput(format!("{field_name} has characters an id may not have")));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_non_empty_field(field_name: &str, value: &str) -> OmniResult<()> {
     if value.trim().is_empty() {
         return Err(OmniError::InvalidInput(format!(

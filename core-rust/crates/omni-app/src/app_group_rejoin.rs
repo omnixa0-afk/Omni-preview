@@ -179,7 +179,7 @@ pub(crate) fn offer_groups_to_own_devices(storage: &Storage, transport: &crate::
                 continue;
             }
             let key = format!("group_device_offer:{}:{}", group.group_id, device_id.0);
-            let offered_at = storage.get_app_meta(&key).ok().flatten().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+            let offered_at = storage.get_profile_meta(&key).ok().flatten().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
             if now - offered_at < DEVICE_JOIN_ASK_EVERY_MS {
                 continue;
             }
@@ -194,7 +194,7 @@ pub(crate) fn offer_groups_to_own_devices(storage: &Storage, transport: &crate::
                 renew: false,
                 authored_at_unix_ms: now,
             };
-            let _ = storage.upsert_app_meta(&key, &now.to_string());
+            let _ = storage.upsert_profile_meta(&key, &now.to_string());
             if let Err(error) = crate::app_groups::send_device_offer(storage, transport, dialog_key, &offer) {
                 crate::omni_app_trace_log("group/device-offer", &format!("group={} device={} not told: {error}", group.group_id, device_id.0));
             }
@@ -216,7 +216,7 @@ pub(crate) fn group_rejoin_round(storage: &Storage, transport: &crate::Transport
         {
             continue;
         }
-        let state = storage.get_app_meta(&ask_state_key(&group.group_id)).ok().flatten().unwrap_or_default();
+        let state = storage.get_profile_meta(&ask_state_key(&group.group_id)).ok().flatten().unwrap_or_default();
         let (asked_at, next) = state
             .split_once(':')
             .map(|(at, next)| (at.parse::<i64>().unwrap_or(0), next.parse::<usize>().unwrap_or(0)))
@@ -254,7 +254,7 @@ pub(crate) fn group_rejoin_round(storage: &Storage, transport: &crate::Transport
             if let Err(error) = &sent {
                 crate::omni_app_trace_log("group/rejoin", &format!("group={} not asked: {error}", group.group_id));
             }
-            let _ = storage.upsert_app_meta(&ask_state_key(&group.group_id), &format!("{now}:{}", index + 1));
+            let _ = storage.upsert_profile_meta(&ask_state_key(&group.group_id), &format!("{now}:{}", index + 1));
             break;
         }
     }

@@ -6,10 +6,11 @@ name: release
 #
 #   gh attestation verify Omni.exe -R <owner>/<repo>
 #
-# Everything is built here from source: libwebrtc (pinned in scripts/bootstrap-libwebrtc.ps1), the
-# native media module, the Rust core and the WinUI shell. A tag v* ends in a DRAFT release with
-# Omni.exe and SHA256SUMS.txt; a maintainer reviews and publishes it. A manual run only uploads the
-# exe as a workflow artifact.
+# Everything is built from source on GitHub: the native media module, the Rust core and the WinUI
+# shell here; libwebrtc (pinned in scripts/bootstrap-libwebrtc.ps1) by the libwebrtc workflow, whose
+# attested kit is checked before use - without one it is built here too (an hour more). A tag v*
+# ends in a DRAFT release with Omni.exe and SHA256SUMS.txt; a maintainer reviews and publishes it.
+# A manual run only uploads the exe as a workflow artifact.
 
 on:
   push:
@@ -24,7 +25,7 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    # libwebrtc from scratch dominates: checkout ~10 GB, build 1-2 h on a hosted runner.
+    # Without a libwebrtc kit, libwebrtc from scratch dominates: checkout ~10 GB, build 1-2 h.
     timeout-minutes: 360
 
     steps:
@@ -32,7 +33,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.201
+          dotnet-version: 10.0.402
 
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
@@ -57,11 +58,43 @@ jobs:
           "OMNI_BUILD_ROOT=$($best.Name):\omni-build" | Add-Content -Path $env:GITHUB_ENV
           Write-Host "building on $($best.Name): ($([int]($best.Free/1GB)) GB free)"
 
+      # The libwebrtc kit of the libwebrtc workflow, if it is published for this commit's scripts: used
+      # only when its provenance says that workflow of THIS repository built it, and its manifest
+      # carries the key computed here. A kit that fails the check stops the release; a missing kit
+      # falls back to building libwebrtc from scratch below.
+      - name: libwebrtc kit
+        id: kit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $key = .\scripts\pack-libwebrtc-kit.ps1 -KeyOnly
+          $dir = "$env:OMNI_BUILD_ROOT\kit"
+          gh release download "libwebrtc-$key" --repo $env:GITHUB_REPOSITORY --pattern libwebrtc-kit.tar.gz --dir $dir
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "no libwebrtc kit $key - building libwebrtc from source"
+            "found=false" | Add-Content -Path $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $kit = Join-Path $dir 'libwebrtc-kit.tar.gz'
+          gh attestation verify $kit --repo $env:GITHUB_REPOSITORY --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/libwebrtc.yml"
+          if ($LASTEXITCODE -ne 0) { throw "libwebrtc kit $key: provenance check failed" }
+          $deps = "$env:OMNI_BUILD_ROOT\deps"
+          New-Item -ItemType Directory -Force $deps | Out-Null
+          tar -xzf $kit -C $deps
+          if ($LASTEXITCODE -ne 0) { throw "libwebrtc kit $key: unpack failed" }
+          $manifest = Get-Content (Join-Path $deps 'kit.json') -Raw | ConvertFrom-Json
+          if ($manifest.key -ne $key) { throw "libwebrtc kit: manifest key $($manifest.key), expected $key" }
+          Write-Host "libwebrtc kit $key (revision $($manifest.revision), built from $($manifest.sourceCommit))"
+          "found=true" | Add-Content -Path $env:GITHUB_OUTPUT
+
       - name: libwebrtc sources (pinned revision)
+        if: steps.kit.outputs.found != 'true'
         shell: pwsh
         run: .\scripts\bootstrap-libwebrtc.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps" -Sync -RunHooks
 
       - name: libwebrtc build
+        if: steps.kit.outputs.found != 'true'
         shell: pwsh
         run: .\scripts\build-libwebrtc.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps"
 

@@ -35,9 +35,6 @@ internal static class ShellStatePresenter
             IsImportRemotePrekeyBundleEnabled:
                 input.IsInitialized && input.IsAuthenticated && input.LifecycleMessagingAllowed &&
                 input.HasRemotePrekeyBundle,
-            IsAddContactByIdentifierEnabled:
-                input.IsInitialized && input.IsAuthenticated && input.LifecycleMessagingAllowed &&
-                input.HasAddContactIdentifier && input.HasAddContactPetname,
             IsAddContactFromPayloadEnabled:
                 input.IsInitialized && input.IsAuthenticated && input.LifecycleMessagingAllowed &&
                 input.HasAddContactPayload && input.HasAddContactPetname,

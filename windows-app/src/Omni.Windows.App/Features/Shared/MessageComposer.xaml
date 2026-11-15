@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- One composer for every conversation (owner, 2026-10-11: «строка в группе и 1 на 1 отличается,
-     надо по 1 макету»): the host's lines over the field (a status), the file about to go, the
-     paperclip, the field, the round send. Enter sends, Shift+Enter is a new line, as in Telegram. -->
+     надо по 1 макету»): the host's lines over the field (a status), the file about to go, then one flat
+     line (owner, 2026-11-05): the paperclip, the field with no frame, the smiley, and the microphone or
+     camera, which turns into the arrow once there is something to send. Enter sends, Shift+Enter is a
+     new line, as in Telegram. -->
 <UserControl
   x:Class="Omni.Windows.App.Features.Shared.MessageComposer"
   xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -13,9 +15,88 @@
     Padding="12,6"
     Background="{ThemeResource OmniBgPanelBrush}"
     BorderBrush="{ThemeResource OmniStrokeBrush}"
-    BorderThickness="0,1,0,0">
+    BorderThickness="0,1,0,0"
+    PreviewKeyDown="OnRootPreviewKeyDown">
     <StackPanel>
       <ContentPresenter x:Name="AbovePart" />
+      <!-- The message being answered, as in Telegram: a strip, whose it is, how it began, a cross. -->
+      <Grid x:Name="ReplyPart" Margin="0,0,0,6" ColumnSpacing="8" Visibility="Collapsed">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <Border Padding="8,0,0,0" BorderBrush="{ThemeResource OmniAccentBrush}" BorderThickness="2,0,0,0">
+          <StackPanel>
+            <TextBlock
+              x:Name="ReplyAuthorPart"
+              FontSize="12"
+              FontWeight="SemiBold"
+              Foreground="{ThemeResource OmniAccentBrush}"
+              MaxLines="1"
+              TextTrimming="CharacterEllipsis" />
+            <TextBlock
+              x:Name="ReplyTextPart"
+              FontSize="12"
+              Foreground="{ThemeResource OmniMutedTextBrush}"
+              MaxLines="1"
+              TextTrimming="CharacterEllipsis" />
+          </StackPanel>
+        </Border>
+        <Button
+          Grid.Column="1"
+          VerticalAlignment="Center"
+          AutomationProperties.Name="Не отвечать"
+          Click="OnReplyDismissClicked"
+          Style="{StaticResource GhostIconButtonStyle}"
+          ToolTipService.ToolTip="Не отвечать">
+          <FontIcon FontSize="14" Glyph="&#xE711;" />
+        </Button>
+      </Grid>
+      <!-- Whom to name: the list after `@`, over the field. A row is a member, not a name: two may
+           share one, and the note tells them apart. -->
+      <ListView
+        x:Name="MentionPart"
+        MaxHeight="212"
+        Margin="0,0,0,6"
+        AutomationProperties.Name="Кого упомянуть"
+        Background="{ThemeResource OmniBgElevatedBrush}"
+        BorderBrush="{ThemeResource OmniStrokeBrush}"
+        BorderThickness="1"
+        CornerRadius="8"
+        IsItemClickEnabled="True"
+        IsTabStop="False"
+        ItemClick="OnMentionClicked"
+        SelectionMode="Single"
+        Visibility="Collapsed">
+        <ListView.ItemTemplate>
+          <DataTemplate x:DataType="shared:MentionCandidate">
+            <Grid Padding="0,4" ColumnSpacing="10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <shared:AvatarView
+                Fill="{x:Bind AvatarBrush}"
+                Size="28"
+                Text="{x:Bind Initial}" />
+              <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                <TextBlock
+                  FontWeight="SemiBold"
+                  MaxLines="1"
+                  Text="{x:Bind Name}"
+                  TextTrimming="CharacterEllipsis" />
+                <TextBlock
+                  FontSize="12"
+                  Foreground="{ThemeResource OmniMutedTextBrush}"
+                  MaxLines="1"
+                  Text="{x:Bind Note}"
+                  TextTrimming="CharacterEllipsis"
+                  Visibility="{x:Bind NoteVisibility}" />
+              </StackPanel>
+            </Grid>
+          </DataTemplate>
+        </ListView.ItemTemplate>
+      </ListView>
       <!-- The file about to go: a picture shows itself and offers «Сжать как фото». -->
       <Border
         x:Name="DraftPart"
@@ -70,12 +151,98 @@
           </Button>
         </Grid>
       </Border>
+      <!-- A video message being recorded: the camera live, in the circle it will be sent in. -->
+      <Canvas x:Name="FloatingPart" Height="0">
+      <!-- Hold to the lock: the recording goes on with the button let go. -->
+      <Border
+        x:Name="LockPart"
+        Width="36"
+        Height="68"
+        Background="{ThemeResource OmniBgElevatedBrush}"
+        CornerRadius="18"
+        IsHitTestVisible="False"
+        Visibility="Collapsed">
+        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+          <FontIcon FontSize="16" Glyph="&#xE785;" />
+          <FontIcon FontSize="10" Foreground="{ThemeResource OmniMutedTextBrush}" Glyph="&#xE70E;" />
+        </StackPanel>
+      </Border>
+      <Grid
+        x:Name="VideoNoteLivePart"
+        Width="300"
+        Height="300"
+        Background="{ThemeResource OmniBgElevatedBrush}"
+        Visibility="Collapsed">
+        <MediaPlayerElement x:Name="VideoNoteSurfacePart" Stretch="UniformToFill" RenderTransformOrigin="0.5,0.5">
+          <MediaPlayerElement.RenderTransform>
+            <!-- As in a mirror, on this screen only: the file goes as the camera sees. -->
+            <ScaleTransform ScaleX="-1" />
+          </MediaPlayerElement.RenderTransform>
+        </MediaPlayerElement>
+      </Grid>
+      </Canvas>
       <Grid MinHeight="36" ColumnSpacing="8">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="*" />
           <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
+        <!-- A recording going on, in place of the paperclip and the field: the cross throws it away,
+             the time and the level say it hears; the round button on the right sends it. -->
+        <Grid
+          x:Name="RecordingPart"
+          Grid.ColumnSpan="2"
+          ColumnSpacing="10"
+          Visibility="Collapsed">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+          </Grid.ColumnDefinitions>
+          <Button
+            x:Name="RecordingCancelPart"
+            Width="36"
+            Height="36"
+            AutomationProperties.Name="Отменить запись"
+            Click="OnVoiceCancelClicked"
+            Style="{StaticResource GhostIconButtonStyle}"
+            ToolTipService.ToolTip="Отменить запись (Esc)">
+            <FontIcon FontSize="14" Glyph="&#xE711;" />
+          </Button>
+          <Ellipse
+            Grid.Column="1"
+            Width="10"
+            Height="10"
+            VerticalAlignment="Center"
+            Fill="{ThemeResource SystemFillColorCriticalBrush}" />
+          <TextBlock
+            x:Name="RecordingTimePart"
+            Grid.Column="2"
+            VerticalAlignment="Center"
+            Text="0:00" />
+          <shared:VoiceWaveform
+            x:Name="RecordingLevelPart"
+            Grid.Column="3"
+            VerticalAlignment="Center"
+            BarBrush="{ThemeResource OmniAccentBrush}"
+            Progress="1" />
+          <TextBlock
+            x:Name="RecordingHoldPart"
+            Grid.Column="3"
+            VerticalAlignment="Center"
+            Foreground="{ThemeResource OmniMutedTextBrush}"
+            Text="Отпустите вне этого поля, чтобы отменить"
+            TextTrimming="CharacterEllipsis"
+            Visibility="Collapsed" />
+          <TextBlock
+            x:Name="RecordingHintPart"
+            Grid.Column="3"
+            VerticalAlignment="Center"
+            Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+            TextTrimming="CharacterEllipsis"
+            Visibility="Collapsed" />
+        </Grid>
         <Button
           x:Name="AttachPart"
           Width="36"
@@ -94,22 +261,99 @@
           Padding="12,6"
           VerticalAlignment="Center"
           AcceptsReturn="True"
+          BorderThickness="0"
+          Background="Transparent"
           PlaceholderText="Сообщение"
           PreviewKeyDown="OnInputPreviewKeyDown"
+          SelectionChanged="OnInputSelectionChanged"
+          TextChanged="OnInputTextChanged"
           ScrollViewer.VerticalScrollBarVisibility="Auto"
-          TextWrapping="Wrap" />
+          TextWrapping="Wrap">
+          <!-- The field has no frame of its own in any state: the line is the frame. -->
+          <TextBox.Resources>
+            <SolidColorBrush x:Key="TextControlBackground" Color="Transparent" />
+            <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="Transparent" />
+            <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="Transparent" />
+            <SolidColorBrush x:Key="TextControlBorderBrush" Color="Transparent" />
+            <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="Transparent" />
+            <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="Transparent" />
+            <Thickness x:Key="TextControlBorderThemeThickness">0</Thickness>
+            <Thickness x:Key="TextControlBorderThemeThicknessFocused">0</Thickness>
+          </TextBox.Resources>
+        </TextBox>
+        <StackPanel Grid.Column="2" VerticalAlignment="Bottom" Orientation="Horizontal" Spacing="4">
+        <Button
+          x:Name="EmojiPart"
+          Width="36"
+          Height="36"
+          AutomationProperties.Name="Эмодзи"
+          Style="{StaticResource GhostIconButtonStyle}"
+          ToolTipService.ToolTip="Эмодзи">
+          <FontIcon FontSize="18" Glyph="&#xE76E;" />
+          <Button.Flyout>
+            <Flyout x:Name="EmojiFlyoutPart" Opening="OnEmojiOpening" Closed="OnEmojiClosed" Placement="TopEdgeAlignedRight">
+              <Flyout.FlyoutPresenterStyle>
+                <Style TargetType="FlyoutPresenter">
+                  <Setter Property="Padding" Value="4" />
+                  <Setter Property="MaxWidth" Value="400" />
+                  <Setter Property="MaxHeight" Value="420" />
+                </Style>
+              </Flyout.FlyoutPresenterStyle>
+            </Flyout>
+          </Button.Flyout>
+        </Button>
         <Button
           x:Name="SendPart"
-          Grid.Column="2"
           Width="36"
           Height="36"
           VerticalAlignment="Bottom"
           AutomationProperties.Name="Отправить"
           Click="OnSendClicked"
-          CornerRadius="18"
-          Style="{StaticResource AccentCircleIconButtonStyle}">
+          Style="{StaticResource GhostIconButtonStyle}">
           <FontIcon FontSize="16" Foreground="{ThemeResource OmniAccentBrush}" Glyph="&#xE122;" />
         </Button>
+        <!-- With nothing to send: what records, in the send button's place. The right button turns the
+             microphone into the camera and back. -->
+        <Button
+          x:Name="RecordPart"
+          Width="36"
+          Height="36"
+          VerticalAlignment="Bottom"
+          Click="OnRecordClicked"
+          RightTapped="OnRecordRightTapped"
+          Style="{StaticResource GhostIconButtonStyle}"
+          Visibility="Collapsed">
+          <Grid>
+            <!-- Held: the button is a big accent circle under the finger. -->
+            <Ellipse
+              x:Name="RecordHaloPart"
+              Width="36"
+              Height="36"
+              HorizontalAlignment="Center"
+              VerticalAlignment="Center"
+              Fill="{ThemeResource OmniAccentBrush}"
+              RenderTransformOrigin="0.5,0.5"
+              Visibility="Collapsed">
+              <Ellipse.RenderTransform>
+                <ScaleTransform ScaleX="1.25" ScaleY="1.25" />
+              </Ellipse.RenderTransform>
+            </Ellipse>
+            <FontIcon x:Name="RecordIconPart" FontSize="18" Glyph="&#xE720;" />
+          </Grid>
+        </Button>
+        <Button
+          x:Name="VoiceSendPart"
+          Width="36"
+          Height="36"
+          VerticalAlignment="Bottom"
+          AutomationProperties.Name="Отправить запись"
+          Click="OnVoiceSendClicked"
+          Style="{StaticResource GhostIconButtonStyle}"
+          ToolTipService.ToolTip="Отправить запись"
+          Visibility="Collapsed">
+          <FontIcon FontSize="16" Foreground="{ThemeResource OmniAccentBrush}" Glyph="&#xE122;" />
+        </Button>
+        </StackPanel>
       </Grid>
     </StackPanel>
   </Border>

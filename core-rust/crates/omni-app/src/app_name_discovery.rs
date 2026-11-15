@@ -35,35 +35,35 @@ pub const NAME_SEARCH_MAX_PEOPLE: usize = 100;
 /// A query shorter than this (normalized, in characters) is not looked up.
 pub const NAME_SEARCH_MIN_CHARS: usize = 2;
 
-fn name_findable_path(db_path: &str) -> std::path::PathBuf {
-    crate::profile_sidecar_path(db_path, "name-findable.json")
+fn name_findable_path(storage: &Storage) -> Option<std::path::PathBuf> {
+    crate::active_profile_sidecar_path(storage, "name-findable.json")
 }
 
 /// The keys our beacon is out under, kept so a renamed or switched-off profile can withdraw it there —
 /// also after a restart.
-fn name_published_keys_path(db_path: &str) -> std::path::PathBuf {
-    crate::profile_sidecar_path(db_path, "name-beacon-keys.json")
+fn name_published_keys_path(storage: &Storage) -> Option<std::path::PathBuf> {
+    crate::active_profile_sidecar_path(storage, "name-beacon-keys.json")
 }
 
 /// The switch as the user set it.
-pub(crate) fn load_name_findable(db_path: &str) -> bool {
-    std::fs::read_to_string(name_findable_path(db_path)).is_ok_and(|raw| raw.trim() == "true")
+pub(crate) fn load_name_findable(storage: &Storage) -> bool {
+    name_findable_path(storage).and_then(|path| std::fs::read_to_string(path).ok()).is_some_and(|raw| raw.trim() == "true")
 }
 
 /// The switch as it works: on only while "findable by Omni-ID" is on too.
-pub(crate) fn name_findable_in_effect(db_path: &str) -> bool {
-    load_name_findable(db_path) && crate::load_discoverability_mode(db_path).is_public()
+pub(crate) fn name_findable_in_effect(storage: &Storage) -> bool {
+    load_name_findable(storage) && crate::load_discoverability_mode(storage).is_public()
 }
 
-fn load_published_keys(db_path: &str) -> Vec<String> {
-    std::fs::read_to_string(name_published_keys_path(db_path))
-        .ok()
+fn load_published_keys(storage: &Storage) -> Vec<String> {
+    name_published_keys_path(storage)
+        .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-fn store_published_keys(db_path: &str, keys: &[String]) {
-    let path = name_published_keys_path(db_path);
+fn store_published_keys(storage: &Storage, keys: &[String]) {
+    let Some(path) = name_published_keys_path(storage) else { return };
     if keys.is_empty() {
         let _ = std::fs::remove_file(path);
     } else if let Ok(json) = serde_json::to_string(keys) {
@@ -149,8 +149,8 @@ fn post_under_keys(
 /// no longer is. Called from the rendezvous sweep next to the identity beacon.
 pub(crate) fn sweep_name_beacon(storage: &Storage, courier: &dyn RendezvousCourier, db_path: &str) {
     let now_ms = current_unix_ms() as u64;
-    let published = load_published_keys(db_path);
-    let on = name_findable_in_effect(db_path);
+    let published = load_published_keys(storage);
+    let on = name_findable_in_effect(storage);
     let profile_name = if on {
         storage.get_local_public_profile_state().ok().map(|profile| profile.display_name).unwrap_or_default()
     } else {
@@ -169,7 +169,7 @@ pub(crate) fn sweep_name_beacon(storage: &Storage, courier: &dyn RendezvousCouri
         omni_app_trace_log("name/withdraw", &format!("keys={} withdrawn={withdrawn}", stale.len()));
         if withdrawn == stale.len() {
             let kept: Vec<String> = published.iter().filter(|key| keys.contains(key)).cloned().collect();
-            store_published_keys(db_path, &kept);
+            store_published_keys(storage, &kept);
         }
     }
     if keys.is_empty() {
@@ -195,13 +195,13 @@ pub(crate) fn sweep_name_beacon(storage: &Storage, courier: &dyn RendezvousCouri
         &format!("keys={} taken={taken} wire={} thumb={}", keys.len(), beacon.to_wire().len(), beacon.thumb_jpeg.len()),
     );
     if taken > 0 {
-        let mut out: Vec<String> = load_published_keys(db_path);
+        let mut out: Vec<String> = load_published_keys(storage);
         for key in &keys {
             if !out.contains(key) {
                 out.push(key.clone());
             }
         }
-        store_published_keys(db_path, &out);
+        store_published_keys(storage, &out);
     }
     if taken == keys.len() {
         publishes().insert(db_path.to_string(), fingerprint);
@@ -337,14 +337,15 @@ pub(crate) fn search_by_name_via(
 impl OmniApp {
     /// Whether "findable by name" is switched on (as set — it works only while findable by Omni-ID).
     pub fn name_findable(&self) -> bool {
-        load_name_findable(&self.storage.db_path().to_string_lossy())
+        load_name_findable(&self.storage)
     }
 
     /// Switch "findable by name". On takes effect on the next sweep; off withdraws the beacons on it.
     pub fn set_name_findable(&self, on: bool) -> OmniResult<()> {
         let _ = self.ensure_runtime_profile_active("set_name_findable")?;
         let db_path = self.storage.db_path().to_string_lossy().to_string();
-        std::fs::write(name_findable_path(&db_path), if on { "true" } else { "false" })
+        let path = name_findable_path(&self.storage).ok_or_else(|| OmniError::InvalidInput("no active profile".into()))?;
+        std::fs::write(path, if on { "true" } else { "false" })
             .map_err(|error| OmniError::Storage(format!("failed to persist name findability: {error}")))?;
         clear_name_discovery_for_profile(&db_path);
         Ok(())

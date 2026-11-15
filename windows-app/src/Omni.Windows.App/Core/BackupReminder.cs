@@ -15,7 +15,7 @@ internal static class BackupReminder
     {
         if (lastBackupAtUnixMs is not long at)
         {
-            return "Резервная копия ещё не сохранялась. Без неё переписка восстановится только со слов собеседников.";
+            return "Копия ещё не сохранялась.";
         }
 
         DateTimeOffset when = DateTimeOffset.FromUnixTimeMilliseconds(at).ToLocalTime();

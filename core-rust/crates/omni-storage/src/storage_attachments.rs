@@ -55,6 +55,14 @@ struct AttachmentSourceMetadata {
     modified_unix_ms: i64,
 }
 
+/// A file of a `Preparing` attachment, read ([`Storage::read_outgoing_attachment_preparation`]) and
+/// not yet completed.
+pub struct PreparedAttachmentSource {
+    source_path: std::path::PathBuf,
+    picked: AttachmentSourceMetadata,
+    tree: omni_crypto::ContentTreeLayer,
+}
+
 impl Storage {
     fn build_attachment_content_crypto_defaults(
         &self,
@@ -71,11 +79,12 @@ impl Storage {
         }
     }
 
+    /// The internal store belongs to the database's FOLDER, not to the file: one database per folder
+    /// (every profile of an install lives in its one database, and one process holds a folder —
+    /// `app_profile_folder_lock`). Deleting device traces wipes it whole, so a second database in the
+    /// same folder would lose its files — tests give every database a folder of its own.
     fn attachments_root_for_db_path(path: &Path) -> OmniResult<PathBuf> {
-        let parent = path.parent().ok_or_else(|| {
-            OmniError::Storage("database path does not have a parent directory".to_string())
-        })?;
-        Ok(parent.join("attachments"))
+        ProfileFolder::Attachments.path(path)
     }
 
     fn attachments_root_dir(&self) -> OmniResult<PathBuf> {
@@ -87,6 +96,12 @@ impl Storage {
             ))
         })?;
         Ok(root)
+    }
+
+    fn attachment_profile_folder(&self) -> OmniResult<String> {
+        // Profile ids in imported databases are opaque strings, never path components.
+        let profile = self.resolve_transition_profile_id()?;
+        Ok(hex::encode(profile.0.as_bytes()))
     }
 
     fn attachments_blobs_dir(&self) -> OmniResult<PathBuf> {
@@ -101,7 +116,7 @@ impl Storage {
     }
 
     fn attachments_temp_dir(&self) -> OmniResult<PathBuf> {
-        let path = self.attachments_root_dir()?.join("temp");
+        let path = self.attachments_root_dir()?.join("temp").join(self.attachment_profile_folder()?);
         fs::create_dir_all(&path).map_err(|error| {
             OmniError::Storage(format!(
                 "failed to create attachments temp directory '{}': {error}",
@@ -120,18 +135,87 @@ impl Storage {
         let prepared = crate::photo::prepare_photo(source_path)?;
         let staged = self
             .attachments_temp_dir()?
-            .join(format!("{}.photo.jpg", sanitize_attachment_file_name(message_id)));
+            .join(format!("{}.photo.jpg", message_file_stem(message_id)));
         self.write_media_file(&staged, &prepared.jpeg)?;
         Ok((staged, prepared.presentation))
     }
 
-    /// Where a received photo downloads by itself (the chat shows it; «Сохранить как…» copies it).
-    pub fn photo_download_path(&self, message_id: &str) -> OmniResult<PathBuf> {
-        let dir = self.attachments_root_dir()?.join("photos");
+    /// The file of a voice message just recorded, until it is sent (encrypted at rest like the rest
+    /// of the store; nothing is written while the recording goes on).
+    pub fn stage_voice_recording(&self, packets: &[Vec<u8>], waveform: &[u8]) -> OmniResult<PathBuf> {
+        let bytes = crate::voice::write_voice_ogg(packets, waveform)?;
+        let name: String = omni_crypto::random_bytes(8)?.iter().map(|byte| format!("{byte:02x}")).collect();
+        let staged = self.attachments_temp_dir()?.join(format!("voice-{name}.ogg"));
+        self.write_media_file(&staged, &bytes)?;
+        Ok(staged)
+    }
+
+    /// A voice message about to go: the file checked and what the receiver shows. A recording staged
+    /// above is used up here; a forwarded one stays where it is.
+    pub fn stage_outgoing_voice(
+        &self,
+        message_id: &str,
+        source_path: &Path,
+    ) -> OmniResult<(PathBuf, omni_types::AttachmentPresentationV1)> {
+        let bytes = self.read_media_file(source_path)?;
+        let presentation = crate::voice::read_voice_ogg(&bytes)?.presentation();
+        let temp = self.attachments_temp_dir()?;
+        let staged = temp.join(format!("{}.voice.ogg", message_file_stem(message_id)));
+        self.write_media_file(&staged, &bytes)?;
+        if source_path.starts_with(&temp) {
+            let _ = fs::remove_file(source_path);
+        }
+        Ok((staged, presentation))
+    }
+
+    /// The file of a video message just recorded, until it is sent: checked, its preview inside.
+    pub fn stage_video_note_recording(&self, mp4: &[u8], preview_jpeg: &[u8]) -> OmniResult<PathBuf> {
+        let bytes = if preview_jpeg.is_empty() {
+            mp4.to_vec()
+        } else {
+            crate::video_note::with_preview_box(mp4, preview_jpeg)
+        };
+        crate::video_note::read_video_note(&bytes)?;
+        let name: String = omni_crypto::random_bytes(8)?.iter().map(|byte| format!("{byte:02x}")).collect();
+        let staged = self.attachments_temp_dir()?.join(format!("video-note-{name}.mp4"));
+        self.write_media_file(&staged, &bytes)?;
+        Ok(staged)
+    }
+
+    /// A video message about to go, as `stage_outgoing_voice` does it for a voice message.
+    pub fn stage_outgoing_video_note(
+        &self,
+        message_id: &str,
+        source_path: &Path,
+    ) -> OmniResult<(PathBuf, omni_types::AttachmentPresentationV1)> {
+        let bytes = self.read_media_file(source_path)?;
+        let presentation = crate::video_note::read_video_note(&bytes)?.presentation();
+        let temp = self.attachments_temp_dir()?;
+        let staged = temp.join(format!("{}.video-note.mp4", message_file_stem(message_id)));
+        self.write_media_file(&staged, &bytes)?;
+        if source_path.starts_with(&temp) {
+            let _ = fs::remove_file(source_path);
+        }
+        Ok((staged, presentation))
+    }
+
+    /// Where a received photo or voice message downloads by itself (the chat shows it; «Сохранить как…»
+    /// copies it).
+    pub fn shown_file_download_path(
+        &self,
+        message_id: &str,
+        kind: omni_types::AttachmentPresentationKindV1,
+    ) -> OmniResult<PathBuf> {
+        let (folder, extension) = match kind {
+            omni_types::AttachmentPresentationKindV1::Photo => ("photos", "jpg"),
+            omni_types::AttachmentPresentationKindV1::Voice => ("voices", "ogg"),
+            omni_types::AttachmentPresentationKindV1::VideoNote => ("video-notes", "mp4"),
+        };
+        let dir = self.attachments_root_dir()?.join(folder).join(self.attachment_profile_folder()?);
         fs::create_dir_all(&dir).map_err(|error| {
-            OmniError::Storage(format!("failed to create the photo directory '{}': {error}", dir.display()))
+            OmniError::Storage(format!("failed to create the directory '{}': {error}", dir.display()))
         })?;
-        Ok(dir.join(format!("{}.jpg", sanitize_attachment_file_name(message_id))))
+        Ok(dir.join(format!("{}.{extension}", message_file_stem(message_id))))
     }
 
     fn managed_blob_path_for_attachment(
@@ -154,7 +238,7 @@ impl Storage {
     fn temp_download_path_for_message(&self, message_id: &str) -> OmniResult<PathBuf> {
         Ok(self.attachments_temp_dir()?.join(format!(
             "{}.part",
-            sanitize_attachment_file_name(message_id)
+            message_file_stem(message_id)
         )))
     }
 
@@ -171,9 +255,10 @@ impl Storage {
             .and_then(|value| value.to_str())
             .map(sanitize_attachment_file_name)
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| sanitize_attachment_file_name(message_id));
-        let message_part = sanitize_attachment_file_name(message_id);
-        Ok(parent.join(format!("{file_name}.{message_part}.part")))
+            .unwrap_or_else(|| message_file_stem(message_id));
+        let message_part = message_file_stem(message_id);
+        let profile = self.attachment_profile_folder()?;
+        Ok(parent.join(format!("{file_name}.{profile}.{message_part}.part")))
     }
 
     fn attachment_source_metadata(path: &Path) -> OmniResult<AttachmentSourceMetadata> {
@@ -613,7 +698,8 @@ impl Storage {
                     local_blob_managed,
                     local_source_size_bytes,
                     local_source_modified_unix_ms,
-                    presentation_json
+                    presentation_json,
+                    (SELECT reply_to FROM message_replies r WHERE r.message_id = message_attachments.message_id AND r.profile_id = message_attachments.profile_id)
                 FROM message_attachments
                 WHERE message_id = ?1
                   AND profile_id = ?2
@@ -636,10 +722,12 @@ impl Storage {
                     let local_blob_available =
                         local_copy_path.is_some() && state != AttachmentTransferState::Preparing;
 
+                    let file_name: String = row.get(2)?;
+                    let opens_as_program = omni_types::file_name_opens_as_program(&file_name);
                     Ok(AttachmentRuntimeInfo {
                         attachment: AttachmentRecord {
                             message_id: row.get(0)?,
-                            file_name: row.get(2)?,
+                            file_name,
                             file_size_bytes: row.get(3)?,
                             mime_type: row.get(4)?,
                             content_id_hex: row.get(5)?,
@@ -659,6 +747,7 @@ impl Storage {
                             local_copy_path: local_copy_path
                                 .map(|path| path.to_string_lossy().into_owned()),
                             source_count: 0,
+                            opens_as_program,
                         },
                         dialog_key: row.get(1)?,
                         local_blob_path,
@@ -672,6 +761,7 @@ impl Storage {
                         content_chunk_size_bytes: row.get(18)?,
                         local_source_size_bytes: row.get(20)?,
                         local_source_modified_unix_ms: row.get(21)?,
+                        reply_to: row.get(23)?,
                     })
                 },
             )
@@ -713,6 +803,9 @@ impl Storage {
             .get_attachment_runtime_info(&message.id)?
             .map(|runtime| runtime.attachment);
         message.told_by_contact = self.history_import_source(&message.id)?.is_some();
+        message.reply = self.message_reply_preview(&message.id, &message.dialog_key)?;
+        message.reactions = self.message_reactions(&message.id)?;
+        message.pinned = self.message_is_pinned(&message.id)?;
         Ok(message)
     }
 
@@ -811,6 +904,29 @@ impl Storage {
         media_protection_mode: AttachmentMediaProtectionMode,
         created_at_unix_ms: i64,
     ) -> OmniResult<AttachmentRuntimeInfo> {
+        self.prepare_outgoing_attachment_with(
+            message_id,
+            dialog_key,
+            source_file_path,
+            display_file_name,
+            media_protection_mode,
+            created_at_unix_ms,
+            &mut |_| true,
+        )
+    }
+
+    /// [`Self::prepare_outgoing_attachment`] whose reading reports to `progress`.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_outgoing_attachment_with(
+        &self,
+        message_id: &str,
+        dialog_key: &str,
+        source_file_path: &str,
+        display_file_name: Option<&str>,
+        media_protection_mode: AttachmentMediaProtectionMode,
+        created_at_unix_ms: i64,
+        progress: &mut dyn FnMut(u64) -> bool,
+    ) -> OmniResult<AttachmentRuntimeInfo> {
         self.begin_outgoing_attachment(
             message_id,
             dialog_key,
@@ -819,10 +935,21 @@ impl Storage {
             media_protection_mode,
             created_at_unix_ms,
         )?;
-        self.finish_outgoing_attachment_preparation(message_id, &mut |_| true, created_at_unix_ms)?;
-        self.get_attachment_runtime_info(message_id)?
+        let finished = self.finish_outgoing_attachment_preparation(message_id, progress, created_at_unix_ms);
+        // What counts is the row, not which pass made it ready: the queue's resume scan takes every
+        // `Preparing` row, this one too in the moment between begin and finish, and a pass that
+        // got there first left ours nothing to complete — the file was ready and the send said
+        // «stopped» (a full test run under load, 2026-10-27).
+        match self
+            .get_attachment_runtime_info(message_id)?
             .filter(|runtime| runtime.attachment.state != AttachmentTransferState::Preparing)
-            .ok_or_else(|| OmniError::Storage(ATTACHMENT_PREPARATION_STOPPED.to_string()))
+        {
+            Some(runtime) => Ok(runtime),
+            None => {
+                finished?;
+                Err(OmniError::Storage(ATTACHMENT_PREPARATION_STOPPED.to_string()))
+            }
+        }
     }
 
     /// The file of an outgoing message, written down as `Preparing`: named, sized, keyed — its tree
@@ -900,7 +1027,7 @@ impl Storage {
                 VALUES (
                     ?1, ?2, ?3, ?4, NULL, '', ?5, 0, NULL, 1, 0, ?6, NULL, NULL, NULL, ?7, ?8, ?9, NULL, 0, ?10, ?11, ?12, ?12, ?13
                 )
-                ON CONFLICT(message_id) DO UPDATE SET
+                ON CONFLICT(profile_id, message_id) DO UPDATE SET
                     dialog_key = excluded.dialog_key,
                     file_name = excluded.file_name,
                     file_size_bytes = excluded.file_size_bytes,
@@ -963,6 +1090,17 @@ impl Storage {
         progress: &mut dyn FnMut(u64) -> bool,
         now_unix_ms: i64,
     ) -> OmniResult<Vec<String>> {
+        let read = self.read_outgoing_attachment_preparation(message_id, progress)?;
+        self.complete_outgoing_attachment_preparation(&read, now_unix_ms)
+    }
+
+    /// The reading half of [`Self::finish_outgoing_attachment_preparation`]: the long part, kept out
+    /// of any transaction. Nothing is completed yet.
+    pub fn read_outgoing_attachment_preparation(
+        &self,
+        message_id: &str,
+        progress: &mut dyn FnMut(u64) -> bool,
+    ) -> OmniResult<PreparedAttachmentSource> {
         let runtime = self
             .get_attachment_runtime_info(message_id)?
             .ok_or_else(|| OmniError::Storage(format!("attachment '{message_id}' was not found")))?;
@@ -988,7 +1126,19 @@ impl Storage {
                 })?
             }
         };
-        let source_metadata = Self::validate_attachment_source_metadata_unchanged(&source_path, picked)?;
+        Ok(PreparedAttachmentSource { source_path, picked, tree })
+    }
+
+    /// The completing half of [`Self::finish_outgoing_attachment_preparation`]: short, so the app
+    /// can make it one transaction with what it says about the file (a group's offer).
+    pub fn complete_outgoing_attachment_preparation(
+        &self,
+        read: &PreparedAttachmentSource,
+        now_unix_ms: i64,
+    ) -> OmniResult<Vec<String>> {
+        let PreparedAttachmentSource { source_path, picked, tree } = read;
+        let (source_path, picked) = (source_path.as_path(), *picked);
+        let source_metadata = Self::validate_attachment_source_metadata_unchanged(source_path, picked)?;
         if source_metadata.size_bytes != tree.size as i64 {
             return Err(OmniError::Storage(format!(
                 "attachment source '{}' changed while it was being prepared",
@@ -996,8 +1146,8 @@ impl Storage {
             )));
         }
         let mut completed = Vec::new();
-        for (sibling, file_name) in self.preparing_rows_of_source(&source_path, picked)? {
-            if self.complete_prepared_attachment(&sibling, &file_name, &source_path, source_metadata, &tree, now_unix_ms)? {
+        for (sibling, file_name) in self.preparing_rows_of_source(source_path, picked)? {
+            if self.complete_prepared_attachment(&sibling, &file_name, source_path, source_metadata, tree, now_unix_ms)? {
                 completed.push(sibling);
             }
         }
@@ -1168,6 +1318,9 @@ impl Storage {
                     self.managed_blob_path_for_attachment(&content_id_hex, file_name)?;
                 let managed_blob_created =
                     self.copy_into_managed_blob_if_needed(source_path, &managed_blob_path)?;
+                if managed_blob_created {
+                    self.remove_after_rollback(AfterCommit::AttachmentFile(managed_blob_path.clone()));
+                }
                 let managed_metadata = Self::attachment_source_metadata(&managed_blob_path)?;
                 (managed_blob_path, true, managed_metadata, managed_blob_created)
             } else {
@@ -1315,6 +1468,12 @@ impl Storage {
         created_at_unix_ms: i64,
     ) -> OmniResult<AttachmentRuntimeInfo> {
         let profile_id = self.resolve_transition_profile_id()?;
+        // The name is the sender's: shown, offered for «Save as», and the name an opened copy gets —
+        // so it is cleaned here, once, for all of them (V-18).
+        let file_name = match sanitize_attachment_file_name(file_name) {
+            name if name.is_empty() => "file".to_string(),
+            name => name,
+        };
         let content_encryption = content_encryption.ok_or_else(|| {
             OmniError::InvalidInput("attachment content encryption mode is required".to_string())
         })?;
@@ -1363,7 +1522,7 @@ impl Storage {
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, 0, 1, NULL, NULL, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14
                 )
-                ON CONFLICT(message_id) DO UPDATE SET
+                ON CONFLICT(profile_id, message_id) DO UPDATE SET
                     dialog_key = excluded.dialog_key,
                     file_name = excluded.file_name,
                     file_size_bytes = excluded.file_size_bytes,
@@ -1380,6 +1539,11 @@ impl Storage {
                     last_error = excluded.last_error,
                     updated_at_unix_ms = excluded.updated_at_unix_ms
                 WHERE message_attachments.state = 'offered'
+                  -- The same file of the same chat offered again; never another chat's file under the
+                  -- same id (security review 2026-11-09, F2).
+                  AND message_attachments.dialog_key = excluded.dialog_key
+                  AND message_attachments.content_id_hex = excluded.content_id_hex
+                  AND message_attachments.profile_id = excluded.profile_id
                 ",
                 params![
                     message_id,
@@ -1606,7 +1770,11 @@ impl Storage {
                 ))
             })?;
         }
-        let temp_download_path = self.temp_download_path_for_save_path(save_path, message_id)?;
+        // A transfer started before paths became profile-scoped keeps its partial download.
+        let temp_download_path = match (&existing.requested_save_path, &existing.temp_download_path) {
+            (Some(previous), Some(partial)) if previous == save_path => partial.clone(),
+            _ => self.temp_download_path_for_save_path(save_path, message_id)?,
+        };
         // What is here already, as this temp file allows (another save path is another file).
         let mut checked = existing.clone();
         checked.temp_download_path = Some(temp_download_path.clone());
@@ -2000,6 +2168,25 @@ impl Storage {
             }
         }
         let requested_save_matches_temp = temp_download_path == requested_save_path;
+        // A file another message keeps is never replaced by this one's download.
+        let anothers = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM message_attachments
+                 WHERE message_id != ?1 AND (local_saved_path = ?2 OR local_blob_path = ?2) LIMIT 1",
+                params![message_id, requested_save_path.to_string_lossy()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        if anothers {
+            self.mark_attachment_download_completion_failed(message_id, "Файл с этим именем принадлежит другому сообщению", updated_at_unix_ms)?;
+            return Err(OmniError::Storage(format!(
+                "'{}' is another message's file; not replaced",
+                requested_save_path.display()
+            )));
+        }
         if !requested_save_matches_temp {
             match fs::remove_file(&requested_save_path) {
                 Ok(()) => {}
@@ -2027,6 +2214,9 @@ impl Storage {
                     requested_save_path.display()
                 )));
             }
+        }
+        if !self.is_internal_media_path(&requested_save_path) {
+            crate::mark_as_downloaded(&requested_save_path);
         }
 
         let persist_result = self.connection.execute(
@@ -2074,16 +2264,19 @@ impl Storage {
 
         if let Some(stale_blob_path) = stale_blob_path {
             if stale_blob_path != requested_save_path {
-                let _ = best_effort_remove_file(&stale_blob_path);
+                // The row names the new file now; the old managed copy goes unless another message
+                // shares it.
+                let _ = self.delete_attachment_files([stale_blob_path]);
             }
         }
 
-        // A photo is shown only if the file is what its offer said (a JPEG of that size): a
-        // sender's lie makes it a plain file, never decoded by the chat.
+        // A photo or a voice message is shown only if the file is what its offer said (a JPEG of that
+        // size, an Ogg/Opus of that length): a sender's lie makes it a plain file, never decoded by the
+        // chat.
         if let Some(presentation) = runtime.attachment.presentation.as_ref() {
             let matches = self
                 .read_media_file(&requested_save_path)
-                .is_ok_and(|bytes| crate::photo::downloaded_photo_matches(&bytes, presentation));
+                .is_ok_and(|bytes| crate::photo::downloaded_file_matches(&bytes, presentation));
             if !matches {
                 self.set_attachment_presentation(message_id, None)?;
             }
@@ -2134,12 +2327,6 @@ impl Storage {
             .ok_or_else(|| {
                 OmniError::Storage(format!("attachment '{}' was not found", message_id))
             })?;
-        if existing.local_blob_managed {
-            if let Some(local_blob_path) = existing.local_blob_path.as_ref() {
-                best_effort_remove_file(local_blob_path)?;
-            }
-        }
-
         self.connection
             .execute(
                 "
@@ -2161,6 +2348,12 @@ impl Storage {
                 ],
             )
             .map_err(map_sqlite_error)?;
+        // Only once no other message names the managed copy (the same content sent twice shares it).
+        if existing.local_blob_managed {
+            if let Some(local_blob_path) = existing.local_blob_path.as_ref() {
+                self.delete_attachment_files([local_blob_path.clone()])?;
+            }
+        }
 
         self.get_attachment_runtime_info(message_id)?
             .ok_or_else(|| {
@@ -2222,7 +2415,6 @@ impl Storage {
         let normalized_dialog_key = normalize_dialog_key(dialog_key);
         let file_paths =
             self.attachment_file_paths_for_dialog_profile(&normalized_dialog_key, &profile_id)?;
-        self.delete_attachment_files(file_paths)?;
 
         self.connection
             .execute(
@@ -2230,6 +2422,7 @@ impl Storage {
                 params![normalized_dialog_key, profile_id.0],
             )
             .map_err(map_sqlite_error)?;
+        self.delete_attachment_files(file_paths)?;
 
         Ok(())
     }
@@ -2239,7 +2432,6 @@ impl Storage {
         profile_id: &LocalProfileId,
     ) -> OmniResult<()> {
         let file_paths = self.attachment_file_paths_for_profile(profile_id)?;
-        self.delete_attachment_files(file_paths)?;
 
         self.connection
             .execute(
@@ -2247,6 +2439,7 @@ impl Storage {
                 params![profile_id.0.as_str()],
             )
             .map_err(map_sqlite_error)?;
+        self.delete_attachment_files(file_paths)?;
 
         Ok(())
     }
@@ -2477,24 +2670,91 @@ impl Storage {
         Ok(file_paths)
     }
 
+    /// After a restore: the rows name the store's files by their full paths, as they were where the
+    /// copy was made. In another folder (another machine, another user name) the files came back and
+    /// no row found them — every attachment of the restored profile showed as missing. A path into
+    /// an `attachments` folder whose file now lies in this database's own is moved to it; a path to
+    /// the person's own file elsewhere is left as it is. Returns how many paths moved.
+    pub fn rehome_attachment_files(&self) -> OmniResult<usize> {
+        let root = self.attachments_root_dir()?;
+        let rehomed = |old: &str| -> Option<String> {
+            let old = Path::new(old);
+            let folder = old.parent()?;
+            if folder.parent()?.file_name()? != "attachments" {
+                return None;
+            }
+            let new = root.join(folder.file_name()?).join(old.file_name()?);
+            (new != old && new.is_file()).then(|| new.to_string_lossy().into_owned())
+        };
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT rowid, local_blob_path, temp_download_path FROM message_attachments")
+                .map_err(map_sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(map_sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(map_sqlite_error)?;
+            rows
+        };
+        let mut moved = 0;
+        self.with_immediate_transaction("rehome_attachment_files", |storage| {
+            for (rowid, blob, temp) in &rows {
+                for (column, old) in [("local_blob_path", blob), ("temp_download_path", temp)] {
+                    let Some(new) = old.as_deref().and_then(rehomed) else {
+                        continue;
+                    };
+                    storage
+                        .connection
+                        .execute(&format!("UPDATE message_attachments SET {column} = ?2 WHERE rowid = ?1"), params![rowid, new])
+                        .map_err(map_sqlite_error)?;
+                    moved += 1;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(moved)
+    }
+
+    /// Remove attachment files no message names any more. A managed copy is named by its content
+    /// (`managed_blob_path_for_attachment`), so the same file sent in two chats is one copy: removing
+    /// it for one message took it from the other (audit 2026-11-09, F05). Callers drop their rows
+    /// first.
+    /// The files of rows just deleted: each goes once no row names it — at once, or, inside a
+    /// transaction, when it commits (and not at all if it rolls back).
     fn delete_attachment_files(
         &self,
         file_paths: impl IntoIterator<Item = PathBuf>,
     ) -> OmniResult<()> {
         for candidate in file_paths {
-            match fs::remove_file(&candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(OmniError::Storage(format!(
-                        "failed to delete attachment file '{}': {error}",
-                        candidate.display()
-                    )));
-                }
-            }
+            self.remove_after_commit(AfterCommit::AttachmentFile(candidate))?;
         }
-
         Ok(())
+    }
+
+    fn remove_unnamed_attachment_file(&self, candidate: &Path) -> OmniResult<()> {
+        let still_named = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM message_attachments WHERE local_blob_path = ?1 OR temp_download_path = ?1 LIMIT 1",
+                params![candidate.to_string_lossy()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        if still_named {
+            return Ok(());
+        }
+        match fs::remove_file(candidate) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(OmniError::Storage(format!(
+                "failed to delete attachment file '{}': {error}",
+                candidate.display()
+            ))),
+        }
     }
 }
 
@@ -2537,6 +2797,12 @@ fn attachment_download_required_space_bytes(file_size_bytes: i64, resume_offset_
     let file_size_bytes = file_size_bytes.max(0) as u64;
     let resume_offset_bytes = resume_offset_bytes.max(0) as u64;
     file_size_bytes.saturating_sub(resume_offset_bytes)
+}
+
+/// Free bytes the user may still write on the disk that holds `path`; `None` where this platform does
+/// not tell.
+pub fn available_space_bytes(path: &Path) -> OmniResult<Option<u64>> {
+    attachment_available_space_bytes(path)
 }
 
 #[cfg(windows)]
@@ -2651,17 +2917,27 @@ fn reserve_attachment_file_allocation(_path: &Path, _allocation_size_bytes: u64)
     Ok(())
 }
 
+/// The file-name stem of a message's files here (its photo, its download's `.part`, …). The id is
+/// the sender's, and cleaning it into a file name (`clean_file_name`) can make two ids one name:
+/// `g-media` and `g-media ` were one photo path, so a contact who knew another chat's photo id wrote
+/// over that photo (security review 2026-11-09, F3). An id the cleaning leaves as it is keeps its
+/// name (the paths already stored stay right); any other gets a hash of the whole id after it.
+fn message_file_stem(message_id: &str) -> String {
+    use sha2::Digest as _;
+    let cleaned = sanitize_attachment_file_name(message_id);
+    if !cleaned.is_empty() && cleaned == message_id {
+        return cleaned;
+    }
+    let tag = hex::encode(&sha2::Sha256::digest(message_id.as_bytes())[..8]);
+    if cleaned.is_empty() {
+        format!("m-{tag}")
+    } else {
+        format!("{cleaned}-{tag}")
+    }
+}
+
 fn sanitize_attachment_file_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            _ => ch,
-        })
-        .collect::<String>()
-        .trim()
-        .trim_matches('.')
-        .to_string()
+    omni_types::clean_file_name(value)
 }
 
 fn best_effort_remove_file(path: &Path) -> OmniResult<()> {

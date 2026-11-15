@@ -40,6 +40,7 @@ public sealed partial class MainWindow
             PrimaryButtonText = "Удалить и создать новую",
             CloseButtonText = "Отмена",
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
 
         if (await dialog.ShowAsync() != ContentDialogResult.Primary)

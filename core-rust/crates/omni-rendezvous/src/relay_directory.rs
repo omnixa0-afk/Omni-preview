@@ -9,7 +9,7 @@
 // entry rarely, so one topic is enough. A relay picks its shelf by its key, the reader reads every
 // shelf of the current and the previous window.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use sha2::{Digest, Sha256};
 
@@ -232,32 +232,8 @@ pub fn relay_entry_signing_bytes(entry: &RelayDirectoryEntry) -> Vec<u8> {
     bytes
 }
 
-/// A routable unicast address: not loopback, private, link-local, CGNAT, documentation,
-/// unspecified or multicast.
-pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || (a == 100 && (64..128).contains(&b)))
-        }
-        IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || first == 0x2001 && v6.segments()[1] == 0x0db8)
-        }
-    }
-}
+/// A routable unicast address — the one check for every address a third party names (V-22).
+pub use omni_net_primitives::is_public_ip;
 
 fn push_endpoints(out: &mut Vec<u8>, endpoints: &[String]) {
     let kept: Vec<&String> =

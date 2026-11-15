@@ -2,6 +2,7 @@
 name = "omni-daemon"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Reusable daemon-serving core: the IPC transport abstraction (TCP + Windows named pipe),
 # the line + framed command protocols, and the events plane — generalized over a tiny
@@ -16,6 +17,13 @@ omni-identity = { path = "../omni-identity" }
 omni-types = { path = "../omni-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The TCP endpoint's access token (V-11).
+hex = { workspace = true }
+rand_core = { workspace = true }
+# The TCP daemon's sealed channel (secure_channel.rs).
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

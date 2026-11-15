@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Omni.Windows.App.Core;
+using Omni.Windows.App.Features.Calls;
 using Omni.Windows.App.Features.Groups;
 using Xunit;
 
@@ -90,6 +91,23 @@ public sealed class ScreenControlContractTests
         // edge), and with no picture size there is no mapping at all.
         Assert.True(MainWindow.FitPoint(800, 800, 1920, 1080, 400, 10)!.Value.Y < 0);
         Assert.Null(MainWindow.FitPoint(800, 800, 0, 1080, 400, 400));
+    }
+
+    [Fact]
+    public void An_absolute_pointer_value_lands_on_its_own_pixel_across_two_screens()
+    {
+        // Two 1920-wide screens side by side: the desktop is 3840 wide. Windows puts an absolute value
+        // n at pixel n*3840/65536 (floored); every pixel must come back as itself, the far edge too.
+        foreach (int pixel in new[] { 0, 1, 1919, 1920, 2880, 3839 })
+        {
+            int value = ScreenControlInjector.ToAbsolute(pixel, 3840);
+            Assert.Equal(pixel, (int)((long)value * 3840 / 65536));
+        }
+
+        // Negative half: off the desktop clamps to its edges, and no desktop is the origin.
+        Assert.Equal(0, ScreenControlInjector.ToAbsolute(-5, 3840));
+        Assert.Equal(65535, ScreenControlInjector.ToAbsolute(4000, 3840));
+        Assert.Equal(0, ScreenControlInjector.ToAbsolute(10, 0));
     }
 
     [Fact]

@@ -18,6 +18,7 @@ public sealed partial class MainWindow
         string? attachmentSourcePath = pendingAttachmentSourcePath;
         string? attachmentFileName = pendingAttachmentFileName;
         bool attachmentAsPhoto = pendingAttachmentAsPhoto;
+        string? answering = chatReplyTo?.MessageId;
 
         if (string.IsNullOrWhiteSpace(peerSelector))
         {
@@ -46,9 +47,11 @@ public sealed partial class MainWindow
                     body,
                     attachmentSourcePath!,
                     attachmentFileName,
-                    attachmentAsPhoto))
-                : rustBridge.SendText(peerSelector, body);
+                    attachmentAsPhoto,
+                    answering))
+                : rustBridge.SendText(peerSelector, body, answering);
             MessageInputTextBox.Text = string.Empty;
+            SetChatReply(null);
             if (hasAttachment)
             {
                 ClearPendingAttachmentDraftIfCurrent(attachmentSourcePath!, preserveStatusText: true);
@@ -70,6 +73,119 @@ public sealed partial class MainWindow
 
         RefreshTransportStatus();
         UpdateControlStates();
+    }
+
+    /// A voice message from the composer: it answers what the text would have answered.
+    private async void OnChatVoiceRecorded(object? sender, Features.Shared.VoiceRecording recording)
+    {
+        string? peerSelector = GetApprovedCurrentDialogKey();
+        if (string.IsNullOrWhiteSpace(peerSelector))
+        {
+            SetActionStatus("Чтобы отправить голосовое, откройте проверенный контакт.");
+            return;
+        }
+
+        string? answering = chatReplyTo?.MessageId;
+        try
+        {
+            pendingChatAutoScrollToLatest = true;
+            await Task.Run(() =>
+            {
+                string file = rustBridge.StageVoiceRecording(recording.Packets, recording.Waveform);
+                rustBridge.SendAttachment(peerSelector, string.Empty, file, null, false, answering, asVoice: true);
+            });
+            SetChatReply(null);
+            SetActionStatus(string.Empty);
+        }
+        catch (Exception ex)
+        {
+            SetActionStatus($"Голосовое не отправилось: {NormalizeUserError(ex)}");
+        }
+
+        RefreshMessages();
+        RefreshQueueDiagnostics();
+        WakeChatRefresh();
+    }
+
+    /// A video message from the composer: it answers what the text would have answered.
+    private async void OnChatVideoNoteRecorded(object? sender, Features.Shared.VideoNoteRecording recording)
+    {
+        string? peerSelector = GetApprovedCurrentDialogKey();
+        if (string.IsNullOrWhiteSpace(peerSelector))
+        {
+            SetActionStatus("Чтобы отправить видеосообщение, откройте проверенный контакт.");
+            return;
+        }
+
+        string? answering = chatReplyTo?.MessageId;
+        try
+        {
+            pendingChatAutoScrollToLatest = true;
+            await Task.Run(() =>
+            {
+                string file = rustBridge.StageVideoNote(recording.Video, recording.Preview);
+                rustBridge.SendAttachment(peerSelector, string.Empty, file, null, false, answering, asVideoNote: true);
+            });
+            SetChatReply(null);
+            SetActionStatus(string.Empty);
+        }
+        catch (Exception ex)
+        {
+            SetActionStatus($"Видеосообщение не отправилось: {NormalizeUserError(ex)}");
+        }
+
+        RefreshMessages();
+        RefreshQueueDiagnostics();
+        WakeChatRefresh();
+    }
+
+    // The message the next one answers, shown over the field until it goes or the cross is pressed.
+    private Features.Shared.MessageRow? chatReplyTo;
+
+    private void OnMessageReplyRequested(object? sender, Features.Shared.MessageRow row) => SetChatReply(row);
+
+    private void OnMessageReactionChosen(object? sender, string emoji)
+    {
+        if (sender is not Features.Shared.MessageBubble { Row: { } row })
+        {
+            return;
+        }
+
+        try
+        {
+            rustBridge.ReactToMessage(row.MessageId, emoji);
+            RefreshMessages();
+        }
+        catch (Exception ex)
+        {
+            SetActionStatus($"Не удалось поставить реакцию: {ex.Message}");
+        }
+    }
+
+    private void SetChatReply(Features.Shared.MessageRow? row)
+    {
+        chatReplyTo = row;
+        if (row is null)
+        {
+            ChatComposerBorder.ClearReply();
+            return;
+        }
+
+        string text = row.Body.Length > 0 ? row.Body : row.AttachmentLabel;
+        ChatComposerBorder.ShowReply(row.IsOutgoing ? "Вы" : ChatIdentityTitleTextBlock.Text, text.Length > 0 ? text : "Сообщение");
+    }
+
+    /// A quote goes to its message when the open part of the transcript holds it.
+    private void OnMessageQuoteOpened(object? sender, Features.Shared.MessageRow row)
+    {
+        if (messageItems.FirstOrDefault(item => item.MessageId == row.QuotedMessageId) is { } target)
+        {
+            MessagesListView.ScrollIntoView(target, ScrollIntoViewAlignment.Leading);
+        }
+        else
+        {
+            SetActionStatus("Это сообщение выше в истории: прокрутите к нему.");
+        }
     }
 
     private void OnMessageInputTextChanged(object sender, TextChangedEventArgs e)
@@ -118,7 +234,7 @@ public sealed partial class MainWindow
     {
         bool canAccept =
             !string.IsNullOrWhiteSpace(GetAttachableCurrentDialogKey()) &&
-            e.DataView.Contains(StandardDataFormats.StorageItems);
+            Features.Shared.DroppedFiles.CanAttach(e.DataView);
 
         if (!canAccept)
         {
@@ -137,34 +253,44 @@ public sealed partial class MainWindow
         ChatDropOverlayBorder.Visibility = Visibility.Collapsed;
 
         if (string.IsNullOrWhiteSpace(GetAttachableCurrentDialogKey()) ||
-            !e.DataView.Contains(StandardDataFormats.StorageItems))
+            !Features.Shared.DroppedFiles.CanAttach(e.DataView))
         {
             return;
         }
 
         try
         {
-            IReadOnlyList<IStorageItem> items = await e.DataView.GetStorageItemsAsync();
-            StorageFile? file = items.OfType<StorageFile>().FirstOrDefault();
-            if (file is null)
-            {
-                SetActionStatus("Можно перетащить только файл.");
-                return;
-            }
-
-            string stagedPath = await StageAttachmentSourceAsync(file);
-            SetPendingAttachmentDraft(stagedPath, file.Name);
-            if (GetApprovedCurrentDialogKey() is null)
-            {
-                SetActionStatus($"Файл {file.Name} подготовлен как черновик. Отправка станет доступна после открытия проверенного чата.");
-            }
-            WakeChatRefresh();
+            await AttachDroppedToCurrentChatAsync(await Features.Shared.DroppedFiles.ReadAsync(e.DataView));
         }
         catch (Exception ex)
         {
             SetActionStatus($"Не удалось обработать перетаскивание: {NormalizeUserError(ex)}");
             WakeChatRefresh();
         }
+    }
+
+    /// Files dropped on the open 1:1 chat (its thread, its composer, its row in the list): the first
+    /// becomes the draft, as «Прикрепить» makes it.
+    private async Task AttachDroppedToCurrentChatAsync(IReadOnlyList<StorageFile> files)
+    {
+        if (files.Count == 0)
+        {
+            SetActionStatus("Можно перетащить файл или картинку, а не папку.");
+            return;
+        }
+
+        StorageFile file = files[0];
+        string stagedPath = await StageAttachmentSourceAsync(file);
+        SetPendingAttachmentDraft(stagedPath, file.Name);
+        if (GetApprovedCurrentDialogKey() is null)
+        {
+            SetActionStatus($"Файл {file.Name} подготовлен как черновик. Отправка станет доступна после открытия проверенного чата.");
+        }
+        else if (Features.Shared.DroppedFiles.MoreThanOneNote(files) is { } note)
+        {
+            SetActionStatus(note);
+        }
+        WakeChatRefresh();
     }
 
     private void OnAttachmentPhotoClicked(object sender, RoutedEventArgs e)
@@ -216,7 +342,7 @@ public sealed partial class MainWindow
         if (attachment.LocalSavedPath is { Length: > 0 } savedPath && File.Exists(savedPath))
         {
             MenuFlyoutItem openItem = new() { Text = "Открыть" };
-            openItem.Click += async (_, _) => await OpenLocalFileAsync(savedPath, attachment.FileName);
+            openItem.Click += async (_, _) => await OpenLocalFileAsync(savedPath, attachment.FileName, attachment.OpensAsProgram);
             attachmentActionsFlyout.Items.Add(openItem);
         }
 
@@ -271,8 +397,13 @@ public sealed partial class MainWindow
         attachmentActionsFlyout.ShowAt(element);
     }
 
-    private async Task OpenLocalFileAsync(string path, string fileName)
+    private async Task OpenLocalFileAsync(string path, string fileName, bool opensAsProgram)
     {
+        if (opensAsProgram && !await ConfirmOpenProgramAsync(fileName))
+        {
+            return;
+        }
+
         try
         {
             // A file in Omni's storage (a photo that downloaded by itself) is encrypted at rest: the
@@ -287,11 +418,43 @@ public sealed partial class MainWindow
         }
     }
 
+    /// <summary>
+    /// A received file that runs as a program or a script (V-18): opening it is the user's decision,
+    /// taken knowing what it is — the name alone may pass for a document.
+    /// </summary>
+    private async Task<bool> ConfirmOpenProgramAsync(string fileName)
+    {
+        ContentDialog dialog = new()
+        {
+            Title = "Это программа",
+            Content = new TextBlock
+            {
+                Text = $"«{fileName}» запустится как программа или сценарий и получит те же права, что и вы. "
+                    + "Открывайте, только если ждали именно эту программу от этого человека.",
+                TextWrapping = TextWrapping.WrapWholeWords,
+            },
+            PrimaryButtonText = "Запустить",
+            CloseButtonText = "Отмена",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
+        };
+        try
+        {
+            return await dialog.ShowAsync() == ContentDialogResult.Primary;
+        }
+        catch (Exception)
+        {
+            // Another dialog is already open (WinUI allows one at a time): do not run it.
+            return false;
+        }
+    }
+
     private void OnOpenContactsFromChatsClicked(object sender, RoutedEventArgs e)
     {
-        // Straight to adding: the button says «Добавить контакт».
+        // «Добавить контакт» goes straight to adding; «Открыть контакты» (people, no conversation yet) to the list.
         AuthenticatedNavigationView.SelectedItem = ContactsNavigationItem;
-        ApplyContactsWorkspaceMode(ContactsWorkspaceMode.Add);
+        ApplyContactsWorkspaceMode(chatPartnerCount > 0 ? ContactsWorkspaceMode.Directory : ContactsWorkspaceMode.Add);
     }
 
     private void OnChatHeaderMenuClicked(object sender, RoutedEventArgs e)

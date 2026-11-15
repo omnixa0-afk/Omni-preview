@@ -4,11 +4,22 @@ impl OmniApp {
         peer_addr_or_key: impl Into<String>,
         body: impl Into<String>,
     ) -> OmniResult<ChatMessageRecord> {
+        self.send_text_answering(peer_addr_or_key, body, None)
+    }
+
+    /// `send_text` that answers `reply_to`, a message of the same chat.
+    pub fn send_text_answering(
+        &self,
+        peer_addr_or_key: impl Into<String>,
+        body: impl Into<String>,
+        reply_to: Option<&str>,
+    ) -> OmniResult<ChatMessageRecord> {
         let _ = self.ensure_runtime_profile_active("send_message")?;
 
         let request = SendTextRequest {
             dialog_key: peer_addr_or_key.into(),
             body: body.into(),
+            reply_to: reply_to.map(str::to_string),
         };
 
         let peer_selector = request.dialog_key.trim();
@@ -79,6 +90,8 @@ impl OmniApp {
 
         let message_id = next_message_id();
         let created_at_unix_ms = current_unix_ms();
+        // Before the message: the queue (another thread) sends whatever message is queued.
+        self.storage.remember_message_reply(&message_id, &dialog_key, request.reply_to.as_deref())?;
 
         if selector_matches_active {
             let _session_guard = lock_app_session_guard(&self.session_lock)?;
@@ -123,6 +136,7 @@ impl OmniApp {
         &self,
         peer_addr_or_key: impl Into<String>,
     ) -> OmniResult<ListMessagesResponse> {
+        let _ = self.ensure_runtime_profile_active("list_messages")?;
         let peer_addr_or_key = peer_addr_or_key.into();
         let trimmed = peer_addr_or_key.trim();
 
@@ -143,6 +157,7 @@ impl OmniApp {
         &self,
         request: ListMessagesPageRequest,
     ) -> OmniResult<ListMessagesPageResponse> {
+        let _ = self.ensure_runtime_profile_active("list_messages_page")?;
         let trimmed = request.dialog_key.trim();
 
         if trimmed.is_empty() {
@@ -182,12 +197,15 @@ impl OmniApp {
         media_protection_mode: omni_types::AttachmentMediaProtectionMode,
     ) -> OmniResult<ChatMessageRecord> {
         self.send_attachment_request(omni_types::SendAttachmentRequest {
+            reply_to: None,
             dialog_key: peer_addr_or_key.into(),
             body: body.into(),
             source_file_path: source_file_path.into(),
             display_file_name,
             media_protection_mode,
             as_photo: false,
+            as_voice: false,
+            as_video_note: false,
         })
     }
 
@@ -248,12 +266,20 @@ impl OmniApp {
             current_unix_ms(),
         );
 
+        let recording = if request.as_voice {
+            Some(omni_types::AttachmentPresentationKindV1::Voice)
+        } else if request.as_video_note {
+            Some(omni_types::AttachmentPresentationKindV1::VideoNote)
+        } else {
+            None
+        };
         let message_id = next_message_id();
         // A picture this app cannot read (or one over the limits) fails here, before anything is
         // queued.
         let staged_photo =
-            stage_outgoing_photo_if_asked(&self.storage, &message_id, source_file_path, request.as_photo)?;
+            stage_outgoing_photo_if_asked(&self.storage, &message_id, source_file_path, request.as_photo, recording)?;
         let created_at_unix_ms = current_unix_ms();
+        self.storage.remember_message_reply(&message_id, &dialog_key, request.reply_to.as_deref())?;
         // The file first, the message second. The queue (another thread) sends whatever message is
         // queued, as a file offer if it has a file row and as plain text if not; with the message
         // written first, it took the message while the file was still being hashed and sent it as
@@ -413,6 +439,10 @@ impl OmniApp {
         }
         self.storage
             .revoke_local_attachment_access(trimmed_message_id, current_unix_ms())?;
+        // The session is read, advanced and stored under the lock every sender takes (B01, audit
+        // 2026-11-09 #6): without it a concurrent send made this write stale and the notice was lost
+        // — or, with no session yet, two bootstraps raced.
+        let _session_guard = lock_app_session_guard(&self.session_lock)?;
         if let Some(contact) = self.storage.resolve_contact_for_dialog(&message.dialog_key)? {
             if let Some(remote_account_id) = contact.remote_account_id {
                 let payload = omni_types::WirePayloadV1::LogicalEvent(

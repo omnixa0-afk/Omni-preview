@@ -220,7 +220,9 @@ public sealed partial class MainWindow
         try
         {
             await Task.Run(() => rustBridge.FindContactByOmniId(person.OmniId, person.DisplayName));
-            button.Content = "Заявка отправлена";
+            // Created, not yet delivered: it leaves with the first link (the contact list then says
+            // "доставлен" or why it waits).
+            button.Content = "Заявка создана";
             SetAddByOmniIdStatus($"«{person.DisplayName}» получит заявку, как только соединение поднимется, и подтвердит её сам.");
             RefreshContactsList(force: true, selectContactId: null);
         }

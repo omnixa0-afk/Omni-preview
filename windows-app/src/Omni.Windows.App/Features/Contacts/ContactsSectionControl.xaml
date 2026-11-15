@@ -132,6 +132,8 @@
           <ColumnDefinition x:Name="ContactsPrimaryColumn" Width="275" />
           <ColumnDefinition x:Name="ContactsDetailColumn" Width="*" />
         </Grid.ColumnDefinitions>
+        <!-- The list column's edge: its width is one for every section (Features/Shared/SectionRail.cs). -->
+        <shared:RailSplitter Grid.Column="0" Grid.RowSpan="10" />
 
         <Border
           x:Name="ContactsLeftPane"
@@ -152,7 +154,7 @@
                 <TextBlock VerticalAlignment="Center" Style="{StaticResource CardTitleTextStyle}" Text="Контакты" />
                 <Button
                   x:Name="ContactsAddToggleButton"
-                  HorizontalAlignment="Right"
+                  Style="{StaticResource PaneHeaderButtonStyle}"
                   AutomationProperties.AutomationId="ContactsAddToggleButton"
                   AutomationProperties.Name="Добавить контакт">
                   <StackPanel Orientation="Horizontal" Spacing="6">
@@ -163,9 +165,10 @@
               </Grid>
               <!-- One row of filters, as tall as the chat list's search; the counts sit in the pills. -->
               <StackPanel x:Name="ContactsFilterRow" MinHeight="32" Orientation="Horizontal" Spacing="2">
-                <Button x:Name="ContactsFilterAllButton" Content="Все" Style="{StaticResource ContactFilterButtonStyle}" Tag="all" />
-                <Button x:Name="ContactsFilterPendingButton" Content="Запросы" Style="{StaticResource ContactFilterButtonStyle}" Tag="pending" />
-                <Button x:Name="ContactsFilterApprovedButton" Content="Принятые" Style="{StaticResource ContactFilterButtonStyle}" Tag="approved" />
+                <!-- The people, then the requests with their count, then the declined and blocked
+                     (docs/decisions/omni-app-ux.md R2: «Все» and «Принятые» side by side overlapped). -->
+                <Button x:Name="ContactsFilterApprovedButton" Content="Контакты" Style="{StaticResource ContactFilterButtonStyle}" Tag="approved" />
+                <Button x:Name="ContactsFilterPendingButton" Content="Заявки" Style="{StaticResource ContactFilterButtonStyle}" Tag="pending" />
                 <Button x:Name="ContactsFilterDeclinedButton" Content="Отказы" Style="{StaticResource ContactFilterButtonStyle}" Tag="declined" />
               </StackPanel>
             </StackPanel>
@@ -209,105 +212,101 @@
           Grid.Row="0"
           Grid.RowSpan="2"
           Grid.Column="1"
-          Padding="32,20,32,0"
+          Padding="24,16,24,0"
           Background="{ThemeResource OmniBgAppBrush}"
           BorderBrush="Transparent"
           BorderThickness="0">
         <Grid>
           <ScrollViewer x:Name="ContactsDetailScroll" VerticalScrollBarVisibility="Auto">
-            <!-- The host fills the viewport and centres the page in it. Without it the scroll
-                 presenter centred the page by its DESIRED width and the page then grew to 560 to the
-                 right, so each contact's page sat a different distance from the middle (owner,
-                 2026-10-11: «прыгает вправо-влево»; measured with ui.bounds: 490 vs 516 desired). -->
+            <!-- The host fills the viewport, so the page's place does not follow its desired width (it
+                 jumped right and left from contact to contact, owner 2026-10-11). The page starts at the
+                 left, under where every header starts, and its rows take the window in columns
+                 (Shared.PageColumns). -->
             <Grid x:Name="ContactsDetailPageHost">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
             <!-- The contact's page; while a chat shows it beside itself, it lives there. -->
-            <StackPanel x:Name="SelectedContactPage" MaxWidth="560" HorizontalAlignment="Stretch" Spacing="24">
-              <!-- The contact's page, as the group's page: the picture and the name big in the
-                   middle, the status under them, a row of action tiles (owner, 2026-10-11: «как в
-                   Telegram»; it was a 64 avatar left and a column of wide buttons right). -->
-              <StackPanel x:Name="SelectedContactHeaderGrid" HorizontalAlignment="Stretch" Spacing="0">
-                <shared:AvatarView x:Name="SelectedContactAvatar" HorizontalAlignment="Center" PictureTitle="{x:Bind SelectedContactTitleTextBlock.Text, Mode=OneWay}" Size="96" />
-                <TextBlock
-                  x:Name="SelectedContactTitleTextBlock"
-                  Margin="0,14,0,0"
-                  HorizontalAlignment="Center"
-                  AutomationProperties.AutomationId="SelectedContactTitleTextBlock"
-                  FontSize="24"
-                  FontWeight="SemiBold"
-                  Text="Карточка контакта"
-                  TextAlignment="Center"
-                  TextWrapping="WrapWholeWords" />
-                <TextBlock
-                  x:Name="SelectedContactSubtitleTextBlock"
-                  Margin="0,4,0,0"
-                  HorizontalAlignment="Center"
-                  AutomationProperties.AutomationId="SelectedContactSubtitleTextBlock"
-                  FontSize="13"
-                  Opacity="0.7"
-                  Text="Выберите контакт слева."
-                  TextAlignment="Center"
-                  TextWrapping="WrapWholeWords" />
-                <!-- Tiles, the same as on a group's page. -->
+            <StackPanel x:Name="SelectedContactPage" HorizontalAlignment="Stretch" Spacing="20">
+              <!-- The contact's page opens with the same header as everything else (docs/decisions/
+                   omni-app-ux.md §4): the avatar, the name and the status line under it, the main
+                   action as a button and the rest as icons at the right — as a chat's header. The
+                   centred card with tiles was the only page built that way (owner, 2026-11-03: «Контакты
+                   так, а всё остальное по другому… нет ощущения целостности»). Narrow (the page beside
+                   a chat), the actions go under the name (ContactsSectionControl.ReflowContactHeader). -->
+              <Grid x:Name="SelectedContactHeaderGrid" ColumnSpacing="14" RowSpacing="10" SizeChanged="ReflowContactHeader">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <shared:AvatarView x:Name="SelectedContactAvatar" VerticalAlignment="Center" PictureTitle="{x:Bind SelectedContactTitleTextBlock.Text, Mode=OneWay}" Size="56" />
+                <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                  <TextBlock
+                    x:Name="SelectedContactTitleTextBlock"
+                    AutomationProperties.AutomationId="SelectedContactTitleTextBlock"
+                    FontSize="20"
+                    FontWeight="SemiBold"
+                    Text="Карточка контакта"
+                    TextTrimming="CharacterEllipsis" />
+                  <TextBlock
+                    x:Name="SelectedContactSubtitleTextBlock"
+                    AutomationProperties.AutomationId="SelectedContactSubtitleTextBlock"
+                    FontSize="13"
+                    Opacity="0.7"
+                    Text="Выберите контакт слева."
+                    TextWrapping="WrapWholeWords" />
+                </StackPanel>
                 <StackPanel
                   x:Name="SelectedContactActionPanel"
-                  Margin="0,20,0,0"
-                  HorizontalAlignment="Center"
+                  Grid.Column="2"
+                  VerticalAlignment="Center"
                   Orientation="Horizontal"
                   Spacing="8">
                   <Button
                     x:Name="OpenContactChatButton"
-                    Width="96"
                     AutomationProperties.AutomationId="OpenContactChatButton"
                     AutomationProperties.Name="Написать"
-                    Style="{StaticResource ActionTileButtonStyle}">
-                    <StackPanel Spacing="4">
-                      <FontIcon FontSize="18" Glyph="&#xE8BD;" />
-                      <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Написать" />
-                    </StackPanel>
-                  </Button>
+                    Content="Написать"
+                    Style="{StaticResource AccentActionButtonStyle}" />
                   <Button
                     x:Name="StartSelectedContactCallButton"
-                    Width="96"
                     AutomationProperties.AutomationId="StartSelectedContactCallButton"
                     AutomationProperties.Name="Позвонить"
-                    Style="{StaticResource ActionTileButtonStyle}">
-                    <StackPanel Spacing="4">
-                      <FontIcon FontSize="18" Glyph="&#xE717;" />
-                      <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Позвонить" />
-                    </StackPanel>
+                    Style="{StaticResource GhostIconButtonStyle}"
+                    ToolTipService.ToolTip="Позвонить">
+                    <FontIcon FontSize="16" Glyph="&#xE717;" />
                   </Button>
                   <Button
                     x:Name="StartSelectedContactRemoteControlButton"
-                    Width="96"
                     AutomationProperties.AutomationId="StartSelectedContactRemoteControlButton"
                     AutomationProperties.Name="Управлять компьютером"
-                    Style="{StaticResource ActionTileButtonStyle}"
+                    Style="{StaticResource GhostIconButtonStyle}"
                     ToolTipService.ToolTip="Управлять компьютером"
                     Visibility="Collapsed">
-                    <StackPanel Spacing="4">
-                      <FontIcon FontSize="18" Glyph="&#xE7F8;" />
-                      <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Управлять" />
-                    </StackPanel>
+                    <FontIcon FontSize="16" Glyph="&#xE7F8;" />
                   </Button>
                   <Button
                     x:Name="ContactActionsButton"
-                    Width="96"
                     AutomationProperties.AutomationId="ContactActionsButton"
                     AutomationProperties.Name="Ещё действия"
-                    Style="{StaticResource ActionTileButtonStyle}">
-                    <StackPanel Spacing="4">
-                      <FontIcon FontSize="18" Glyph="&#xE712;" />
-                      <TextBlock HorizontalAlignment="Center" FontSize="12" Text="Ещё" />
-                    </StackPanel>
+                    Style="{StaticResource GhostIconButtonStyle}"
+                    ToolTipService.ToolTip="Ещё действия">
+                    <FontIcon FontSize="16" Glyph="&#xE712;" />
                   </Button>
                 </StackPanel>
-              </StackPanel>
+              </Grid>
 
               <!-- The rest as Telegram's profile: rows — an icon, the value, a small caption under
                    it, the action at the right of the same row. No grey section titles over
                    paragraphs (owner, 2026-10-11: «так себе выглядит» — the top was new, the bottom
                    the old card). -->
               <StackPanel x:Name="SelectedContactDetailBody" Spacing="0" BorderBrush="{ThemeResource OmniStrokeBrush}" BorderThickness="0,1,0,0" Padding="0,8,0,0">
+<shared:PageColumns ColumnGap="40" EachChild="True">
                 <!-- Connection: the state; the path and the trace are one click away. -->
                 <Grid x:Name="SelectedContactConnectionRow" Padding="0,12" ColumnSpacing="16" Visibility="Collapsed">
                   <Grid.ColumnDefinitions>
@@ -321,6 +320,13 @@
                       AutomationProperties.AutomationId="SelectedContactConnectionTextBlock"
                       Text=""
                       TextWrapping="WrapWholeWords"
+                      Visibility="Collapsed" />
+                    <!-- V-13: the contact meets through its own server; used only once allowed here. -->
+                    <Button
+                      x:Name="SelectedContactAllowCourierButton"
+                      AutomationProperties.AutomationId="SelectedContactAllowCourierButton"
+                      Margin="0,4,0,4"
+                      Content="Разрешить встречу через его сервер"
                       Visibility="Collapsed" />
                     <TextBlock FontSize="12" Opacity="0.6" Text="Соединение" />
                     <Expander
@@ -399,7 +405,7 @@
                     <TextBlock
                       FontSize="12.5"
                       TextWrapping="WrapWholeWords"
-                      Text="1. Попросите собеседника открыть у себя «Диагностика → Данные для проверки» и прислать этот текст другим путём — лично, по телефону, в другом мессенджере." />
+                      Text="1. Попросите собеседника открыть у себя «Помощь → Инструменты» и прислать этот текст другим путём — лично, по телефону, в другом мессенджере." />
                     <TextBlock
                       FontSize="12.5"
                       TextWrapping="WrapWholeWords"
@@ -529,7 +535,8 @@
                   FontSize="12.5"
                   Opacity="0.85"
                   TextWrapping="WrapWholeWords" />
-              </StackPanel>
+              </shared:PageColumns>
+</StackPanel>
             </StackPanel>
             </Grid>
           </ScrollViewer>
@@ -538,7 +545,7 @@
                pane said «Контактов пока нет»). Rows as in Settings; the list stays on the left. -->
           <Border x:Name="ContactsAddPanel" Visibility="Collapsed">
             <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollMode="Disabled">
-              <StackPanel MaxWidth="680" HorizontalAlignment="Left" Padding="0,0,0,32">
+              <shared:PageColumns Margin="0,0,0,32">
                 <TextBlock Style="{StaticResource PageTitleTextStyle}" Text="Добавить контакт" />
 
                 <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Новый друг" />
@@ -587,33 +594,38 @@
                   </shared:SettingRow.Details>
                 </shared:SettingRow>
 
-                <TextBlock Style="{StaticResource SettingGroupTitleTextStyle}" Text="Друг уже в контактах, но не находится" />
-                <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Обменяйтесь кодами связи: в коде — ваши текущие адреса для прямого подключения. Действует, пока не сменится сеть." />
-                <shared:SettingRow Header="Ваш код связи">
-                  <Button x:Name="GenerateReachTokenButton" AutomationProperties.AutomationId="GenerateReachTokenButton" Content="Показать" />
-                  <shared:SettingRow.Details>
-                    <Grid ColumnSpacing="8">
-                      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                      <TextBox x:Name="GeneratedReachTokenTextBox" AutomationProperties.AutomationId="GeneratedReachTokenTextBox" FontFamily="Consolas" FontSize="12" IsReadOnly="True" MaxHeight="80" PlaceholderText="Нажмите «Показать»" TextWrapping="Wrap" />
-                      <Button x:Name="CopyReachTokenButton" Grid.Column="1" VerticalAlignment="Top" AutomationProperties.AutomationId="CopyReachTokenButton" Content="Копировать" />
-                    </Grid>
-                  </shared:SettingRow.Details>
-                </shared:SettingRow>
-                <shared:SettingRow Header="Код друга">
-                  <shared:SettingRow.Details>
-                    <StackPanel Spacing="6">
-                      <Grid ColumnSpacing="8">
-                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                        <TextBox x:Name="ImportReachTokenTextBox" FontFamily="Consolas" FontSize="12" MaxHeight="80" PlaceholderText="om3reach:…" TextWrapping="Wrap" />
-                        <Button x:Name="DialReachTokenButton" Grid.Column="1" VerticalAlignment="Top" AutomationProperties.AutomationId="DialReachTokenButton" Content="Подключиться" />
-                      </Grid>
-                      <TextBlock x:Name="ReachTokenStatusTextBlock" AutomationProperties.AutomationId="ReachTokenStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
-                    </StackPanel>
-                  </shared:SettingRow.Details>
-                </shared:SettingRow>
+                <!-- Not a way to add someone: repair for a contact already here (docs/decisions/omni-app-ux.md —
+                     the newcomer met four ways at once and did not know which was theirs). Folded. -->
+                <Expander x:Name="ContactsReachCodesExpander" Tag="page-group" Margin="0,24,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Друг уже в контактах, но не находится">
+                  <StackPanel Spacing="4">
+                    <TextBlock Style="{StaticResource SettingCaptionTextStyle}" Text="Обменяйтесь кодами связи: в коде — ваши текущие адреса для прямого подключения. Действует, пока не сменится сеть." />
+                    <shared:SettingRow Header="Ваш код связи">
+                      <Button x:Name="GenerateReachTokenButton" AutomationProperties.AutomationId="GenerateReachTokenButton" Content="Показать" />
+                      <shared:SettingRow.Details>
+                        <Grid ColumnSpacing="8">
+                          <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                          <TextBox x:Name="GeneratedReachTokenTextBox" AutomationProperties.AutomationId="GeneratedReachTokenTextBox" FontFamily="Consolas" FontSize="12" IsReadOnly="True" MaxHeight="80" PlaceholderText="Нажмите «Показать»" TextWrapping="Wrap" />
+                          <Button x:Name="CopyReachTokenButton" Grid.Column="1" VerticalAlignment="Top" AutomationProperties.AutomationId="CopyReachTokenButton" Content="Копировать" />
+                        </Grid>
+                      </shared:SettingRow.Details>
+                    </shared:SettingRow>
+                    <shared:SettingRow Header="Код друга">
+                      <shared:SettingRow.Details>
+                        <StackPanel Spacing="6">
+                          <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <TextBox x:Name="ImportReachTokenTextBox" FontFamily="Consolas" FontSize="12" MaxHeight="80" PlaceholderText="om3reach:…" TextWrapping="Wrap" />
+                            <Button x:Name="DialReachTokenButton" Grid.Column="1" VerticalAlignment="Top" AutomationProperties.AutomationId="DialReachTokenButton" Content="Подключиться" />
+                          </Grid>
+                          <TextBlock x:Name="ReachTokenStatusTextBlock" AutomationProperties.AutomationId="ReachTokenStatusTextBlock" Style="{StaticResource SettingCaptionTextStyle}" />
+                        </StackPanel>
+                      </shared:SettingRow.Details>
+                    </shared:SettingRow>
+                  </StackPanel>
+                </Expander>
 
                 <!-- Rare and manual ways, folded. -->
-                <Expander Margin="0,24,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Другие способы">
+                <Expander Margin="0,8,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="Другие способы">
                   <StackPanel Spacing="4">
                     <shared:SettingRow Header="Сохранить собеседника открытого чата">
                       <shared:SettingRow.Details>
@@ -624,32 +636,22 @@
                         </Grid>
                       </shared:SettingRow.Details>
                     </shared:SettingRow>
-                    <shared:SettingRow Header="По ID аккаунта" Description="acct-… и имя, под которым он будет у вас.">
-                      <shared:SettingRow.Details>
-                        <StackPanel Spacing="8">
-                          <TextBox x:Name="AddContactIdentifierTextBox" FontFamily="Consolas" PlaceholderText="acct-…" />
-                          <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                            <TextBox x:Name="AddContactPetnameTextBox" PlaceholderText="Ваше имя для него" />
-                            <TextBox x:Name="AddContactDisplayNameTextBox" MaxLength="64" Grid.Column="1" PlaceholderText="Его имя (необязательно)" />
-                            <Button x:Name="AddContactByIdentifierButton" Grid.Column="2" AutomationProperties.AutomationId="AddContactByIdentifierButton" Content="Добавить" />
-                          </Grid>
-                        </StackPanel>
-                      </shared:SettingRow.Details>
-                    </shared:SettingRow>
                     <shared:SettingRow Header="По данным контакта" Description="Для ручного обмена: вставьте данные, которые вам передали.">
                       <shared:SettingRow.Details>
-                        <Grid ColumnSpacing="8">
-                          <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <StackPanel Spacing="8">
                           <TextBox x:Name="AddContactPayloadTextBox" AcceptsReturn="True" AutomationProperties.AutomationId="AddContactPayloadTextBox" FontFamily="Consolas" FontSize="12" MinHeight="80" PlaceholderText="Данные контакта" TextWrapping="Wrap" />
-                          <Button x:Name="AddContactFromPayloadButton" Grid.Column="1" VerticalAlignment="Top" AutomationProperties.AutomationId="AddContactFromPayloadButton" Content="Добавить" />
-                        </Grid>
+                          <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <TextBox x:Name="AddContactPetnameTextBox" AutomationProperties.AutomationId="AddContactPetnameTextBox" PlaceholderText="Как его назвать" />
+                            <Button x:Name="AddContactFromPayloadButton" Grid.Column="1" AutomationProperties.AutomationId="AddContactFromPayloadButton" Content="Добавить" />
+                          </Grid>
+                        </StackPanel>
                       </shared:SettingRow.Details>
                     </shared:SettingRow>
                   </StackPanel>
                 </Expander>
                 <TextBlock x:Name="ContactsStatusTextBlock" Margin="0,12,0,0" AutomationProperties.AutomationId="ContactsStatusTextBlock" TextWrapping="WrapWholeWords" />
-              </StackPanel>
+              </shared:PageColumns>
             </ScrollViewer>
           </Border>
         </Grid>

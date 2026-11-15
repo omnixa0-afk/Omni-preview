@@ -323,6 +323,42 @@ pub struct DhtProxyRequestFrame {
     pub value: Vec<u8>,
     /// TTL, decremented per hop (loop/flood bound). 0 ⇒ don't forward onward.
     pub hop_limit: u8,
+    /// The requester's public key and its signature over everything but `hop_limit` (which every
+    /// hop lowers). Who may use a proxy is decided by `from` — our own devices and approved
+    /// contacts — so `from` must be proven, not just stated, even many hops away (V-20).
+    pub signature: Vec<u8>,
+}
+
+/// Domain separator of the DHT-proxy request signature.
+const DHT_PROXY_SIGNATURE_DOMAIN: &[u8] = b"omni-dht-proxy-v1";
+
+impl DhtProxyRequestFrame {
+    fn signing_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(
+            DHT_PROXY_SIGNATURE_DOMAIN.len() + 20 + 20 + 8 + 1 + 32 + 1 + self.salt.len() + 2 + self.value.len(),
+        );
+        payload.extend_from_slice(DHT_PROXY_SIGNATURE_DOMAIN);
+        payload.extend_from_slice(self.from.as_bytes());
+        payload.extend_from_slice(self.to.as_bytes());
+        payload.extend_from_slice(&self.req_id.to_be_bytes());
+        payload.push(self.op.to_tag());
+        payload.extend_from_slice(&self.key);
+        payload.push(self.salt.len() as u8);
+        payload.extend_from_slice(&self.salt);
+        payload.extend_from_slice(&(self.value.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&self.value);
+        payload
+    }
+
+    /// Sign the request as its origin. `key` must be the identity `from` names.
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) {
+        self.signature = origin_signature(key, &self.signing_payload());
+    }
+
+    /// Whether the request was signed by the node it claims to come from and is unaltered.
+    pub fn verify(&self) -> bool {
+        origin_signature_valid(&self.from, &self.signature, &self.signing_payload())
+    }
 }
 
 /// Reply to a `DhtProxyRequest` — the BEP44 result, routed back toward the requester (`to`).
@@ -434,6 +470,34 @@ pub struct PathRequestFrame {
     pub nonce: u64,
     /// TTL, decremented per hop (loop/flood bound). 0 ⇒ don't re-broadcast.
     pub hop_limit: u8,
+    /// `origin`'s key ‖ its signature over origin, target and nonce ([`DURABLE_SIGNATURE_BYTES`]).
+    /// A relay files the reverse route to `origin` only for a request `origin` really sent (V-07):
+    /// before, any verified neighbour could name itself the way to a node we had no route to. The
+    /// hop limit is outside it — each relay takes one off.
+    pub signature: Vec<u8>,
+}
+
+const PATH_REQUEST_SIGNATURE_DOMAIN: &[u8] = b"omni-path-request-v1";
+
+impl PathRequestFrame {
+    fn signing_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(PATH_REQUEST_SIGNATURE_DOMAIN.len() + 20 + 20 + 8);
+        payload.extend_from_slice(PATH_REQUEST_SIGNATURE_DOMAIN);
+        payload.extend_from_slice(self.origin.as_bytes());
+        payload.extend_from_slice(self.target.as_bytes());
+        payload.extend_from_slice(&self.nonce.to_be_bytes());
+        payload
+    }
+
+    /// Sign as `origin` (whose key `key` is).
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) {
+        self.signature = origin_signature(key, &self.signing_payload());
+    }
+
+    /// Whether `origin` itself sent this request (target and nonce unaltered).
+    pub fn verify(&self) -> bool {
+        origin_signature_valid(&self.origin, &self.signature, &self.signing_payload())
+    }
 }
 
 /// Reactive path-discovery reply (R3): the answerer can reach `target` at `cost` hops. Routed back
@@ -466,21 +530,92 @@ pub struct DurableDataFrame {
     pub feed_id: FeedId,
     pub seq: u64,
     pub msg_id: u64,
+    /// How long the frame lives, counted from `sent_at_unix_secs` (holders cap it, see
+    /// `Network::durable_lifetime`).
     pub ttl_secs: u32,
+    /// When the origin sent the frame (unix seconds). Signed with the rest, so a holder cannot
+    /// reset a frame's age and every holder lets it expire at the same moment.
+    pub sent_at_unix_secs: u64,
     pub ciphertext: Vec<u8>,
-    /// Signature over the envelope+ciphertext by `from` (so a relay can't forge).
-    /// Carried opaquely here; produce/verify wiring is a later durable increment.
+    /// `from`'s public key (32) ‖ its Ed25519 signature (64) over the envelope and the ciphertext
+    /// ([`DurableDataFrame::sign`]). The key must hash to `from`, so a relay or a neighbour can
+    /// neither forge a frame under someone else's address nor alter one it carries (V-05).
     pub signature: Vec<u8>,
 }
 
+/// Domain separator of the durable-frame signature.
+const DURABLE_SIGNATURE_DOMAIN: &[u8] = b"omni-durable-v1";
+
+/// Length of [`DurableDataFrame::signature`]: public key + signature.
+pub const DURABLE_SIGNATURE_BYTES: usize = 32 + 64;
+
+impl DurableDataFrame {
+    /// What the signature covers: every field a storer could otherwise rewrite — the routing
+    /// envelope (to, from, feed, seq, msg_id, ttl, send time) and the ciphertext.
+    fn signing_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(
+            DURABLE_SIGNATURE_DOMAIN.len() + 20 + 20 + 16 + 8 + 8 + 4 + 8 + self.ciphertext.len(),
+        );
+        payload.extend_from_slice(DURABLE_SIGNATURE_DOMAIN);
+        payload.extend_from_slice(self.to.as_bytes());
+        payload.extend_from_slice(self.from.as_bytes());
+        payload.extend_from_slice(&self.feed_id);
+        payload.extend_from_slice(&self.seq.to_be_bytes());
+        payload.extend_from_slice(&self.msg_id.to_be_bytes());
+        payload.extend_from_slice(&self.ttl_secs.to_be_bytes());
+        payload.extend_from_slice(&self.sent_at_unix_secs.to_be_bytes());
+        payload.extend_from_slice(&self.ciphertext);
+        payload
+    }
+
+    /// Sign the frame as its origin. `key` must be the identity `from` names.
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) {
+        self.signature = origin_signature(key, &self.signing_payload());
+    }
+
+    /// Whether the frame was signed by the node it claims to come from and is unaltered.
+    pub fn verify(&self) -> bool {
+        origin_signature_valid(&self.from, &self.signature, &self.signing_payload())
+    }
+}
+
+/// An origin's signature of a routed frame: its public key and the signature over `payload`
+/// ([`DURABLE_SIGNATURE_BYTES`] long).
+fn origin_signature(key: &ed25519_dalek::SigningKey, payload: &[u8]) -> Vec<u8> {
+    use ed25519_dalek::Signer as _;
+    let signature = key.sign(payload);
+    let mut bytes = Vec::with_capacity(DURABLE_SIGNATURE_BYTES);
+    bytes.extend_from_slice(key.verifying_key().as_bytes());
+    bytes.extend_from_slice(&signature.to_bytes());
+    bytes
+}
+
+/// Whether `signature` is `from`'s own over `payload`: the key in it is the one `from` is derived
+/// from, and the signature holds.
+fn origin_signature_valid(from: &NodeAddress, signature: &[u8], payload: &[u8]) -> bool {
+    if signature.len() != DURABLE_SIGNATURE_BYTES {
+        return false;
+    }
+    let (key, signature) = signature.split_at(32);
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(key.try_into().expect("32 bytes")) else {
+        return false;
+    };
+    if !from.verify_for_pubkey(&key) {
+        return false;
+    }
+    let signature = ed25519_dalek::Signature::from_bytes(signature.try_into().expect("64 bytes"));
+    key.verify_strict(payload, &signature).is_ok()
+}
+
 /// Anti-entropy `have`: a node's high-water vector `{feed → highest contiguous seq}`,
-/// plus the destinations it is INTERESTED in (subscribed group dests + its own address).
+/// plus the destinations it is INTERESTED in: its own address and, for each group it is in, a
+/// token blinded for this pair of nodes (`Network::own_interests_for`).
 ///
-/// `interests` is what lets a store-and-forward relay scope its offers WITHOUT leaking: a
-/// relay can't map an opaque `feed_id` (a per-sender hash) back to a destination, so a member
-/// must name the destinations it wants; the relay then offers only frames for those dests (plus
-/// what it forwards for). This replaces "offer everything to everyone", which broadcast the full
-/// feed inventory to untrusted route-candidates. See docs/decisions/anti-entropy-have-scoping.md.
+/// A holder that is in the group itself offers its frames only to peers that want them; the token
+/// tells it this peer does, and tells a neighbour outside the group nothing (it differs for every
+/// pair, so it can't be matched with other members). This replaces "offer everything to everyone",
+/// which broadcast the full feed inventory to untrusted route-candidates. See
+/// docs/decisions/anti-entropy-have-scoping.md.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AntiEntropyHaveFrame {
     pub marks: Vec<(FeedId, u64)>,
@@ -708,12 +843,13 @@ impl NetworkFrame {
             NetworkFrame::Ping => vec![FrameKind::Ping as u8],
             NetworkFrame::Pong => vec![FrameKind::Pong as u8],
             NetworkFrame::PathRequest(req) => {
-                let mut buf = Vec::with_capacity(1 + 20 + 20 + 8 + 1);
+                let mut buf = Vec::with_capacity(1 + 20 + 20 + 8 + 1 + req.signature.len());
                 buf.push(FrameKind::PathRequest as u8);
                 buf.extend_from_slice(req.origin.as_bytes());
                 buf.extend_from_slice(req.target.as_bytes());
                 buf.extend_from_slice(&req.nonce.to_be_bytes());
                 buf.push(req.hop_limit);
+                buf.extend_from_slice(&req.signature);
                 buf
             }
             NetworkFrame::PathReply(rep) => {
@@ -743,10 +879,11 @@ impl NetworkFrame {
                 buf.push(p.hop_limit);
                 buf
             }
-            // [from 20][to 20][req_id 8][op 1][hop_limit 1][key 32][salt_len 1][salt][value_len 2][value]
+            // [from 20][to 20][req_id 8][op 1][hop_limit 1][key 32][salt_len 1][salt][value_len 2][value][signature 96]
             NetworkFrame::DhtProxyRequest(r) => {
-                let mut buf =
-                    Vec::with_capacity(1 + 20 + 20 + 8 + 1 + 1 + 32 + 1 + r.salt.len() + 2 + r.value.len());
+                let mut buf = Vec::with_capacity(
+                    1 + 20 + 20 + 8 + 1 + 1 + 32 + 1 + r.salt.len() + 2 + r.value.len() + r.signature.len(),
+                );
                 buf.push(FrameKind::DhtProxyRequest as u8);
                 buf.extend_from_slice(r.from.as_bytes());
                 buf.extend_from_slice(r.to.as_bytes());
@@ -758,6 +895,7 @@ impl NetworkFrame {
                 buf.extend_from_slice(&r.salt);
                 buf.extend_from_slice(&(r.value.len() as u16).to_be_bytes());
                 buf.extend_from_slice(&r.value);
+                buf.extend_from_slice(&r.signature);
                 buf
             }
             // [from 20][to 20][req_id 8][ok 1][hop_limit 1][value_len 2][value]
@@ -820,7 +958,7 @@ impl NetworkFrame {
             }
             NetworkFrame::DurableData(d) => {
                 let mut buf = Vec::with_capacity(
-                    1 + 20 + 20 + 16 + 8 + 8 + 4 + 4 + d.ciphertext.len() + 2 + d.signature.len(),
+                    1 + 20 + 20 + 16 + 8 + 8 + 4 + 8 + 4 + d.ciphertext.len() + 2 + d.signature.len(),
                 );
                 buf.push(FrameKind::DurableData as u8);
                 buf.extend_from_slice(d.to.as_bytes());
@@ -829,6 +967,7 @@ impl NetworkFrame {
                 buf.extend_from_slice(&d.seq.to_be_bytes());
                 buf.extend_from_slice(&d.msg_id.to_be_bytes());
                 buf.extend_from_slice(&d.ttl_secs.to_be_bytes());
+                buf.extend_from_slice(&d.sent_at_unix_secs.to_be_bytes());
                 buf.extend_from_slice(&(d.ciphertext.len() as u32).to_be_bytes());
                 buf.extend_from_slice(&d.ciphertext);
                 buf.extend_from_slice(&(d.signature.len() as u16).to_be_bytes());
@@ -1064,7 +1203,7 @@ impl NetworkFrame {
             FrameKind::Ping => Ok(NetworkFrame::Ping),
             FrameKind::Pong => Ok(NetworkFrame::Pong),
             FrameKind::PathRequest => {
-                if body.len() != 20 + 20 + 8 + 1 {
+                if body.len() != 20 + 20 + 8 + 1 + DURABLE_SIGNATURE_BYTES {
                     return Err(NetworkFrameError::BodyLength("PathRequest", body.len()));
                 }
                 let mut origin = [0u8; 20];
@@ -1078,6 +1217,7 @@ impl NetworkFrame {
                     target: NodeAddress::from_bytes(target),
                     nonce,
                     hop_limit,
+                    signature: body[49..].to_vec(),
                 }))
             }
             FrameKind::PathReply => {
@@ -1121,7 +1261,7 @@ impl NetworkFrame {
                 }
             }
             FrameKind::DhtProxyRequest => {
-                // [from 20][to 20][req_id 8][op 1][hop_limit 1][key 32][salt_len 1][salt][value_len 2][value]
+                // [from 20][to 20][req_id 8][op 1][hop_limit 1][key 32][salt_len 1][salt][value_len 2][value][signature 96]
                 const HEADER: usize = 20 + 20 + 8 + 1 + 1 + 32 + 1; // through salt_len
                 if body.len() < HEADER {
                     return Err(NetworkFrameError::BodyLength("DhtProxyRequest", body.len()));
@@ -1158,13 +1298,14 @@ impl NetworkFrame {
                 if value_len > DHT_PROXY_MAX_VALUE {
                     return Err(NetworkFrameError::BodyLength("DhtProxyRequest value", value_len));
                 }
-                if body.len() != off + value_len {
+                if body.len() != off + value_len + DURABLE_SIGNATURE_BYTES {
                     return Err(NetworkFrameError::BodyLength(
                         "DhtProxyRequest length mismatch",
                         body.len(),
                     ));
                 }
-                let value = body[off..].to_vec();
+                let value = body[off..off + value_len].to_vec();
+                let signature = body[off + value_len..].to_vec();
                 Ok(NetworkFrame::DhtProxyRequest(DhtProxyRequestFrame {
                     from: NodeAddress::from_bytes(from),
                     to: NodeAddress::from_bytes(to),
@@ -1174,6 +1315,7 @@ impl NetworkFrame {
                     salt,
                     value,
                     hop_limit,
+                    signature,
                 }))
             }
             FrameKind::DhtProxyResponse => {
@@ -1282,8 +1424,9 @@ impl NetworkFrame {
                 Ok(NetworkFrame::DhtBootResp(DhtBootRespFrame { req_id, nodes }))
             }
             FrameKind::DurableData => {
-                // [to 20][from 20][feed 16][seq 8][msg_id 8][ttl 4][clen 4][ciphertext][slen 2][sig]
-                const HEADER: usize = 20 + 20 + 16 + 8 + 8 + 4 + 4;
+                // [to 20][from 20][feed 16][seq 8][msg_id 8][ttl 4][sent_at 8][clen 4][ciphertext]
+                // [slen 2][sig]
+                const HEADER: usize = 20 + 20 + 16 + 8 + 8 + 4 + 8 + 4;
                 if body.len() < HEADER {
                     return Err(NetworkFrameError::BodyLength("DurableData", body.len()));
                 }
@@ -1303,6 +1446,8 @@ impl NetworkFrame {
                 off += 8;
                 let ttl_secs = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
                 off += 4;
+                let sent_at_unix_secs = u64::from_be_bytes(body[off..off + 8].try_into().unwrap());
+                off += 8;
                 let clen = u32::from_be_bytes(body[off..off + 4].try_into().unwrap()) as usize;
                 off += 4;
                 if clen > MAX_DATA_PAYLOAD {
@@ -1326,6 +1471,7 @@ impl NetworkFrame {
                     seq,
                     msg_id,
                     ttl_secs,
+                    sent_at_unix_secs,
                     ciphertext,
                     signature,
                 }))
@@ -1574,6 +1720,7 @@ mod tests {
             salt: b"0".to_vec(),
             value: b"sealed-beacon-bytes".to_vec(),
             hop_limit: 6,
+            signature: vec![0xC3; DURABLE_SIGNATURE_BYTES],
         });
         let bytes = put.encode_to_wire();
         assert_eq!(bytes[0], FrameKind::DhtProxyRequest as u8);
@@ -1589,6 +1736,7 @@ mod tests {
             salt: b"1".to_vec(),
             value: Vec::new(),
             hop_limit: 6,
+            signature: vec![0x3C; DURABLE_SIGNATURE_BYTES],
         });
         assert_eq!(NetworkFrame::decode_from_wire(&get.encode_to_wire()).unwrap(), get);
 
@@ -1732,7 +1880,7 @@ mod tests {
     fn challenge_response_frame_round_trip() {
         let responder_key = fresh_key();
         let nonce = fresh_challenge_nonce();
-        let response = respond_to_challenge(&responder_key, &nonce);
+        let response = respond_to_challenge(&responder_key, &nonce, &[0u8; crate::cert::CHANNEL_BINDING_BYTES]);
 
         let frame_resp = NetworkFrame::ChallengeResponse(ChallengeResponseFrame {
             nonce,
@@ -1769,17 +1917,24 @@ mod tests {
 
     #[test]
     fn path_request_and_reply_round_trip() {
-        let origin = fresh_addr();
+        let origin_key = fresh_key();
+        let origin = NodeAddress::from_pubkey(&origin_key.verifying_key());
         let target = fresh_addr();
-        let req = NetworkFrame::PathRequest(PathRequestFrame {
-            origin,
-            target,
-            nonce: 0xDEAD_BEEF,
-            hop_limit: 4,
-        });
+        let mut signed = PathRequestFrame { origin, target, nonce: 0xDEAD_BEEF, hop_limit: 4, signature: vec![] };
+        signed.sign(&origin_key);
+        let req = NetworkFrame::PathRequest(signed.clone());
         let wire = req.encode_to_wire();
         assert_eq!(wire[0], FrameKind::PathRequest as u8);
         assert_eq!(NetworkFrame::decode_from_wire(&wire).unwrap(), req);
+        assert!(signed.verify(), "signed by its origin");
+        let relayed = PathRequestFrame { hop_limit: 3, ..signed.clone() };
+        assert!(relayed.verify(), "a relay taking a hop off keeps it valid");
+        let retargeted = PathRequestFrame { target: fresh_addr(), ..signed.clone() };
+        assert!(!retargeted.verify(), "another target is not what the origin asked");
+        let mut forged = PathRequestFrame { origin: fresh_addr(), ..signed.clone() };
+        assert!(!forged.verify(), "someone else's signature does not make it theirs");
+        forged.sign(&fresh_key());
+        assert!(!forged.verify(), "nor a key that is not the origin's");
 
         let rep = NetworkFrame::PathReply(PathReplyFrame {
             origin,
@@ -1995,12 +2150,58 @@ mod tests {
             seq: 42,
             msg_id: 0xCAFE_F00D_1234_5678,
             ttl_secs: 3600,
+            sent_at_unix_secs: 1_700_000_000,
             ciphertext: vec![1, 2, 3, 4, 5],
             signature: vec![9u8; 64],
         });
         let wire = frame.encode_to_wire();
         assert_eq!(wire[0], FrameKind::DurableData as u8);
         assert_eq!(NetworkFrame::decode_from_wire(&wire).unwrap(), frame);
+    }
+
+    /// V-05: a durable frame verifies only signed by the node it names, and only unaltered.
+    #[test]
+    fn durable_signature_binds_origin_and_content() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let mut frame = DurableDataFrame {
+            to: fresh_addr(),
+            from: NodeAddress::from_pubkey(&key.verifying_key()),
+            feed_id: fd(1),
+            seq: 5,
+            msg_id: 9,
+            ttl_secs: 3600,
+            sent_at_unix_secs: 1_700_000_000,
+            ciphertext: vec![1, 2, 3],
+            signature: vec![],
+        };
+        assert!(!frame.verify(), "unsigned");
+        frame.sign(&key);
+        assert!(frame.verify());
+        let decoded = match NetworkFrame::decode_from_wire(
+            &NetworkFrame::DurableData(frame.clone()).encode_to_wire(),
+        )
+        .unwrap()
+        {
+            NetworkFrame::DurableData(d) => d,
+            other => panic!("{other:?}"),
+        };
+        assert!(decoded.verify(), "survives the wire");
+
+        for altered in [
+            DurableDataFrame { ciphertext: vec![1, 2, 4], ..frame.clone() },
+            DurableDataFrame { seq: 6, ..frame.clone() },
+            DurableDataFrame { ttl_secs: 7_200, ..frame.clone() },
+            DurableDataFrame { sent_at_unix_secs: 1_800_000_000, ..frame.clone() },
+            DurableDataFrame { to: fresh_addr(), ..frame.clone() },
+        ] {
+            assert!(!altered.verify(), "altered field must break the signature");
+        }
+
+        // A stranger signs with its own key but claims `from`: the key does not hash to it.
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let mut forged = frame.clone();
+        forged.sign(&stranger);
+        assert!(!forged.verify(), "foreign key under someone else's address");
     }
 
     #[test]
@@ -2012,6 +2213,7 @@ mod tests {
             seq: 1,
             msg_id: 1,
             ttl_secs: 0,
+            sent_at_unix_secs: 1_700_000_000,
             ciphertext: vec![],
             signature: vec![],
         });

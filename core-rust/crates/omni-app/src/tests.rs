@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    include!("tests_workspace_files.rs");
+    include!("tests_workspace_agents.rs");
     use std::fs::{self, File, OpenOptions};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -224,6 +226,36 @@ fn orphaned_call_session_self_heals_instead_of_resurrecting_unkillable() {
     assert!(matches!(hang_up_err, OmniError::InvalidInput(_)));
 }
 
+/// Blind audit 2026-11-13, pass 21: only the call inbox finalized a call row a dead process left
+/// going on; a chat header read first showed the call as live.
+#[test]
+fn chat_header_does_finalize_orphaned_call_after_restart() {
+    let app = create_app_with_active_profile(isolated_test_db_path("omni-orphaned-call-header", "alice"), "Alice", "Laptop");
+    let now = current_unix_ms();
+    let orphan = CallSummary {
+        call_id: "call-out-orphan".to_string(),
+        dialog_key: "dm:acct-orphan-peer".to_string(),
+        contact_id: None,
+        direction: CallDirection::Outgoing,
+        state: CallState::Active,
+        outcome: None,
+        decline_reason: None,
+        participants: Vec::new(),
+        local_mic_muted: false,
+        network_quality: None,
+        started_at_unix_ms: now - 60_000,
+        ringing_started_at_unix_ms: None,
+        connected_at_unix_ms: Some(now - 60_000),
+        ended_at_unix_ms: None,
+        reconnect_deadline_unix_ms: None,
+        updated_at_unix_ms: now - 60_000,
+        remote_control: None,
+    };
+    app.storage.upsert_call_session(&orphan).unwrap();
+    let shown = app.chat_header_call_summary("dm:acct-orphan-peer").unwrap().expect("the chat's last call");
+    assert_eq!((shown.call_id.as_str(), shown.state), ("call-out-orphan", CallState::Ended));
+}
+
 #[test]
 fn a_call_that_could_not_be_accepted_stays_ringing_instead_of_going_active() {
     // Живой двухмашинный прогон 2026-08-29, три раза подряд: принимающий брал трубку, уходил в
@@ -270,6 +302,7 @@ fn a_call_that_could_not_be_accepted_stays_ringing_instead_of_going_active() {
             remote_device_id: DeviceId("dev-unreachable-peer".to_string()),
             invite_expires_at_unix_ms: now + 60_000,
             invited_devices: Vec::new(),
+            media: Default::default(),
         }),
     )
     .expect("seed the live call runtime");
@@ -443,7 +476,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         let welcome = super::app_groups::add_invitee(&admin.storage, newcomer_dialog, &accept)
             .unwrap()
             .expect("an invited newcomer is added");
-        super::app_groups::join_from_welcome(&newcomer.storage, &newcomer.transport, &welcome).unwrap();
+        super::app_groups::join_from_welcome(&newcomer.storage, &newcomer.transport, "dialog:admin", &welcome).unwrap();
         // ...and is gone once we are in the group.
         assert!(newcomer.list_group_invites().unwrap().iter().all(|i| i.group_id != group_id));
     }
@@ -502,6 +535,799 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         (asking, server)
     }
 
+    /// V-15: a Welcome counts only from the one who invited us, and one that does not hold up for the
+    /// group — here a real Welcome into another group, under this group's id — leaves the group as it
+    /// was. Before, the group was deleted first and the Welcome opened after.
+    #[test]
+    fn a_welcome_from_anyone_but_the_inviter_or_into_another_group_leaves_the_group() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-welcome", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-welcome", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        // A real Welcome — but into another group of Alice's.
+        let other = alice.create_group("Другая").unwrap().group_id;
+        alice.storage.record_group_sent_invite(&other, "dialog:bob", 1).unwrap();
+        let accept = omni_protocol::GroupInviteAcceptV2 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            group_id: other.clone(),
+            key_package_b64: base64::engine::general_purpose::STANDARD
+                .encode(super::app_groups::own_key_package(&bob.storage).unwrap()),
+        };
+        let into_other = super::app_groups::add_invitee(&alice.storage, "dialog:bob", &accept).unwrap().unwrap();
+        let mislabelled = omni_protocol::GroupWelcomeV2 { group_id: gid.clone(), ..into_other };
+
+        super::app_groups::join_from_welcome(&bob.storage, &bob.transport, "dialog:mallory", &mislabelled).unwrap();
+        assert!(
+            super::app_groups::join_from_welcome(&bob.storage, &bob.transport, "dialog:admin", &mislabelled).is_err(),
+            "a Welcome into another group is refused"
+        );
+        alice.send_group_text(&gid, "всё ещё здесь").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        assert!(bob.list_group_messages(&gid).unwrap().iter().any(|m| m.body == "всё ещё здесь"), "bob is still in");
+    }
+
+    /// Deleting in a group: for everyone only one's own line; someone else's goes only here; a tombstone
+    /// keeps a late copy out.
+    #[test]
+    fn group_line_goes_from_everyone_only_by_its_author() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-delete", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-delete", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        alice.send_group_text(&gid, "её").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        bob.send_group_text(&gid, "его").unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        let id_of = |app: &OmniApp, body: &str| app.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == body).map(|m| m.message_id);
+        let hers = id_of(&bob, "её").unwrap();
+        let his = id_of(&bob, "его").unwrap();
+
+        bob.delete_message(&hers, true).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        assert!(id_of(&bob, "её").is_none(), "gone here");
+        assert!(id_of(&alice, "её").is_some(), "not his to take from her");
+
+        bob.delete_message(&his, true).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        assert!(id_of(&bob, "его").is_none());
+        assert!(id_of(&alice, "его").is_none(), "his own line goes from everyone");
+        assert!(alice.storage.message_is_deleted(&his).unwrap(), "and stays out");
+    }
+
+    /// A member who knew a line's id deleted it at someone the line had not reached yet: that used to
+    /// stand as a tombstone, and the line never came. Now the deletion waits for the line and takes it
+    /// only if its author asked (audit 2026-11-09, F07).
+    #[test]
+    fn a_deletion_before_the_line_takes_it_only_from_its_author() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-early-delete", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-early-delete", "bob"), "Bob", "Laptop");
+        let carol = create_app_with_active_profile(isolated_test_db_path("omni-groups-early-delete", "carol"), "Carol", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        group_join_for_real(&alice, &carol, &gid, "dialog:carol");
+        deliver_group_feed(&alice, &[&bob, &carol]);
+        let dialog = format!("group:{gid}");
+        let card_of = |app: &OmniApp| omni_group_mls::MemberCard {
+            member_pub: app.storage.get_group(&gid).unwrap().unwrap().my_member_pub,
+            account_id: app.storage.get_local_account().unwrap().unwrap().descriptor.account_id.0,
+            display_name: String::new(),
+            device_chain: String::new(),
+        };
+        let delete_from = |id: &str| omni_protocol::GroupAppPayloadV1 {
+            message_id: crate::app_groups::random_group_message_id(),
+            kind: omni_protocol::GroupAppKindV1::MessageDelete,
+            body: serde_json::to_string(&omni_types::MessageDeleteV1 { message_id: id.into(), at_unix_ms: 5 }).unwrap(),
+            authored_at_unix_ms: 5,
+            signature_b64: None,
+            reply_to: None,
+            mentions: Vec::new(),
+        };
+        let line = |app: &OmniApp, id: &str| app.storage.message_exists(id).unwrap();
+
+        // Carol asks bob's copy to drop a line of alice's he does not have yet; then the line comes.
+        let early = "early-line";
+        crate::app_message_actions::receive_group_delete(&bob.storage, &dialog, &card_of(&carol), &delete_from(early)).unwrap();
+        assert!(!bob.storage.message_is_deleted(early).unwrap(), "no tombstone for someone else's ask");
+        bob.storage.insert_incoming_message(early, &dialog, "её", 6).unwrap();
+        bob.storage
+            .insert_group_message_meta(&gid, &omni_storage::GroupMessageMeta {
+                message_id: early.into(),
+                sender_pub: Some(card_of(&alice).member_pub),
+                sender_name: "Alice".into(),
+                kind: "text".into(),
+            })
+            .unwrap();
+        assert!(!crate::app_message_actions::apply_pending_message_deletes(&bob.storage, early).unwrap());
+        assert!(line(&bob, early), "alice's line stays: carol was not its author");
+
+        // Alice's own deletion that came first does take her line when it comes.
+        let taken = "taken-line";
+        crate::app_message_actions::receive_group_delete(&bob.storage, &dialog, &card_of(&alice), &delete_from(taken)).unwrap();
+        bob.storage.insert_incoming_message(taken, &dialog, "передумала", 7).unwrap();
+        bob.storage
+            .insert_group_message_meta(&gid, &omni_storage::GroupMessageMeta {
+                message_id: taken.into(),
+                sender_pub: Some(card_of(&alice).member_pub),
+                sender_name: "Alice".into(),
+                kind: "text".into(),
+            })
+            .unwrap();
+        assert!(crate::app_message_actions::apply_pending_message_deletes(&bob.storage, taken).unwrap());
+        assert!(!line(&bob, taken) && bob.storage.message_is_deleted(taken).unwrap());
+    }
+
+    /// An incoming line whose id is already another chat's message, or ours, is not taken: its file,
+    /// its sender and its text stay as they were (security review 2026-11-09, F2). The same line of
+    /// the same chat again is a resend.
+    #[test]
+    fn an_incoming_line_under_another_chats_id_is_not_taken() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-id-collision", "a"), "A", "Laptop");
+        let storage = &app.storage;
+        storage.insert_incoming_message("theirs", "dialog:x", "их", 10).unwrap();
+        storage.insert_outgoing_message("mine", "dialog:x", "моё", omni_types::MessageStatus::Sent, 11).unwrap();
+        let taken = |id: &str, dialog: &str| crate::app_message_actions::message_id_taken_elsewhere(storage, id, dialog).unwrap();
+        assert!(taken("theirs", "dialog:mallory"), "another chat's line");
+        assert!(taken("mine", "dialog:x"), "our own line");
+        assert!(!taken("theirs", "dialog:x"), "the same chat's line again: a resend");
+        assert!(!taken("new", "dialog:mallory"), "a free id");
+    }
+
+    /// A contact takes back only its own line, only in its own chat; a line not here yet is taken when
+    /// it comes, if it is the contact's.
+    #[test]
+    fn contact_deletes_only_its_own_line_of_its_own_chat() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-delete-1to1", "a"), "A", "Laptop");
+        let storage = &app.storage;
+        storage.insert_incoming_message("theirs", "dialog:x", "их", 10).unwrap();
+        storage.insert_incoming_message("other", "dialog:y", "другое", 11).unwrap();
+        storage.insert_outgoing_message("mine", "dialog:x", "моё", omni_types::MessageStatus::Sent, 12).unwrap();
+        let event = |id: &str| omni_types::MessageDeleteV1 { message_id: id.to_string(), at_unix_ms: 20 };
+
+        crate::app_message_actions::receive_message_delete(storage, "dialog:x", &event("mine")).unwrap();
+        assert!(storage.message_exists("mine").unwrap(), "never one of ours");
+        crate::app_message_actions::receive_message_delete(storage, "dialog:x", &event("other")).unwrap();
+        assert!(storage.message_exists("other").unwrap(), "never another chat's");
+        crate::app_message_actions::receive_message_delete(storage, "dialog:x", &event("theirs")).unwrap();
+        assert!(!storage.message_exists("theirs").unwrap());
+        crate::app_message_actions::receive_message_delete(storage, "dialog:x", &event("late")).unwrap();
+        storage.insert_incoming_message("late", "dialog:x", "поздно", 21).unwrap();
+        assert!(crate::app_message_actions::apply_pending_message_deletes(storage, "late").unwrap());
+        assert!(storage.message_is_deleted("late").unwrap() && !storage.message_exists("late").unwrap());
+        // Ours, synced from our other device after the contact asked for it: not the contact's to take.
+        crate::app_message_actions::receive_message_delete(storage, "dialog:x", &event("ours-late")).unwrap();
+        storage.insert_outgoing_message("ours-late", "dialog:x", "наше", omni_types::MessageStatus::Sent, 22).unwrap();
+        assert!(!crate::app_message_actions::apply_pending_message_deletes(storage, "ours-late").unwrap());
+        assert!(storage.message_exists("ours-late").unwrap());
+    }
+
+    /// A pin reaches the group, an unpin takes it away, and an older event arriving late changes nothing.
+    #[test]
+    fn a_pin_reaches_the_group_and_the_latest_stands() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-pin", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-pin", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        alice.send_group_text(&gid, "важное").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        let id = bob.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == "важное").unwrap().message_id;
+        let dialog = bob.storage.get_message(&id).unwrap().dialog_key;
+
+        bob.pin_message(&id, true).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        let seen = alice.message_actions(&dialog).unwrap();
+        assert_eq!(seen.pinned.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["важное"]);
+        assert!(alice.list_group_messages(&gid).unwrap().iter().any(|m| m.message_id == id && m.pinned));
+
+        let now = crate::current_unix_ms();
+        assert!(!alice.storage.set_message_pin(&id, &dialog, false, 1, false, now).unwrap(), "older: nothing changes");
+        assert!(!alice.storage.set_message_pin(&id, "dialog:elsewhere", false, now, false, now).unwrap(), "not this conversation's");
+
+        bob.pin_message(&id, false).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        assert!(alice.message_actions(&dialog).unwrap().pinned.is_empty());
+    }
+
+    /// A pin stamped beyond any clock (`i64::MAX`) does not stand for good: it is refused when it comes,
+    /// and one stored before gives way to the next pin or unpin (audit 2026-11-09, F08).
+    #[test]
+    fn a_pin_from_beyond_any_clock_cannot_lock_the_pin() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-pin-max", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-pin-max", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        alice.send_group_text(&gid, "важное").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        let id = alice.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == "важное").unwrap().message_id;
+        let dialog = alice.storage.get_message(&id).unwrap().dialog_key;
+        let now = crate::current_unix_ms();
+
+        assert!(!alice.storage.set_message_pin(&id, &dialog, true, i64::MAX, false, now).unwrap(), "refused when it comes");
+        assert!(!alice.storage.message_is_pinned(&id).unwrap());
+
+        // One stored before the check (a poisoned row): the person's own unpin still takes.
+        omni_storage::Storage::open_keyed_connection(alice.storage.db_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO message_pins (message_id, dialog_key, pinned, at_unix_ms, unsent, profile_id) VALUES (?1, ?2, 1, ?3, 0, ?4)",
+                rusqlite::params![id, dialog, i64::MAX, alice.storage.get_active_profile_id().unwrap().unwrap().0],
+            )
+            .unwrap();
+        assert!(alice.storage.message_is_pinned(&id).unwrap());
+        alice.pin_message(&id, false).unwrap();
+        assert!(!alice.storage.message_is_pinned(&id).unwrap(), "the unpin takes");
+        // And the person's next pin beats a pin a peer stamped a little ahead of our clock.
+        assert!(alice.storage.set_message_pin(&id, &dialog, false, now + 30_000, false, now).unwrap());
+        alice.pin_message(&id, true).unwrap();
+        assert!(alice.storage.message_is_pinned(&id).unwrap());
+    }
+
+    /// A reaction in a group: one per person, a later one replaces it, an empty one takes it away; an
+    /// older event arriving late changes nothing, and a line of another conversation takes none.
+    #[test]
+    fn group_reaction_is_one_per_person_and_the_latest_stands() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-react", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-react", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        alice.send_group_text(&gid, "встречаемся?").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        let id = bob.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == "встречаемся?").unwrap().message_id;
+        let on = |app: &OmniApp| app.list_group_messages(&gid).unwrap().into_iter().find(|m| m.message_id == id).unwrap().reactions;
+
+        bob.react_to_message(&id, "👍").unwrap();
+        alice.react_to_message(&id, "👍").unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        deliver_group_feed(&alice, &[&bob]);
+        let seen = on(&alice);
+        assert_eq!((seen.len(), seen[0].count, seen[0].mine), (1, 2, true));
+        assert!(seen[0].who.contains(&"Bob".to_string()), "{:?}", seen[0].who);
+
+        bob.react_to_message(&id, "🔥").unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        let seen = on(&alice);
+        assert_eq!(seen.len(), 2, "bob's replaced, alice's stays: {seen:?}");
+        assert!(seen.iter().all(|r| r.count == 1));
+
+        // An older word from bob, late: nothing changes.
+        let bob_account = bob.storage.get_local_account().unwrap().unwrap().descriptor.account_id.0;
+        let dialog = alice.storage.get_message(&id).unwrap().dialog_key;
+        assert!(!alice.storage.set_message_reaction(&id, &dialog, &bob_account, false, "😢", 1, false, crate::current_unix_ms()).unwrap());
+        // Not this conversation's line: refused.
+        assert!(!alice.storage.set_message_reaction(&id, "dialog:elsewhere", &bob_account, false, "😢", crate::current_unix_ms(), false, crate::current_unix_ms()).unwrap());
+
+        bob.react_to_message(&id, "").unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        let seen = on(&alice);
+        assert_eq!((seen.len(), seen[0].emoji.as_str()), (1, "👍"));
+    }
+
+    /// An answer in a group: members see the quote read from their own copy of the answered line; an
+    /// answer to a line of another conversation, or to one that is not here, shows no quote at all.
+    #[test]
+    fn group_reply_shows_the_answered_line_from_the_members_own_copy() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-reply", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-reply", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Клуб").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        alice.send_group_text(&gid, "когда встречаемся?").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        let asked = bob
+            .list_group_messages(&gid)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.body == "когда встречаемся?")
+            .unwrap()
+            .message_id;
+        bob.send_group_line(&gid, "в пятницу", Some(&asked), &[]).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+
+        let answer = alice.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == "в пятницу").unwrap();
+        let quote = answer.reply.expect("the quote of the answered line");
+        assert_eq!(quote.message_id, asked);
+        assert!(quote.from_me, "alice wrote the answered line");
+        assert_eq!(quote.text, "когда встречаемся?");
+        let own = bob.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == "в пятницу").unwrap();
+        let quote = own.reply.expect("the author sees the quote too");
+        assert!(!quote.from_me);
+        assert_eq!(quote.author, "Alice");
+
+        // Nothing here by that id: the line goes as a plain one.
+        bob.send_group_line(&gid, "мимо", Some("no-such-line"), &[]).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        let plain = alice.list_group_messages(&gid).unwrap().into_iter().find(|m| m.body == "мимо").unwrap();
+        assert!(plain.reply.is_none());
+
+        // A peer naming a message of another conversation gets no quote of it.
+        bob.storage.remember_received_message_reply(&plain.message_id, Some(&asked)).unwrap();
+        assert!(bob.storage.message_reply_preview(&plain.message_id, "dialog:elsewhere").unwrap().is_none());
+    }
+
+    /// Group sends from background threads (files projects publish from their own threads, outside
+    /// the app's lock) while the node takes in the group's messages: each MLS step loads the group,
+    /// changes it and stores it, so two at once stored one over the other and a message went out
+    /// with a generation already used — the members dropped it and every later one until the
+    /// counter caught up (seen live 2026-10-31 after a restart).
+    #[test]
+    fn group_messages_sent_from_threads_while_taking_in_the_feed_all_reach_the_members() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-race", "alice"), "Alice", "A");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-race", "bob"), "Bob", "B");
+        let gid = alice.create_group("Race").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        for i in 0..20 {
+            alice.send_group_text(&gid, &format!("alice {i}")).unwrap();
+        }
+        let feed = alice.storage.list_group_feed_outbox(1_000).unwrap();
+        let bob_db = bob.storage.db_path().to_path_buf();
+        thread::scope(|s| {
+            for t in 0..4 {
+                let (db, gid) = (bob_db.clone(), gid.clone());
+                s.spawn(move || {
+                    let storage = Storage::open(&db).unwrap();
+                    for i in 0..10 {
+                        let payload = omni_protocol::GroupAppPayloadV1 {
+                            mentions: Vec::new(),
+                            reply_to: None,
+                            message_id: format!("race-{t}-{i}"),
+                            kind: omni_protocol::GroupAppKindV1::Text,
+                            body: format!("bob {t}-{i}"),
+                            authored_at_unix_ms: crate::current_unix_ms(),
+                            signature_b64: None,
+                        };
+                        super::app_groups::send_app_payload(&storage, &gid, &payload).unwrap();
+                    }
+                });
+            }
+            for (_, group_id, mls) in &feed {
+                let item = omni_protocol::GroupFeedItemV2 {
+                    version: omni_protocol::GROUP_WIRE_VERSION_V2,
+                    group_id: group_id.clone(),
+                    mls_b64: base64::engine::general_purpose::STANDARD.encode(mls),
+                };
+                super::app_groups::ingest_group_feed_item(&bob.storage, &bob.transport, &serde_json::to_string(&item).unwrap()).unwrap();
+            }
+        });
+        deliver_group_feed(&bob, &[&alice]);
+        let got = alice.list_group_messages(&gid).unwrap().iter().filter(|m| m.body.starts_with("bob ")).count();
+        assert_eq!(got, 40, "every message Bob's threads sent reaches Alice");
+        assert_eq!(bob.list_group_messages(&gid).unwrap().iter().filter(|m| m.body.starts_with("alice ")).count(), 20);
+    }
+
+    /// Workspace, phase 1: what Alice pushes to her `omni` remote (a plain folder) is announced to the
+    /// group and Bob learns her branch, not yet fetched; her published repository is served to Bob's
+    /// node and to no node outside the group.
+    #[test]
+    fn a_workspace_branch_pushed_to_omni_is_announced_to_the_group_and_served_to_members_only() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-workspace", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-workspace", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Проект").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        let work = std::env::temp_dir().join("omni-workspace").join(format!("work-{}", unique_suffix()));
+        fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&work).args(args).output().expect("git is installed");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        fs::write(work.join("a.txt"), "a").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "a"]);
+        let published = alice.workspace_add_repo(&gid, "api", Some(&work.to_string_lossy())).unwrap().published_path;
+        git(&["push", "--quiet", "omni", "main"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        alice.workspace_publish(&gid, "api").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        let branches = bob.workspace_member_branches(&gid, "api").unwrap();
+        assert_eq!(branches.len(), 1, "{branches:?}");
+        assert_eq!((branches[0].ref_name.as_str(), branches[0].oid.as_str(), branches[0].fetched), ("refs/heads/main", head.as_str(), false));
+
+        let alice_db = alice.storage.db_path().to_string_lossy().into_owned();
+        let bob_node = alice
+            .storage
+            .list_group_members(&gid)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.display_name == "Bob")
+            .and_then(|m| super::app_groups::node_from_hex(&m.node_hint_hex))
+            .expect("bob's node");
+        let (served, own_device) = super::app_workspace::published_repo_for_member_node(&alice_db, &gid, "api", &bob_node).unwrap();
+        assert!(!own_device, "Bob is not a device of Alice's account");
+        assert_eq!(served, std::path::PathBuf::from(&published));
+        let stranger = omni_mesh_runtime::MeshNodeAddress::from_bytes([7; 20]);
+        assert!(super::app_workspace::published_repo_for_member_node(&alice_db, &gid, "api", &stranger).is_err());
+        assert!(super::app_workspace::published_repo_for_member_node(&alice_db, &gid, "other", &bob_node).is_err());
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// Workspace, the shared `main`: Bob's node follows the `main` of Alice, the group's admin; once
+    /// she sets "needs another member's approval", her next `main` waits until Bob approves it — and
+    /// his approval moves it on her node too. Alice's working repository sees it as `omni-shared/main`.
+    #[test]
+    fn a_restart_does_not_say_our_workspace_events_to_the_group_again() {
+        let db_path = isolated_test_db_path("omni-workspace-newcomers", "alice");
+        let alice = create_app_with_active_profile(db_path.clone(), "Alice", "Laptop");
+        let gid = alice.create_group("Проект").unwrap().group_id;
+        let group = alice.storage.get_group(&gid).unwrap().unwrap();
+        let event = omni_protocol::WorkspaceFilesEventV1::Retention {
+            repo: "cad".into(),
+            keep_last: 3,
+            keep_days: 0,
+            only_current: Vec::new(),
+            at_unix_ms: 1_000,
+        };
+        alice
+            .storage
+            .put_workspace_file_event(
+                &gid,
+                "retention",
+                &omni_storage::WorkspaceFileEventRecord {
+                    sender_account: "alice".into(),
+                    sender_member: group.my_member_pub.clone(),
+                    event_json: serde_json::to_string(&event).unwrap(),
+                    at_unix_ms: 1_000,
+                },
+            )
+            .unwrap();
+        let members = super::app_workspace::agents::members(&alice.storage, &gid).unwrap();
+        let tell = || super::app_workspace::tell_newcomers(&alice.storage, &group, &members, &[]).unwrap();
+        let frames = || alice.storage.count_group_feed_outbox(&gid).unwrap();
+
+        let before = frames();
+        tell();
+        let told = frames();
+        assert_eq!(told, before + 1, "the members are new to this node");
+        tell();
+        assert_eq!(frames(), told, "the same members");
+
+        // What a restart leaves of the memory; the database stays.
+        super::app_workspace::clear_workspaces_for_profile(&db_path);
+        tell();
+        assert_eq!(frames(), told, "a restart brings no newcomers");
+
+        // A nomination or consent asks for it again.
+        alice.storage.set_group_newcomers_told(&gid, None).unwrap();
+        tell();
+        assert_eq!(frames(), told + 1);
+    }
+
+    #[test]
+    fn the_shared_main_follows_the_maintainer_and_under_the_approval_rule_waits_for_another_member() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-workspace-main", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-workspace-main", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Проект").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        let work = std::env::temp_dir().join("omni-workspace-main").join(format!("work-{}", unique_suffix()));
+        fs::create_dir_all(&work).unwrap();
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().expect("git is installed");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let git = |args: &[&str]| git_in(&work, args);
+        let commit = |name: &str| {
+            fs::write(work.join(name), name).unwrap();
+            git(&["add", name]);
+            git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", name]);
+            git(&["push", "--quiet", "omni", "main"]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        let alice_published = alice.workspace_add_repo(&gid, "api", Some(&work.to_string_lossy())).unwrap().published_path;
+        let bob_published = std::path::PathBuf::from(bob.workspace_add_repo(&gid, "api", None).unwrap().published_path);
+        // What the mesh fetch does: Alice's branches into Bob's published repository, marked here.
+        let fetch_to_bob = || {
+            alice.workspace_publish(&gid, "api").unwrap();
+            deliver_group_feed(&alice, &[&bob]);
+            git_in(&bob_published, &["fetch", "--quiet", &alice_published, "+refs/heads/*:refs/omni/members/alice/heads/*"]);
+            for b in bob.workspace_member_branches(&gid, "api").unwrap() {
+                bob.storage.mark_workspace_member_ref_fetched(&gid, "api", &b.account_id, &b.ref_name, &b.oid).unwrap();
+            }
+        };
+
+        let first = commit("a");
+        fetch_to_bob();
+        assert_eq!(bob.workspace_main(&gid, "api").unwrap().oid.as_deref(), Some(first.as_str()), "any maintainer moves it");
+        assert_eq!(alice.workspace_main(&gid, "api").unwrap().oid.as_deref(), Some(first.as_str()), "hers from her own branch");
+
+        alice.workspace_set_main_rule(&gid, "api", true).unwrap();
+        assert!(bob.workspace_set_main_rule(&gid, "api", false).is_err(), "only an admin sets the rule");
+        let second = commit("b");
+        fetch_to_bob();
+        let waiting = bob.workspace_main(&gid, "api").unwrap();
+        assert!(waiting.needs_approval, "the rule reached Bob");
+        assert_eq!(waiting.oid.as_deref(), Some(first.as_str()));
+        assert_eq!(waiting.waiting.iter().map(|(_, oid)| oid.as_str()).collect::<Vec<_>>(), vec![second.as_str()]);
+        alice.workspace_approve(&gid, "api", &second).unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        assert_eq!(alice.workspace_main(&gid, "api").unwrap().oid.as_deref(), Some(first.as_str()), "her own approval does not count");
+
+        bob.workspace_approve(&gid, "api", &second).unwrap();
+        assert_eq!(bob.workspace_main(&gid, "api").unwrap().oid.as_deref(), Some(second.as_str()));
+        deliver_group_feed(&bob, &[&alice]);
+        assert_eq!(alice.workspace_main(&gid, "api").unwrap().oid.as_deref(), Some(second.as_str()), "Bob's approval moves it at Alice");
+
+        git(&["fetch", "--quiet", "omni"]);
+        assert_eq!(git(&["rev-parse", "omni-shared/main"]), second);
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// Workspace screen, phase 1: Bob sees Alice's repository as one to take, takes it into an empty
+    /// folder, reads who moved the shared `main` and how far his folder is behind; «Забрать» checks it
+    /// out, later brings `main` forward and leaves a dirty folder alone; «Опубликовать ветку» sends his
+    /// branch to Alice.
+    #[test]
+    fn a_member_takes_a_workspace_repository_pulls_the_shared_main_and_publishes_a_branch() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-workspace-view", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-workspace-view", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Проект").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        let root = std::env::temp_dir().join("omni-workspace-view").join(format!("run-{}", unique_suffix()));
+        let (work, bob_work) = (root.join("alice"), root.join("bob"));
+        fs::create_dir_all(&work).unwrap();
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().expect("git is installed");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit_in = |dir: &std::path::Path, name: &str| {
+            fs::write(dir.join(name), name).unwrap();
+            git_in(dir, &["add", name]);
+            git_in(dir, &["-c", "user.name=Alice", "-c", "user.email=a@t", "commit", "--quiet", "-m", name]);
+            git_in(dir, &["rev-parse", "HEAD"])
+        };
+        git_in(&work, &["init", "--quiet", "--initial-branch=main"]);
+        let first = commit_in(&work, "a");
+        let alice_published = alice.workspace_add_repo(&gid, "api", Some(&work.to_string_lossy())).unwrap().published_path;
+        alice.workspace_publish_branch(&gid, "api", "main").unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        assert!(alice.list_group_summaries().unwrap().iter().any(|g| g.group_id == gid && g.is_workspace));
+
+        let offered = bob.workspace_view(&gid).unwrap();
+        assert_eq!(offered.repos.len(), 1);
+        assert!(!offered.repos[0].here, "Bob has not taken it yet");
+        assert_eq!(offered.repos[0].branches[0].name, "Alice");
+
+        let bob_published = std::path::PathBuf::from(bob.workspace_take_repo(&gid, "api", &bob_work.to_string_lossy()).unwrap().published_path);
+        let fetch_to_bob = || {
+            alice.workspace_publish(&gid, "api").unwrap();
+            deliver_group_feed(&alice, &[&bob]);
+            git_in(&bob_published, &["fetch", "--quiet", &alice_published, "+refs/heads/*:refs/omni/members/alice/heads/*"]);
+            for b in bob.workspace_member_branches(&gid, "api").unwrap() {
+                bob.storage.mark_workspace_member_ref_fetched(&gid, "api", &b.account_id, &b.ref_name, &b.oid).unwrap();
+            }
+        };
+        fetch_to_bob();
+        let view = bob.workspace_view(&gid).unwrap();
+        let repo = &view.repos[0];
+        assert!(repo.here && !view.i_am_admin && !view.i_am_maintainer);
+        let main = repo.main.as_ref().expect("the shared main");
+        assert_eq!((main.oid.as_str(), main.subject.as_str(), main.author.as_str()), (first.as_str(), "a", "Alice"));
+        assert_eq!(repo.main_behind, 1, "an empty folder is behind by the whole main");
+        assert_eq!(bob.workspace_pull(&gid, "api").unwrap(), super::WorkspacePullOutcome::Updated);
+        assert!(bob_work.join("a").is_file(), "main checked out");
+        assert_eq!(bob.workspace_view(&gid).unwrap().repos[0].main_behind, 0);
+
+        commit_in(&work, "b");
+        alice.workspace_publish_branch(&gid, "api", "main").unwrap();
+        fetch_to_bob();
+        let behind = bob.workspace_view(&gid).unwrap();
+        assert_eq!(behind.repos[0].main_behind, 1);
+        // The page lists the shared main's commits beside it, newest first.
+        assert_eq!(behind.repos[0].recent.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), vec!["b", "a"]);
+        fs::write(bob_work.join("a"), "changed").unwrap();
+        assert_eq!(bob.workspace_pull(&gid, "api").unwrap(), super::WorkspacePullOutcome::Dirty, "a dirty folder is left alone");
+        git_in(&bob_work, &["checkout", "--quiet", "--", "a"]);
+        assert_eq!(bob.workspace_pull(&gid, "api").unwrap(), super::WorkspacePullOutcome::Updated);
+        assert!(bob_work.join("b").is_file());
+        assert!(bob.workspace_view(&gid).unwrap().repos[0].local_branches.iter().any(|b| b.branch == "main" && b.published), "a main at the shared one is nothing to publish");
+
+        git_in(&bob_work, &["checkout", "--quiet", "-b", "feat"]);
+        commit_in(&bob_work, "c");
+        let local = bob.workspace_view(&gid).unwrap().repos[0].local_branches.clone();
+        assert!(local.iter().any(|b| b.branch == "feat" && !b.published), "{local:?}");
+        bob.workspace_publish_branch(&gid, "api", "feat").unwrap();
+        assert!(bob.workspace_view(&gid).unwrap().repos[0].local_branches.iter().any(|b| b.branch == "feat" && b.published));
+        deliver_group_feed(&bob, &[&alice]);
+        let at_alice = alice.workspace_view(&gid).unwrap();
+        assert!(at_alice.repos[0].branches.iter().any(|t| t.name == "Bob" && t.branch == "feat"), "{:?}", at_alice.repos[0].branches);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A files workspace (docs/decisions/omni-workspace-git.md section 6): Alice saves the first version
+    /// with a big model; Bob takes the repository, its content comes by hash over a content stream and
+    /// his folder follows. Then both save at once from the same version: every node settles on one line,
+    /// the losing line is replayed on top, both folders end with both changes; a file both changed keeps
+    /// one version in place and the other beside it.
+    #[test]
+    fn a_files_workspace_shares_big_files_by_hash_and_settles_two_saves_at_once() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-workspace-files", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-workspace-files", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Изделие").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        // This test exercises concurrent saves in the explicitly unmoderated workspace mode.
+        workspace_files_command(&alice, serde_json::json!({"action":"policy","group_id":gid,"repo":"model","participants_need_approval":false,"newcomers_download_current":false})).unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+
+        let root = std::env::temp_dir().join("omni-workspace-files").join(format!("run-{}", unique_suffix()));
+        let (alice_dir, bob_dir) = (root.join("alice"), root.join("bob"));
+        fs::create_dir_all(&alice_dir).unwrap();
+        let model: Vec<u8> = (0..(3 << 20) as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        fs::write(alice_dir.join("корпус.prt"), &model).unwrap();
+        fs::write(alice_dir.join("заметки.txt"), "v1").unwrap();
+
+        let alice_record = alice.workspace_add_files_repo(&gid, "model", &alice_dir.to_string_lossy()).unwrap();
+        let v1 = alice.workspace_save_version(&gid, "model", "Первая версия").unwrap().expect("saved");
+        assert_eq!(alice.workspace_save_version(&gid, "model", "").unwrap(), None, "nothing changed, nothing saved");
+        deliver_group_feed(&alice, &[&bob]);
+        assert!(bob.storage.workspace_repo_is_files(&gid, "model").unwrap(), "the project comes with its line's announcement");
+        let bob_record = bob.workspace_take_repo(&gid, "model", &bob_dir.to_string_lossy()).unwrap();
+
+        let sync = workspace_exchange(&alice, &bob, &gid, "model");
+        assert_eq!((sync.content_missing_bytes, sync.content_total_bytes), (0, model.len() as u64 + 2), "{sync:?}");
+        assert_eq!(fs::read(bob_dir.join("корпус.prt")).unwrap(), model, "the model came whole by its hash");
+        assert_eq!(fs::read_to_string(bob_dir.join("заметки.txt")).unwrap(), "v1");
+        let at_bob = bob.workspace_view(&gid).unwrap();
+        assert!(at_bob.repos[0].files && at_bob.repos[0].changed_count == 0, "{:?}", at_bob.repos[0].changed);
+        assert_eq!((at_bob.repos[0].version, at_bob.repos[0].main.as_ref().map(|m| m.oid.clone())), (1, Some(v1.clone())));
+        // The member keeps no second copy: the folder is where the version's content is.
+        let bob_published = std::path::PathBuf::from(&bob_record.published_path);
+        assert!(crate::app_workspace::test_object_path(&bob_published, None, &crate::app_workspace::test_tree(&bob_published, "model", &v1)["корпус.prt"]).is_none());
+
+        // Both save from version 1 at once; one also changes the file the other changes.
+        fs::write(alice_dir.join("заметки.txt"), "Алиса").unwrap();
+        fs::write(alice_dir.join("кронштейн.stp"), "solid").unwrap();
+        fs::write(bob_dir.join("заметки.txt"), "Боб").unwrap();
+        fs::write(bob_dir.join("чертёж.pdf"), "%PDF").unwrap();
+        alice.workspace_save_version(&gid, "model", "Кронштейн").unwrap().expect("saved");
+        bob.workspace_save_version(&gid, "model", "Чертёж").unwrap().expect("saved");
+        for _ in 0..3 {
+            workspace_exchange(&alice, &bob, &gid, "model");
+            workspace_exchange(&bob, &alice, &gid, "model");
+        }
+        let shared = |app: &OmniApp| app.workspace_main(&gid, "model").unwrap().oid;
+        assert_eq!(shared(&alice), shared(&bob), "every node on the same line");
+        for dir in [&alice_dir, &bob_dir] {
+            assert_eq!(fs::read_to_string(dir.join("кронштейн.stp")).unwrap(), "solid", "{}", dir.display());
+            assert_eq!(fs::read_to_string(dir.join("чертёж.pdf")).unwrap(), "%PDF", "{}", dir.display());
+            let kept = fs::read_to_string(dir.join("заметки.txt")).unwrap();
+            let beside: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .filter(|n| n.starts_with("заметки (") && n.ends_with(").txt"))
+                .collect();
+            assert_eq!(beside.len(), 1, "the other version beside it: {beside:?}");
+            let other = fs::read_to_string(dir.join(&beside[0])).unwrap();
+            let mut both = vec![kept, other];
+            both.sort();
+            assert_eq!(both, vec!["Алиса".to_string(), "Боб".to_string()], "{}", dir.display());
+        }
+        assert_eq!(alice.workspace_view(&gid).unwrap().repos[0].version, 3, "the first version and both saves");
+        let _ = alice_record;
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// «На мои устройства»: the laptop sends a branch to the account's devices only. The desktop, a
+    /// device of the same account in the group, is served it and takes it into its folder — new, then
+    /// moved forward; Bob, another member, is served the repository without it.
+    #[test]
+    fn a_branch_sent_to_my_devices_reaches_my_other_device_and_not_the_team() {
+        use crate::app_group_rejoin::{account_device_pubs, add_account_device, device_join_request};
+        let alice = OmniApp::init(AppInitRequest { db_path: isolated_test_db_path("omni-workspace-mine", "laptop") }).unwrap();
+        let created = alice.create_account("Alice", "Laptop").unwrap();
+        let mnemonic = created.recovery_phrase_v2.as_ref().unwrap().mnemonic.clone();
+        let own = created.descriptor.account_id.clone();
+        let desktop = OmniApp::init(AppInitRequest { db_path: isolated_test_db_path("omni-workspace-mine", "desktop") }).unwrap();
+        let account = desktop.restore_account_from_mnemonic("Alice", &mnemonic, "Desktop").unwrap();
+        if let Some(summary) = account.local_profile_summary.as_ref() {
+            desktop.select_active_profile(&summary.profile_id).unwrap();
+        }
+        let now = current_unix_ms();
+        let desktop_chain = desktop.storage.get_local_device_certificate_chain().unwrap().unwrap();
+        alice.storage.record_own_device(&desktop_chain, "Desktop", "dialog:desktop", now).unwrap();
+        let laptop_chain = alice.storage.get_local_device_certificate_chain().unwrap().unwrap();
+        desktop.storage.record_own_device(&laptop_chain, "Laptop", "dialog:laptop", now).unwrap();
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-workspace-mine", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Проект").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        let known = account_device_pubs(&alice.storage, &own).unwrap();
+        let request = device_join_request(&desktop.storage, &gid, "Проект", "dialog:laptop", "ваше устройство", now).unwrap();
+        let welcome = add_account_device(&alice.storage, "dialog:desktop", &own, &known, &request).unwrap().expect("added");
+        super::app_groups::join_from_welcome(&desktop.storage, &desktop.transport, "dialog:laptop", &welcome).unwrap();
+        deliver_group_feed(&alice, &[&bob, &desktop]);
+
+        let root = std::env::temp_dir().join("omni-workspace-mine").join(format!("run-{}", unique_suffix()));
+        let (work, desk_work) = (root.join("laptop"), root.join("desktop"));
+        fs::create_dir_all(&work).unwrap();
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().expect("git is installed");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit_in = |dir: &std::path::Path, name: &str| {
+            fs::write(dir.join(name), name).unwrap();
+            git_in(dir, &["add", name]);
+            git_in(dir, &["-c", "user.name=Alice", "-c", "user.email=a@t", "commit", "--quiet", "-m", name]);
+            git_in(dir, &["rev-parse", "HEAD"])
+        };
+        git_in(&work, &["init", "--quiet", "--initial-branch=main"]);
+        commit_in(&work, "a");
+        let published = alice.workspace_add_repo(&gid, "api", Some(&work.to_string_lossy())).unwrap().published_path;
+        alice.workspace_publish_branch(&gid, "api", "main").unwrap();
+        git_in(&work, &["checkout", "--quiet", "-b", "feat"]);
+        let first = commit_in(&work, "b");
+        alice.workspace_send_to_my_devices(&gid, "api", "feat").unwrap();
+        let feat = alice.workspace_view(&gid).unwrap().repos[0].local_branches.iter().find(|b| b.branch == "feat").cloned().unwrap();
+        assert!(feat.on_my_devices && !feat.published, "{feat:?}");
+
+        // Who is served what: the desktop is a device of ours, Bob is not.
+        let alice_db = alice.storage.db_path().to_string_lossy().into_owned();
+        let members = alice.storage.list_group_members(&gid).unwrap();
+        let node_of = |name: &str, me: bool| {
+            members
+                .iter()
+                .find(|m| m.display_name == name && (m.account_id == own.0) == me && m.member_pub != alice.storage.get_group(&gid).unwrap().unwrap().my_member_pub)
+                .map(|m| m.node_hint_hex.clone())
+                .unwrap()
+        };
+        let (desktop_node, bob_node) = (node_of("Alice", true), node_of("Bob", false));
+        let served = |node: &str| {
+            let node = super::app_groups::node_from_hex(node).unwrap();
+            super::app_workspace::published_repo_for_member_node(&alice_db, &gid, "api", &node).unwrap().1
+        };
+        assert!(served(&desktop_node), "our other device gets the branches «на мои устройства»");
+        assert!(!served(&bob_node), "Bob does not");
+
+        // What the tick does at the desktop: the laptop's branches sent to our devices into its space.
+        let laptop_node = desktop
+            .storage
+            .list_group_members(&gid)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.account_id == own.0 && m.member_pub == alice.storage.get_group(&gid).unwrap().unwrap().my_member_pub)
+            .map(|m| m.node_hint_hex.to_ascii_lowercase())
+            .unwrap();
+        let desk_published = std::path::PathBuf::from(desktop.workspace_take_repo(&gid, "api", &desk_work.to_string_lossy()).unwrap().published_path);
+        let fetch_to_desktop = || {
+            git_in(&desk_published, &["fetch", "--quiet", "--prune", &published, &format!("+refs/omni/mine/heads/*:refs/omni/devices/{laptop_node}/heads/*")]);
+        };
+        fetch_to_desktop();
+        let from = desktop.workspace_view(&gid).unwrap().repos[0].device_branches.clone();
+        assert_eq!(from.len(), 1, "{from:?}");
+        assert_eq!((from[0].device.as_str(), from[0].branch.as_str(), from[0].state.as_str()), ("Laptop", "feat", "new"));
+        assert_eq!(from[0].commit.as_ref().map(|c| c.subject.as_str()), Some("b"));
+        assert_eq!(desktop.workspace_take_from_device(&gid, "api", &laptop_node, "feat").unwrap(), super::WorkspacePullOutcome::Updated);
+        assert_eq!(git_in(&desk_work, &["rev-parse", "feat"]), first);
+
+        let second = commit_in(&work, "c");
+        alice.workspace_send_to_my_devices(&gid, "api", "feat").unwrap();
+        fetch_to_desktop();
+        assert_eq!(desktop.workspace_view(&gid).unwrap().repos[0].device_branches[0].state, "newer");
+        assert_eq!(desktop.workspace_take_from_device(&gid, "api", &laptop_node, "feat").unwrap(), super::WorkspacePullOutcome::Updated);
+        assert_eq!(git_in(&desk_work, &["rev-parse", "feat"]), second);
+        assert_eq!(desktop.workspace_view(&gid).unwrap().repos[0].device_branches[0].state, "same");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A group file outlives its author's absence: Bob, who downloaded Alice's photo, hands it on to
     /// Carol while Alice is away — the same file, its hash checked. Until he has it whole he has
     /// nothing to give; a copy he changed afterwards is not served.
@@ -520,7 +1346,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]))
             .save(&source)
             .unwrap();
-        alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, true).unwrap();
+        alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, true, None, None).unwrap();
         deliver_group_feed(&alice, &[&bob, &carol]);
         let message_id = bob
             .list_group_messages(&gid)
@@ -675,7 +1501,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         let block = omni_crypto::CONTENT_TREE_BLOCK_BYTES as usize;
         let bytes: Vec<u8> = (0..size).map(|at| (at % 251) as u8 ^ (at / block) as u8).collect();
         fs::write(&source, &bytes).unwrap();
-        alice.send_group_attachment(&gid, "сборка", &source.to_string_lossy(), None, false).unwrap();
+        alice.send_group_attachment(&gid, "сборка", &source.to_string_lossy(), None, false, None, None).unwrap();
         let message_id = alice
             .list_group_messages(&gid)
             .unwrap()
@@ -1044,7 +1870,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
             .collect();
         fs::write(&source, &bytes).unwrap();
 
-        alice.send_group_attachment(&gid, "сборка", &source.to_string_lossy(), None, false).unwrap();
+        alice.send_group_attachment(&gid, "сборка", &source.to_string_lossy(), None, false, None, None).unwrap();
         let line = alice
             .list_group_messages(&gid)
             .unwrap()
@@ -1069,6 +1895,140 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         assert_eq!(at_bob.attachment.state, omni_types::AttachmentTransferState::Offered);
     }
 
+    /// Blind audit 2026-11-13, pass 21: the group's offer of a big file failed after the file was made
+    /// ready, and no pass looked at it again (only files still `Preparing` are resumed): the members
+    /// never heard of it. Ready and offered are one now; a failed offer leaves it to prepare again.
+    #[test]
+    fn group_attachment_does_retry_offer_after_preparation_failure() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-prepare-retry", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-prepare-retry", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Файлы").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        let source = std::env::temp_dir().join("omni-groups-prepare-retry").join(format!("big-{}.bin", unique_suffix()));
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let bytes: Vec<u8> = (0..super::app_attachment_preparation::PREPARE_INLINE_MAX_BYTES as usize + 4099)
+            .map(|i| (i * 17 % 251) as u8)
+            .collect();
+        fs::write(&source, &bytes).unwrap();
+        let db_path = alice.storage.db_path().to_string_lossy().into_owned();
+        let failing = || super::app_attachment_preparation::FAIL_PREPARED_OFFER.lock().unwrap().contains(&db_path);
+        super::app_attachment_preparation::FAIL_PREPARED_OFFER.lock().unwrap().push(db_path.clone());
+
+        alice.send_group_attachment(&gid, "сборка", &source.to_string_lossy(), None, false, None, None).unwrap();
+        let message_id = alice
+            .list_group_messages(&gid)
+            .unwrap()
+            .into_iter()
+            .find_map(|m| m.attachment.map(|a| a.message_id))
+            .expect("the line is in the thread at once");
+        wait_for_condition(Duration::from_secs(30), || !failing());
+        assert!(!failing(), "the first offer failed");
+
+        // The queue's tick resumes what is still being prepared.
+        wait_for_condition(Duration::from_secs(30), || {
+            super::app_attachment_preparation::resume_attachment_preparations(&alice.storage).unwrap();
+            deliver_group_feed(&alice, &[&bob]);
+            bob.storage.get_attachment_runtime_info(&message_id).ok().flatten().is_some()
+        });
+        let at_bob = bob.storage.get_attachment_runtime_info(&message_id).unwrap().expect("the offer reached the member");
+        assert_eq!(at_bob.attachment.file_size_bytes, bytes.len() as i64);
+    }
+
+    /// A video message stays one on its way: the group shows its length and first frame and asks for the
+    /// file by itself; forwarding keeps all of it; what is no such recording cannot go as one.
+    #[test]
+    fn a_group_video_message_reaches_a_member_as_a_video_message() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-circle", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-circle", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Кружок").expect("create").group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let kind = Some(omni_types::AttachmentPresentationKindV1::VideoNote);
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg).encode_image(&image::RgbImage::new(64, 64)).unwrap();
+        let staged = alice
+            .stage_video_note_recording(&b64.encode(omni_storage::video_note::test_mp4(4_000, 854, 480)), &b64.encode(&jpeg))
+            .unwrap();
+        alice.send_group_attachment(&gid, "", &staged.path, None, false, kind, None).unwrap();
+        assert!(!std::path::Path::new(&staged.path).exists(), "the recording is used up by sending it");
+        deliver_group_feed(&alice, &[&bob]);
+
+        let line = bob.list_group_messages(&gid).unwrap().into_iter().find(|m| m.kind == "attachment").expect("the offer reached bob");
+        let offered = line.attachment.expect("an attachment line carries its file");
+        let shown = offered.presentation.clone().expect("it stays a video message at bob's");
+        assert_eq!(shown.kind, omni_types::AttachmentPresentationKindV1::VideoNote);
+        assert_eq!((shown.duration_ms, shown.width, shown.height), (Some(4_000), 854, 480));
+        assert_eq!(shown.preview_jpeg_b64, Some(b64.encode(&jpeg)));
+        assert_eq!(offered.state, omni_types::AttachmentTransferState::Requested, "it asks for itself");
+
+        let at_alice = alice.list_group_messages(&gid).unwrap();
+        let mine = at_alice.iter().find(|m| m.is_mine && m.attachment.is_some()).unwrap();
+        let path = mine.attachment.as_ref().unwrap().local_copy_path.clone().expect("the sender keeps its copy");
+        alice.send_group_attachment(&gid, "", &path, None, false, kind, None).unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        let copies = alice.list_group_messages(&gid).unwrap();
+        let forwarded = copies.iter().filter_map(|m| m.attachment.as_ref()).next_back().unwrap();
+        assert_eq!(forwarded.presentation.as_ref().and_then(|p| p.preview_jpeg_b64.clone()), Some(b64.encode(&jpeg)));
+
+        assert!(alice.stage_video_note_recording(&b64.encode(b"not an mp4"), "").is_err());
+    }
+
+    /// A voice message stays one on its way: the group shows its length and outline, asks for the file
+    /// by itself, and the file that arrives is the recording.
+    #[test]
+    fn a_group_voice_message_reaches_a_member_as_a_voice_message() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-voice", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-voice", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Голос").expect("create").group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // 3 s of 20 ms packets; the code byte 72 is a SILK wideband 20 ms frame.
+        let packets: Vec<Vec<u8>> = (0..150).map(|_| vec![72, 1, 2, 3, 4, 5]).collect();
+        let waveform = vec![200u8; 64];
+        let staged = alice
+            .stage_voice_recording(&b64.encode(omni_storage::voice::join_voice_packets(&packets)), &b64.encode(&waveform))
+            .unwrap();
+        alice.send_group_attachment(&gid, "", &staged.path, None, false, Some(omni_types::AttachmentPresentationKindV1::Voice), None).unwrap();
+        assert!(!std::path::Path::new(&staged.path).exists(), "the recording is used up by sending it");
+        deliver_group_feed(&alice, &[&bob]);
+
+        let line = bob
+            .list_group_messages(&gid)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.kind == "attachment")
+            .expect("the offer reached bob");
+        let offered = line.attachment.expect("an attachment line carries its file");
+        let shown = offered.presentation.clone().expect("it stays a voice message at bob's");
+        assert_eq!(shown.kind, omni_types::AttachmentPresentationKindV1::Voice);
+        assert_eq!(shown.duration_ms, Some((150 * 960 - 312) / 48));
+        assert_eq!(shown.waveform_b64, Some(b64.encode(&waveform)));
+        assert_eq!(offered.state, omni_types::AttachmentTransferState::Requested, "it asks for itself");
+        let at_alice = alice.list_group_messages(&gid).unwrap();
+        let mine = at_alice.iter().find(|m| m.is_mine && m.attachment.is_some()).unwrap();
+        let path = mine.attachment.as_ref().unwrap().local_copy_path.clone().expect("the sender keeps its copy");
+        let read = alice.read_voice_file(&path).unwrap();
+        assert_eq!(read.duration_ms, shown.duration_ms.unwrap());
+        assert_eq!(b64.decode(read.packets_b64).unwrap(), omni_storage::voice::join_voice_packets(&packets));
+
+        // Forwarding takes the very file: it stays a voice message, the original stays too.
+        alice.send_group_attachment(&gid, "", &path, None, false, Some(omni_types::AttachmentPresentationKindV1::Voice), None).unwrap();
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(alice.list_group_messages(&gid).unwrap().iter().filter(|m| m.attachment.is_some()).count(), 2);
+
+        // A file that is no recording cannot go as one.
+        let source = std::env::temp_dir().join(format!("omni-not-voice-{}.ogg", unique_suffix()));
+        fs::write(&source, b"not an ogg").unwrap();
+        assert!(alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, false, Some(omni_types::AttachmentPresentationKindV1::Voice), None).is_err());
+    }
+
     /// A photo in a group: the offer rides the group, the photo asks for itself, and the author
     /// hands it over a bulk stream to a member — and to nobody else.
     #[test]
@@ -1087,7 +2047,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
             .save(&source)
             .unwrap();
         alice
-            .send_group_attachment(&gid, "закат", &source.to_string_lossy(), None, true)
+            .send_group_attachment(&gid, "закат", &source.to_string_lossy(), None, true, None, None)
             .unwrap();
         deliver_group_feed(&alice, &[&bob]);
 
@@ -1124,7 +2084,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
                 super::app_group_attachments::InboundBulk::GroupPull(request, bulk) => {
                     super::app_group_attachments::serve_group_pull(&serve_db, stranger, request, bulk, &|_| true)
                 }
-                super::app_group_attachments::InboundBulk::Transfer(_) => panic!("a pull reads as a pull"),
+                _ => panic!("a pull reads as a pull"),
             }
         });
         let refused = super::app_group_attachments::pull_over(&bob_db, asker, &gid, &offered.message_id);
@@ -1164,10 +2124,104 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
 
         // In the chat list: the caption, or «Фото» for a photo without one — not an empty line.
         assert_eq!(bob.list_group_summaries().unwrap()[0].last_message_preview, "Alice: закат");
-        alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, true).unwrap();
+        alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, true, None, None).unwrap();
         deliver_group_feed(&alice, &[&bob]);
         assert_eq!(alice.list_group_summaries().unwrap()[0].last_message_preview, "Вы: Фото");
         assert_eq!(bob.list_group_summaries().unwrap()[0].last_message_preview, "Alice: Фото");
+    }
+
+    #[test]
+    fn a_member_that_said_it_left_is_heard_no_more_before_its_removal() {
+        // Code audit 2026-11-09, OMNI-02: a farewell made a member «left» only until the next Commit
+        // about anything else, and lines from a member that said it left were taken all along.
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-left", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-left", "bob"), "Bob", "Laptop");
+        let carol = create_app_with_active_profile(isolated_test_db_path("omni-groups-left", "carol"), "Carol", "Laptop");
+        let gid = alice.create_group("Друзья").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        group_join_for_real(&alice, &carol, &gid, "dialog:carol");
+        deliver_group_feed(&alice, &[&bob, &carol]);
+        let carol_pub = super::app_groups::local_mls_identity(&carol.storage).unwrap().1.member_pub;
+        let say = |app: &OmniApp, kind: omni_protocol::GroupAppKindV1, body: &str| {
+            super::app_groups::send_app_payload(
+                &app.storage,
+                &gid,
+                &omni_protocol::GroupAppPayloadV1 {
+                    message_id: super::app_groups::random_group_message_id(),
+                    kind,
+                    body: body.into(),
+                    authored_at_unix_ms: crate::current_unix_ms(),
+                    signature_b64: None,
+                    reply_to: None,
+                    mentions: Vec::new(),
+                },
+            )
+            .unwrap()
+        };
+        let status_at = |app: &OmniApp| app.group_members_view(&gid).unwrap().into_iter().find(|m| m.member_pub == carol_pub).map(|m| m.status);
+        // `deliver_group_feed` empties the sender's queue: what reaches the members at different times
+        // is taken once and handed out here.
+        let take = |from: &OmniApp| -> Vec<String> {
+            let mut items = Vec::new();
+            for (row, group_id, mls) in from.storage.list_group_feed_outbox(1_000).unwrap() {
+                let item = omni_protocol::GroupFeedItemV2 {
+                    version: omni_protocol::GROUP_WIRE_VERSION_V2,
+                    group_id,
+                    mls_b64: base64::engine::general_purpose::STANDARD.encode(mls),
+                };
+                items.push(serde_json::to_string(&item).unwrap());
+                from.storage.delete_group_feed_outbox(row).unwrap();
+            }
+            items
+        };
+        let give = |items: &[String], to: &OmniApp| {
+            for json in items {
+                super::app_groups::ingest_group_feed_item(&to.storage, &to.transport, json).unwrap();
+            }
+        };
+
+        // A changed client: Carol says farewell and stays. Bob hears it; Alice, the admin, not yet.
+        say(&carol, omni_protocol::GroupAppKindV1::Leave, "");
+        let farewell = take(&carol);
+        give(&farewell, &bob);
+        assert_eq!(status_at(&bob).as_deref(), Some("left"));
+        // A Commit about something else: Carol stays «left» at Bob's.
+        alice.rename_group(&gid, "Друзья 2").unwrap();
+        deliver_group_feed(&alice, &[&bob, &carol]);
+        assert_eq!(status_at(&bob).as_deref(), Some("left"), "a Commit about another thing does not make her a member again");
+        // What she says now does not count.
+        say(&carol, omni_protocol::GroupAppKindV1::Text, "я всё ещё тут");
+        say(&carol, omni_protocol::GroupAppKindV1::Dissolve, "");
+        let after = take(&carol);
+        give(&after, &bob);
+        assert!(!bob.list_group_messages(&gid).unwrap().iter().any(|m| m.body == "я всё ещё тут"));
+        assert_eq!(bob.storage.get_group(&gid).unwrap().unwrap().my_status, "member");
+
+        // Alice hears the farewell (late, from the epoch before her rename): her Commit takes Carol
+        // out everywhere.
+        give(&farewell, &alice);
+        give(&after, &alice);
+        assert_eq!(status_at(&alice), None, "the admin took her out");
+        assert!(!alice.list_group_messages(&gid).unwrap().iter().any(|m| m.body == "я всё ещё тут"));
+        deliver_group_feed(&alice, &[&bob]);
+        assert_eq!(status_at(&bob), None, "removed by the admin's Commit");
+    }
+
+    #[test]
+    fn a_left_member_still_in_is_taken_out_by_an_admins_sweep() {
+        // OMNI-02: a farewell whose Commit did not happen (no admin heard it, or it failed) leaves the
+        // member in, with the epoch's keys; an admin's sweep finishes it.
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-groups-left-sweep", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-groups-left-sweep", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Друзья").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        let bob_pub = super::app_groups::local_mls_identity(&bob.storage).unwrap().1.member_pub;
+        alice.storage.set_group_member_status(&gid, &bob_pub, "left").unwrap();
+        assert_eq!(super::app_groups::remove_revoked_and_departed_from_groups(&bob.storage), 0, "not an admin: nothing of others to remove");
+        assert_eq!(super::app_groups::remove_revoked_and_departed_from_groups(&alice.storage), 1);
+        assert!(!alice.group_members_view(&gid).unwrap().iter().any(|m| m.member_pub == bob_pub));
     }
 
     /// The whole people-to-people path on MLS: three real profiles join through Invite → Accept →
@@ -1275,17 +2329,19 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         let texts_at_bob = bob.list_group_messages(&gid).unwrap().into_iter().filter(|m| m.kind == "text").count();
         assert_eq!(texts_at_bob, 2, "a member already in gets nothing twice");
         // Carol can hand the same lines on: she kept them with their authors' signatures.
-        assert_eq!(carol.storage.list_recent_group_signed_lines(&gid, 100).unwrap().len(), 2);
+        assert_eq!(carol.storage.list_recent_group_signed_lines(&gid, 100, None).unwrap().len(), 2);
 
         // A packet with one line changed: the signature of its author does not hold.
         let group = carol.storage.get_group(&gid).unwrap().unwrap();
         let mut packet: omni_protocol::GroupHistoryPacketV1 = omni_protocol::GroupHistoryPacketV1 {
             lines: carol
                 .storage
-                .list_recent_group_signed_lines(&gid, 100)
+                .list_recent_group_signed_lines(&gid, 100, None)
                 .unwrap()
                 .into_iter()
                 .map(|line| omni_protocol::GroupHistoryLineV1 {
+                    mentions: Vec::new(),
+                    reply_to: None,
                     message_id: format!("{}-copy", line.message_id),
                     kind: omni_protocol::GroupAppKindV1::Text,
                     sender_pub: line.sender_pub,
@@ -1298,6 +2354,8 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         };
         packet.lines.truncate(1);
         let forged = omni_protocol::GroupAppPayloadV1 {
+            mentions: Vec::new(),
+            reply_to: None,
             message_id: "g-forged".into(),
             kind: omni_protocol::GroupAppKindV1::History,
             body: serde_json::to_string(&packet).unwrap(),
@@ -1305,6 +2363,77 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
             signature_b64: None,
         };
         assert_eq!(super::app_group_history::receive_history(&carol.storage, &gid, &group, &forged).unwrap(), 0, "a renamed line breaks its signature");
+
+        // V-14: a line is shown under its author's own name, whatever name it carries; a line of a key
+        // that is no member here, or one dated ahead, is refused.
+        let signed_line = |app: &OmniApp, message_id: &str, body: &str, at: i64, name: &str| {
+            let account = app.storage.get_local_account().unwrap().unwrap();
+            let identity = app.storage.get_local_identity_key(&account.descriptor.account_id).unwrap().unwrap();
+            let bytes = omni_protocol::group_line_signing_bytes(&gid, message_id, omni_protocol::GroupAppKindV1::Text, body, at, None, &[]);
+            let signature = omni_crypto::sign_message(&identity.protected_signing_private_key, &bytes).unwrap();
+            omni_protocol::GroupHistoryLineV1 {
+                mentions: Vec::new(),
+                reply_to: None,
+                message_id: message_id.into(),
+                kind: omni_protocol::GroupAppKindV1::Text,
+                sender_pub: super::app_groups::local_mls_identity(&app.storage).unwrap().1.member_pub,
+                sender_name: name.into(),
+                body: body.into(),
+                authored_at_unix_ms: at,
+                signature_b64: base64::engine::general_purpose::STANDARD.encode(signature.bytes),
+            }
+        };
+        let now = current_unix_ms();
+        let packet = omni_protocol::GroupHistoryPacketV1 {
+            lines: vec![
+                signed_line(&bob, "g-bob-as-alice", "я Алиса", now - 1000, "Alice"),
+                signed_line(&dave, "g-outsider", "чужая строка", now - 1000, "Bob"),
+                signed_line(&bob, "g-ahead", "из будущего", now + 24 * 3600 * 1000, "Bob"),
+            ],
+        };
+        let handed = omni_protocol::GroupAppPayloadV1 {
+            mentions: Vec::new(),
+            reply_to: None,
+            message_id: "g-handed".into(),
+            kind: omni_protocol::GroupAppKindV1::History,
+            body: serde_json::to_string(&packet).unwrap(),
+            authored_at_unix_ms: now,
+            signature_b64: None,
+        };
+        assert_eq!(super::app_group_history::receive_history(&carol.storage, &gid, &group, &handed).unwrap(), 1);
+        let taken: Vec<(String, String)> = carol
+            .list_group_messages(&gid)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.body == "я Алиса" || m.body == "чужая строка" || m.body == "из будущего")
+            .map(|m| (m.sender_name, m.body))
+            .collect();
+        assert_eq!(taken, vec![("Bob".to_string(), "я Алиса".to_string())], "under its author's own name only");
+
+        // Blind audit 2026-11-12, pass 15: a member's lines dated far ahead are shown, but not kept
+        // for newcomers — the packet takes the latest by date, and they filled it.
+        let bob_card = super::app_groups::local_mls_identity(&bob.storage).unwrap().1;
+        let bob_card = omni_group_mls::MemberCard { member_pub: bob.storage.get_group(&gid).unwrap().unwrap().my_member_pub, ..bob_card };
+        let mut ahead = omni_protocol::GroupAppPayloadV1 {
+            mentions: Vec::new(),
+            reply_to: None,
+            message_id: super::app_groups::random_group_message_id(),
+            kind: omni_protocol::GroupAppKindV1::Text,
+            body: "наверх".into(),
+            authored_at_unix_ms: crate::current_unix_ms() + 10 * 365 * 24 * 3600 * 1000,
+            signature_b64: None,
+        };
+        super::app_group_history::sign_own_line(&bob.storage, &gid, &mut ahead, &bob_card).unwrap();
+        super::app_groups::send_app_payload(&bob.storage, &gid, &ahead).unwrap();
+        deliver_group_feed(&bob, &[&alice, &carol]);
+        assert!(carol.list_group_messages(&gid).unwrap().iter().any(|m| m.body == "наверх"), "shown");
+        let kept = carol.storage.list_recent_group_signed_lines(&gid, 100, None).unwrap();
+        assert!(kept.iter().all(|line| line.body != "наверх"), "not kept for newcomers");
+        // Pass 16: one member's lines are chosen before the bound — after it, the others' latest
+        // left none of theirs.
+        let alice_pub = alice.storage.get_group(&gid).unwrap().unwrap().my_member_pub;
+        let alices = carol.storage.list_recent_group_signed_lines(&gid, 1, Some(&alice_pub)).unwrap();
+        assert_eq!(alices.iter().map(|l| l.body.as_str()).collect::<Vec<_>>(), vec!["первое"], "Alice's own latest line");
 
         // The admin turns it off: Dave sees nothing from before.
         alice.set_group_newcomer_history(&gid, false).unwrap();
@@ -1375,7 +2504,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         let welcome = add_account_device(&bob.storage, "dialog:alice-new", &account_id, &known, &request)
             .unwrap()
             .expect("a new device of a member's account is added");
-        super::app_groups::join_from_welcome(&restored.storage, &restored.transport, &welcome).unwrap();
+        super::app_groups::join_from_welcome(&restored.storage, &restored.transport, "dialog:bob", &welcome).unwrap();
         deliver_group_feed(&bob, &[&alice, &restored]);
         let summaries = restored.list_group_summaries().unwrap();
         assert_eq!((summaries.len(), summaries[0].name.as_str()), (1, "Семья"));
@@ -1527,7 +2656,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         let welcome = add_account_device(&alice.storage, "dialog:desktop", &own, &known, &request)
             .unwrap()
             .expect("our member device adds our other device");
-        super::app_groups::join_from_welcome(&desktop.storage, &desktop.transport, &welcome).unwrap();
+        super::app_groups::join_from_welcome(&desktop.storage, &desktop.transport, "dialog:laptop", &welcome).unwrap();
         deliver_group_feed(&alice, &[&bob, &desktop]);
         assert!(desktop
             .list_group_messages(&gid)
@@ -1590,6 +2719,9 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
             version: i64::MAX,
             display_name: "Не Алиса".into(),
             avatar_jpeg_b64: None,
+            agent_of: None,
+            agents: Vec::new(),
+            agents_version: i64::MAX,
         };
         let changed = super::app_group_member_profiles::receive_profile(&alice.storage, &bob_card, &serde_json::to_string(&forged).unwrap()).unwrap();
         assert!(!changed);
@@ -1716,6 +2848,8 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
 
         // A forged "deleted" from a member changes nothing.
         let forged = omni_protocol::GroupAppPayloadV1 {
+            mentions: Vec::new(),
+            reply_to: None,
             message_id: "g-forged".into(),
             kind: omni_protocol::GroupAppKindV1::Dissolve,
             body: String::new(),
@@ -1771,7 +2905,8 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
             .unwrap();
         assert!(alice.list_group_summaries().unwrap().is_empty());
 
-        assert_eq!(super::app_groups::restore_groups_without_rows(&alice.storage), 1);
+        let any_node = omni_mesh_runtime::MeshNodeAddress::from_bytes([7u8; 20]);
+        assert_eq!(super::app_groups::restore_groups_without_rows(&alice.storage, &any_node), 1);
         let back = alice.list_group_summaries().unwrap();
         assert_eq!(back.len(), 1, "the left group stays gone");
         assert_eq!(back[0].name, "Дача");
@@ -1779,7 +2914,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         assert_eq!(members.iter().filter(|m| m.status == "member").count(), 2);
         assert!(members.iter().any(|m| m.is_me && m.role == "admin"));
         assert!(alice.storage.next_group_feed_seq(&gid).unwrap() > 1, "the feed counts on past what it carried");
-        assert_eq!(super::app_groups::restore_groups_without_rows(&alice.storage), 0, "once");
+        assert_eq!(super::app_groups::restore_groups_without_rows(&alice.storage, &any_node), 0, "once");
 
         alice.send_group_text(&gid, "после").unwrap();
         deliver_group_feed(&alice, &[&bob]);
@@ -1916,6 +3051,58 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     /// A call rings, it does not join: Bob hears Alice's Invite, sees it ringing, and is NOT in the call
     /// until he joins. Then mute/camera badges reach only the sender's tile (the sender is the
     /// MLS-authenticated leaf — a member cannot spoof another's badge).
+    #[test]
+    fn leaving_a_group_or_its_dissolution_ends_our_part_in_its_call() {
+        // A09, A10 (audit 2026-11-09 #6).
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-call-end", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-call-end", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Squad").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        deliver_group_feed(&bob, &[&alice]);
+        deliver_group_feed(&alice, &[&bob]);
+        alice.start_group_call(&gid).unwrap();
+        deliver_group_feed(&alice, &[&bob]);
+        bob.join_group_call(&gid).unwrap();
+        deliver_group_feed(&bob, &[&alice]);
+        let bob_db = bob.storage.db_path().to_string_lossy().to_string();
+        assert_eq!(crate::app_group_calls::group_call_in_progress(&bob_db), Some(gid.clone()));
+
+        // The admin dissolves the group: Bob, hearing it, is out of its call.
+        alice.delete_group_for_everyone(&gid).unwrap();
+        let alice_db = alice.storage.db_path().to_string_lossy().to_string();
+        assert_eq!(crate::app_group_calls::group_call_in_progress(&alice_db), None, "the dissolver is out of it");
+        deliver_group_feed(&alice, &[&bob]);
+        assert_eq!(bob.storage.get_group(&gid).unwrap().unwrap().my_status, "dissolved");
+        assert_eq!(crate::app_group_calls::group_call_in_progress(&bob_db), None, "a dissolved group's call ends here");
+        assert!(bob.group_call_inbox().unwrap().is_empty(), "and is not listed to join");
+
+        // Leaving a group in a call.
+        let solo = alice.create_group("Solo").unwrap().group_id;
+        alice.start_group_call(&solo).unwrap();
+        alice.leave_group(&solo).unwrap();
+        assert_eq!(crate::app_group_calls::group_call_in_progress(&alice_db), None, "leaving ends our part in the call");
+    }
+
+    #[test]
+    fn one_call_per_profile_holds_across_group_and_one_to_one_calls() {
+        // F5 (audit 2026-11-09 #5).
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-one-call", "alice"), "Alice", "Laptop");
+        let (first, second) = (alice.create_group("First").unwrap().group_id, alice.create_group("Second").unwrap().group_id);
+        alice.start_group_call(&first).expect("the first call");
+        assert!(alice.start_group_call(&second).is_err(), "not a second group call");
+        assert!(alice.group_call_snapshot(&second).unwrap().is_none());
+        assert!(alice.group_call_snapshot(&first).unwrap().is_some(), "the first call stays");
+        assert!(alice.place_call("dialog:instance:someone").is_err(), "not a 1:1 call beside it");
+        alice.leave_group_call(&first).unwrap();
+        // A 1:1 call (ringing counts) keeps a group call from starting.
+        let db_path = alice.storage.db_path().to_string_lossy().to_string();
+        set_current_call_runtime(&db_path, Some(test_active_call_runtime(CallState::Ringing))).unwrap();
+        assert!(alice.start_group_call(&second).is_err(), "not beside a 1:1 call");
+        set_current_call_runtime(&db_path, None).unwrap();
+        alice.start_group_call(&second).expect("free again");
+    }
+
     #[test]
     fn group_call_rings_joins_by_consent_and_badges_only_sender() {
         let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-call-consent", "alice"), "Alice", "Laptop");
@@ -2108,7 +3295,8 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
 
     /// Removing someone from the GROUP mid-call rotates the call secret (sent in the new epoch), so
     /// the removed member can neither decrypt nor forge the call's media; the rest share the new
-    /// key. Removing a member who is not in the call changes nothing.
+    /// key. A member removed while out of the call had the secret from the Invite all the same: the
+    /// call is rekeyed then too (blind audit 2026-11-11, L3).
     #[test]
     fn removing_a_call_participant_from_the_group_rekeys_the_call() {
         let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-call-rekey", "alice"), "Alice", "Laptop");
@@ -2143,11 +3331,14 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         assert_eq!(secret(&bob).as_ref(), Some(&original));
         assert_eq!(secret(&carol).as_ref(), Some(&original));
 
-        // Negative half: removing Dave (not in the call) leaves the key alone.
+        // Dave was not in the call, but he heard its Invite: his removal rekeys it for those in it.
         alice.remove_group_member(&gid, &member_pub_of(&alice, &gid, "Dave")).unwrap();
         exchange();
-        assert_eq!(secret(&alice).as_ref(), Some(&original), "a non-participant's removal does not rekey");
-        assert_eq!(secret(&bob).as_ref(), Some(&original));
+        let after_dave = secret(&alice).expect("alice in the call");
+        assert_ne!(after_dave, original, "a non-participant's removal rekeys too");
+        assert_eq!(secret(&bob).as_ref(), Some(&after_dave));
+        assert_eq!(secret(&carol).as_ref(), Some(&after_dave));
+        let original = after_dave;
 
         // Removing Carol mid-call rotates the key for those who stay.
         let carol_pub = member_pub_of(&alice, &gid, "Carol");
@@ -2267,10 +3458,28 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         // Bob's passport comes on the call's media, not the group feed: only the call hears it. It
         // fits one datagram with all three codecs in it.
         let bob_decodes = test_realtime_media_capabilities("group:x", all_three(), (1280, 720, 30), (1280, 720, 30));
-        let wire = super::app_group_calls::encode_group_passport(&bob_decodes).expect("a passport fits one datagram");
+        // It is signed by its member's identity key (V-27): read back only as that member, in this call.
+        let seed = [7u8; 32];
+        let signer = crate::app_screen_control::encode_identity(
+            &ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+        );
+        let wire = super::app_group_calls::encode_group_passport(&bob_decodes, &seed, &call_id)
+            .expect("a signed passport fits one datagram");
         assert!(wire.starts_with(super::app_group_calls::GROUP_PASSPORT_MAGIC));
-        let read = super::app_group_calls::decode_group_passport(&wire).flatten().expect("reads back");
+        let read = super::app_group_calls::decode_group_passport(&wire, &call_id, &signer)
+            .flatten()
+            .expect("reads back");
         assert_eq!(read.codecs, bob_decodes.codecs);
+        assert_eq!(
+            super::app_group_calls::decode_group_passport(&wire, &call_id, &bob_pub),
+            Some(None),
+            "a passport another member sealed as Bob is not Bob's"
+        );
+        assert_eq!(
+            super::app_group_calls::decode_group_passport(&wire, "another-call", &signer),
+            Some(None),
+            "a passport from another call is not replayed into this one"
+        );
         let db_path = app.storage.db_path().to_string_lossy().to_string();
         assert!(super::app_group_calls::note_member_video_capabilities(&db_path, &group_id, &bob_pub, bob_decodes.clone()));
         crate::reselect_group_media(&db_path, &dialog_key);
@@ -2335,23 +3544,284 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         app.leave_group_call(&group_id).ok();
     }
 
-    /// The periodic durable snapshot skips an unchanged set (order does not matter) and writes a
-    /// changed one.
+    /// Blind audit 2026-11-10: an `End` from any member of the group ended a group call, sent by
+    /// someone who was not in it. It takes out only its sender now, as `Leave` does.
     #[test]
-    fn durable_snapshot_marks_ignore_order_and_see_a_new_entry() {
-        let a = (vec![1u8; 16], 1i64, vec![9u8]);
-        let b = (vec![2u8; 16], 5i64, vec![8u8]);
-        let marks = super::durable_rows_marks;
-        assert_eq!(marks(&[a.clone(), b.clone()]), marks(&[b.clone(), a.clone()]));
-        let c = (vec![2u8; 16], 6i64, vec![7u8]);
-        assert_ne!(marks(&[a.clone(), b.clone()]), marks(&[a, b, c]));
+    fn a_group_call_is_not_ended_by_a_member_outside_it() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-group-call-end", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-call-end", "bob"), "Bob", "Laptop");
+        let carol = create_app_with_active_profile(isolated_test_db_path("omni-group-call-end", "carol"), "Carol", "Laptop");
+        let group_id = app.create_group("Talk").unwrap().group_id;
+        group_join_for_real(&app, &bob, &group_id, "dialog:bob");
+        group_join_for_real(&app, &carol, &group_id, "dialog:carol");
+        let bob_pub = member_pub_of(&app, &group_id, "Bob");
+        let carol_pub = member_pub_of(&app, &group_id, "Carol");
+        let call_id = app.start_group_call(&group_id).expect("start call").call_id;
+        let frame = |kind| omni_protocol::GroupCallControlV1 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            call_id: call_id.clone(),
+            control: kind,
+            call_secret_b64: None,
+            muted: Some(false),
+            camera_off: Some(true),
+            screen_sharing: Some(false),
+            screen_control: None,
+            at_unix_ms: 2_400,
+        };
+        super::app_group_calls::handle_group_call_control(
+            &app.storage,
+            &group_id,
+            &bob_pub,
+            &frame(omni_protocol::GroupCallControlKindV1::Join),
+        )
+        .unwrap();
+        let in_call = || app.group_call_snapshot(&group_id).unwrap().map(|call| call.participant_count);
+        assert_eq!(in_call(), Some(2));
+
+        super::app_group_calls::handle_group_call_control(
+            &app.storage,
+            &group_id,
+            &carol_pub,
+            &frame(omni_protocol::GroupCallControlKindV1::Leave),
+        )
+        .unwrap();
+        assert_eq!(in_call(), Some(2), "Carol, not in the call, takes nobody out");
+        super::app_group_calls::handle_group_call_control(
+            &app.storage,
+            &group_id,
+            &bob_pub,
+            &frame(omni_protocol::GroupCallControlKindV1::Leave),
+        )
+        .unwrap();
+        assert_eq!(in_call(), Some(1), "Bob's leave takes Bob out, not the call");
+        app.leave_group_call(&group_id).ok();
+    }
+
+    /// Blind audit 2026-11-13, pass 21: any member of the group took a running call over with an
+    /// Invite of a smaller call id («0»): we left the call for one of the sender's own. Only a call
+    /// just started, with nobody else in it yet, folds into an earlier one.
+    #[test]
+    fn group_call_does_not_replace_active_call_for_unjoined_member_invite() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-group-call-takeover", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-call-takeover", "bob"), "Bob", "Laptop");
+        let carol = create_app_with_active_profile(isolated_test_db_path("omni-group-call-takeover", "carol"), "Carol", "Laptop");
+        let group_id = app.create_group("Talk").unwrap().group_id;
+        group_join_for_real(&app, &bob, &group_id, "dialog:bob");
+        group_join_for_real(&app, &carol, &group_id, "dialog:carol");
+        let bob_pub = member_pub_of(&app, &group_id, "Bob");
+        let carol_pub = member_pub_of(&app, &group_id, "Carol");
+        let call_id = app.start_group_call(&group_id).expect("start call").call_id;
+        let frame = |call: &str, kind, secret: Option<&[u8]>| omni_protocol::GroupCallControlV1 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            call_id: call.to_string(),
+            control: kind,
+            call_secret_b64: secret.map(|s| base64::engine::general_purpose::STANDARD.encode(s)),
+            muted: Some(false),
+            camera_off: Some(true),
+            screen_sharing: Some(false),
+            screen_control: None,
+            at_unix_ms: current_unix_ms(),
+        };
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &bob_pub, &frame(&call_id, omni_protocol::GroupCallControlKindV1::Join, None)).unwrap();
+        let db_path = app.storage.db_path().to_string_lossy().to_string();
+        let secret = super::app_group_calls::call_secret_for_test(&db_path, &group_id);
+
+        let emits = super::app_group_calls::handle_group_call_control(
+            &app.storage,
+            &group_id,
+            &carol_pub,
+            &frame("0", omni_protocol::GroupCallControlKindV1::Invite, Some(&[9u8; 32])),
+        )
+        .unwrap();
+        assert!(emits.is_empty(), "no Leave of ours, no Join of Carol's");
+        let call = app.group_call_snapshot(&group_id).unwrap().expect("still in the call");
+        assert_eq!((call.call_id.as_str(), call.participant_count), (call_id.as_str(), 2));
+        assert_eq!(super::app_group_calls::call_secret_for_test(&db_path, &group_id), secret, "the same media keys");
+        app.leave_group_call(&group_id).ok();
+    }
+
+    /// Blind audit 2026-11-13, pass 23: a member who said it leaves keeps its leaf until an admin
+    /// takes it out; its request to be put back was checked against that tree and could bring it a
+    /// new Welcome. Not on its own word.
+    #[test]
+    fn a_member_who_left_is_not_put_back_on_its_own_request() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-left-readd", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-left-readd", "bob"), "Bob", "Laptop");
+        let gid = alice.create_group("Squad").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        let bob_pub = member_pub_of(&alice, &gid, "Bob");
+        // Bob said he leaves; a changed client of his asks to be put back, with a KeyPackage of his.
+        alice.storage.set_group_member_status(&gid, &bob_pub, "left").unwrap();
+        let request = crate::app_groups::with_engine(&bob.storage, |engine| engine.rejoin_request()).unwrap();
+        let item = serde_json::to_string(&omni_protocol::GroupFeedItemV2 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            group_id: gid.clone(),
+            mls_b64: base64::engine::general_purpose::STANDARD.encode(request),
+        })
+        .unwrap();
+        super::app_groups::ingest_group_feed_item(&alice.storage, &alice.transport, &item).unwrap();
+        assert_eq!(alice.storage.list_group_readd_requests().unwrap().len(), 1, "the request is heard");
+        super::app_group_branches::group_branch_tick(&alice.storage, current_unix_ms() + 60 * 60 * 1000);
+        assert!(alice.storage.list_group_readd_requests().unwrap().is_empty(), "dropped");
+        assert!(alice.storage.list_group_pending_welcomes().unwrap().is_empty(), "no Welcome for Bob");
+    }
+
+    /// Blind audit 2026-11-13, pass 23: a call we knew of and had not joined was taken over by any
+    /// member's Join of an old, smaller id; we joined a call nobody was in.
+    #[test]
+    fn old_call_id_cannot_replace_fresh_ringing_call() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-group-call-old-id", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-call-old-id", "bob"), "Bob", "Laptop");
+        let carol = create_app_with_active_profile(isolated_test_db_path("omni-group-call-old-id", "carol"), "Carol", "Laptop");
+        let group_id = app.create_group("Talk").unwrap().group_id;
+        group_join_for_real(&app, &bob, &group_id, "dialog:bob");
+        group_join_for_real(&app, &carol, &group_id, "dialog:carol");
+        let bob_pub = member_pub_of(&app, &group_id, "Bob");
+        let carol_pub = member_pub_of(&app, &group_id, "Carol");
+        let frame = |call: String, kind, secret: &[u8]| omni_protocol::GroupCallControlV1 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            call_id: call,
+            control: kind,
+            call_secret_b64: Some(base64::engine::general_purpose::STANDARD.encode(secret)),
+            muted: None,
+            camera_off: None,
+            screen_sharing: None,
+            screen_control: None,
+            at_unix_ms: current_unix_ms(),
+        };
+        let bobs = format!("gcall-{:013}-aa", current_unix_ms());
+        let old = format!("gcall-{:013}-bb", current_unix_ms() - 30 * 24 * 60 * 60 * 1000);
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &bob_pub, &frame(bobs.clone(), omni_protocol::GroupCallControlKindV1::Invite, &[1u8; 32])).unwrap();
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &carol_pub, &frame(old, omni_protocol::GroupCallControlKindV1::Join, &[2u8; 32])).unwrap();
+        assert_eq!(app.start_group_call(&group_id).unwrap().call_id, bobs, "the call that rang");
+        app.leave_group_call(&group_id).ok();
+    }
+
+    /// Blind audit 2026-11-13, pass 23: the passport counted a chat «through» the time it was made,
+    /// while a line dated past it (the clock set back) was counted too — a restore then took that
+    /// line from no one. Through the latest line counted.
+    #[test]
+    fn passport_through_matches_fingerprinted_lines_when_clock_moves_backward() {
+        let alice = create_stage5_peer("hs-through-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-through-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let now = current_unix_ms();
+        alice.app.storage.insert_incoming_message("ahead-1", &chat.chat_dialog_key, "written before the clock went back", now + 90_000).unwrap();
+        let (_, count, _, through) = crate::passport_chat_fingerprints(&alice.app.storage, &own, now)
+            .into_iter()
+            .find(|(account, ..)| account == &bob_account.0)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(through >= now + 90_000, "the line counted is within it");
+    }
+
+    /// Blind audit 2026-11-13, pass 22: three pressed «call» at once; one call was joined before the
+    /// earliest one's Invite came, and folding only while alone left two calls in the group for good.
+    #[test]
+    fn three_concurrent_group_starts_converge_after_delayed_lowest_invite() {
+        let a = create_app_with_active_profile(isolated_test_db_path("omni-group-call-three", "alice"), "Alice", "Laptop");
+        let b = create_app_with_active_profile(isolated_test_db_path("omni-group-call-three", "bob"), "Bob", "Laptop");
+        let c = create_app_with_active_profile(isolated_test_db_path("omni-group-call-three", "carol"), "Carol", "Laptop");
+        let gid = a.create_group("Squad").unwrap().group_id;
+        group_join_for_real(&a, &b, &gid, "dialog:bob");
+        group_join_for_real(&a, &c, &gid, "dialog:carol");
+        deliver_group_feed(&a, &[&b, &c]);
+        deliver_group_feed(&b, &[&a, &c]);
+        deliver_group_feed(&c, &[&a, &b]);
+
+        let first = a.start_group_call(&gid).unwrap().call_id;
+        std::thread::sleep(Duration::from_millis(5));
+        let second = b.start_group_call(&gid).unwrap().call_id;
+        std::thread::sleep(Duration::from_millis(5));
+        let third = c.start_group_call(&gid).unwrap().call_id;
+        assert!(first < second && second < third);
+        // Carol hears Bob first and moves to his call; Bob hears her join it. Alice's Invite comes last.
+        deliver_group_feed(&b, &[&c]);
+        deliver_group_feed(&c, &[&b]);
+        assert_eq!(b.group_call_snapshot(&gid).unwrap().unwrap().participant_count, 2, "Carol is in Bob's call");
+        for _ in 0..3 {
+            deliver_group_feed(&a, &[&b, &c]);
+            deliver_group_feed(&b, &[&a, &c]);
+            deliver_group_feed(&c, &[&a, &b]);
+        }
+        for app in [&a, &b, &c] {
+            assert_eq!(app.group_call_snapshot(&gid).unwrap().unwrap().call_id, first, "one call: the earliest");
+        }
+    }
+
+    /// Blind audit 2026-11-13, pass 22: a Rekey from a member whose Join was still on the way was
+    /// dropped, and we stayed on the old key once it joined. It is held until the member is in.
+    #[test]
+    fn group_call_applies_rekey_received_before_join() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-group-call-early-rekey", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-call-early-rekey", "bob"), "Bob", "Laptop");
+        let group_id = app.create_group("Talk").unwrap().group_id;
+        group_join_for_real(&app, &bob, &group_id, "dialog:bob");
+        let bob_pub = member_pub_of(&app, &group_id, "Bob");
+        let call_id = app.start_group_call(&group_id).expect("start call").call_id;
+        let frame = |kind, secret: Option<&[u8]>| omni_protocol::GroupCallControlV1 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            call_id: call_id.clone(),
+            control: kind,
+            call_secret_b64: secret.map(|s| base64::engine::general_purpose::STANDARD.encode(s)),
+            muted: Some(false),
+            camera_off: Some(true),
+            screen_sharing: Some(false),
+            screen_control: None,
+            at_unix_ms: current_unix_ms(),
+        };
+        let db_path = app.storage.db_path().to_string_lossy().to_string();
+        let before = super::app_group_calls::call_secret_for_test(&db_path, &group_id).unwrap();
+        let new_secret = vec![0u8; 32];
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &bob_pub, &frame(omni_protocol::GroupCallControlKindV1::Rekey, Some(&new_secret))).unwrap();
+        assert_eq!(super::app_group_calls::call_secret_for_test(&db_path, &group_id).unwrap(), before, "not in the call yet: held");
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &bob_pub, &frame(omni_protocol::GroupCallControlKindV1::Join, None)).unwrap();
+        assert_eq!(super::app_group_calls::call_secret_for_test(&db_path, &group_id).unwrap(), new_secret, "taken once Bob is in");
+        app.leave_group_call(&group_id).ok();
+    }
+
+    /// Blind audit 2026-11-13, pass 21: a member not in a call we knew of but had not joined changed
+    /// its secret by a Rekey, and we joined on a key nobody in the call held.
+    #[test]
+    fn group_call_rekey_does_not_change_known_secret_from_nonparticipant() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-group-call-known-rekey", "alice"), "Alice", "Laptop");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-call-known-rekey", "bob"), "Bob", "Laptop");
+        let carol = create_app_with_active_profile(isolated_test_db_path("omni-group-call-known-rekey", "carol"), "Carol", "Laptop");
+        let group_id = app.create_group("Talk").unwrap().group_id;
+        group_join_for_real(&app, &bob, &group_id, "dialog:bob");
+        group_join_for_real(&app, &carol, &group_id, "dialog:carol");
+        let bob_pub = member_pub_of(&app, &group_id, "Bob");
+        let carol_pub = member_pub_of(&app, &group_id, "Carol");
+        let frame = |kind, secret: &[u8]| omni_protocol::GroupCallControlV1 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            call_id: "gcall-k".to_string(),
+            control: kind,
+            call_secret_b64: Some(base64::engine::general_purpose::STANDARD.encode(secret)),
+            muted: None,
+            camera_off: None,
+            screen_sharing: None,
+            screen_control: None,
+            at_unix_ms: current_unix_ms(),
+        };
+        let honest = [1u8; 32];
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &bob_pub, &frame(omni_protocol::GroupCallControlKindV1::Invite, &honest)).unwrap();
+        super::app_group_calls::handle_group_call_control(&app.storage, &group_id, &carol_pub, &frame(omni_protocol::GroupCallControlKindV1::Rekey, &[2u8; 32])).unwrap();
+
+        assert_eq!(app.start_group_call(&group_id).unwrap().call_id, "gcall-k", "the call button joins Bob's call");
+        let db_path = app.storage.db_path().to_string_lossy().to_string();
+        assert_eq!(super::app_group_calls::call_secret_for_test(&db_path, &group_id), Some(honest.to_vec()));
+        app.leave_group_call(&group_id).ok();
     }
 
     #[test]
     fn init_creates_database_and_ping_works() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-0-app-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -2398,7 +3868,8 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         let nonce_hex = hex::encode(nonce);
         let node = omni_mesh_runtime::MeshNodeAddress::from_bytes([0x9Au8; 20]);
         let secret = omni_crypto::derive_rendezvous_bootstrap_secret(&nonce).unwrap();
-        app.register_bootstrap_invite(&nonce_hex, secret, Some(node), current_unix_ms() + 60_000);
+        let seal = crate::importer_seal(node, [0x5Cu8; 32]).unwrap();
+        app.register_bootstrap_invite(&nonce_hex, secret, seal, current_unix_ms() + 60_000);
 
         // Simulate a process restart: the in-memory sets are gone, but storage keeps the row.
         app.mesh_bootstrap_invites.lock().unwrap().clear();
@@ -2407,7 +3878,12 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         app.reload_persisted_bootstrap_invites();
         let invites = app.mesh_bootstrap_invites.lock().unwrap();
         let entry = invites.get(&nonce_hex).expect("invite reloaded from storage");
-        assert_eq!(entry.inviter_node, Some(node), "inviter node round-trips");
+        assert_eq!(entry.inviter_node(), Some(node), "inviter node round-trips");
+        assert!(
+            matches!(entry.seal, crate::InviteSeal::Importer { inviter_key, .. } if inviter_key == [0x5Cu8; 32]),
+            "and the inviter's reply key: {:?}",
+            entry.seal
+        );
         assert_eq!(entry.secret, secret, "secret re-derived from the persisted nonce");
         drop(invites);
         assert!(
@@ -2610,6 +4086,213 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         }
     }
 
+    /// Blind audit 2026-11-11, pass 14 (N1): a backup was a snapshot of the whole install under one
+    /// profile's key — the other profiles' chats, keys and files went with it. It is one profile's
+    /// now; and since a restore replaces the install, it is refused where it would delete a profile
+    /// the copy does not hold.
+    #[test]
+    fn a_backup_holds_one_profile_and_a_restore_deletes_no_other() {
+        use crate::opened_backups;
+        let base_dir = std::env::temp_dir()
+            .join("omni-stage-0-app-tests")
+            .join(format!("backup-one-profile-{}", unique_suffix()));
+        let source_db_path = base_dir.join("source").join("omni.db");
+        let target_db_path = base_dir.join("target").join("omni.db");
+        let backup_path = base_dir.join("backup").join("copy.omnibackup");
+        for dir in ["source", "backup", "target"] {
+            fs::create_dir_all(base_dir.join(dir)).unwrap();
+        }
+        let attach = |app: &OmniApp, name: &str, line: &str| {
+            let path = base_dir.join("source").join(name);
+            fs::write(&path, line).unwrap();
+            app.storage
+                .prepare_outgoing_attachment(
+                    &format!("message-{name}"),
+                    &dialog_key_from_instance_id("backup-inst"),
+                    path.to_str().unwrap(),
+                    None,
+                    omni_types::AttachmentMediaProtectionMode::E2eeMedia,
+                    1_000,
+                )
+                .unwrap();
+        };
+
+        let app = OmniApp::init(AppInitRequest { db_path: source_db_path.to_string_lossy().into_owned() }).unwrap();
+        let first = app.create_account("First Owner", "Shared PC").unwrap();
+        let first_profile = first.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        attach(&app, "first.txt", "a line of the first profile");
+        confirm_sign_out_profile(&app, &first_profile);
+        let second = app.create_account("Second Owner", "Shared PC").unwrap();
+        let second_profile = second.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        let mnemonic = second.recovery_phrase_v2.as_ref().unwrap().mnemonic.clone();
+        attach(&app, "second.txt", "a line of the second profile");
+        assert_eq!(app.storage.list_local_profiles().unwrap().profiles.len(), 2);
+        let blobs_of = |db: &Path| fs::read_dir(attachments_directory_for_db_path(db).unwrap().join("blobs")).unwrap().count();
+        assert_eq!(blobs_of(&source_db_path), 2);
+
+        app.export_current_database_backup_bundle(&backup_path).unwrap();
+        // The install is as it was: both profiles, both files.
+        assert_eq!(app.storage.list_local_profiles().unwrap().profiles.len(), 2);
+        assert_eq!(blobs_of(&source_db_path), 2);
+
+        let inspection = OmniApp::inspect_account_backup_manifest(backup_path.to_string_lossy(), &mnemonic).unwrap();
+        // Other tests open copies too: this one's is the one that holds its profile.
+        let opened = opened_backups()
+            .lock()
+            .unwrap()
+            .values()
+            .find(|db| Storage::open(db).ok().and_then(|copy| copy.get_local_profile_summary(&second_profile).ok().flatten()).is_some())
+            .cloned()
+            .expect("the inspection opened the copy");
+        {
+            let copy = Storage::open(&opened).unwrap();
+            let profiles = copy.list_local_profiles().unwrap().profiles;
+            assert_eq!(profiles.len(), 1, "one profile in the copy");
+            assert_eq!(profiles[0].profile_id, second_profile);
+            assert!(copy.get_local_profile_footprint_summary(&first_profile).unwrap().is_none());
+        }
+        let keys = fs::read_to_string(opened.with_file_name(Storage::database_key_file_name(
+            &opened.file_name().unwrap().to_string_lossy(),
+        )))
+        .unwrap();
+        assert!(keys.contains(&second.descriptor.account_id.0), "its own account opens the copy by the phrase");
+        assert!(!keys.contains(&first.descriptor.account_id.0), "no wrap of another account");
+
+        // Over the install that holds the first profile, the restore is refused, and nothing is lost.
+        let error = OmniApp::import_database_backup_bundle(source_db_path.to_string_lossy(), &backup_path, &inspection.inspection_token)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("other profiles"), "{error}");
+        assert_eq!(app.storage.list_local_profiles().unwrap().profiles.len(), 2);
+
+        // On an empty device it brings the one profile and its one file.
+        let inspection = OmniApp::inspect_account_backup_manifest(backup_path.to_string_lossy(), &mnemonic).unwrap();
+        OmniApp::import_database_backup_bundle(target_db_path.to_string_lossy(), &backup_path, &inspection.inspection_token).unwrap();
+        let restored = Storage::open(&target_db_path).unwrap();
+        assert_eq!(restored.list_local_profiles().unwrap().profiles.len(), 1);
+        assert_eq!(blobs_of(&target_db_path), 1, "only the file of the profile's own message");
+        // The row names the file where it is now, not where the copy was made.
+        let named: String = Storage::open_keyed_connection(&target_db_path)
+            .unwrap()
+            .query_row("SELECT local_blob_path FROM message_attachments WHERE message_id = 'message-second.txt'", [], |row| row.get(0))
+            .unwrap();
+        assert!(Path::new(&named).starts_with(base_dir.join("target")), "{named}");
+        assert!(Path::new(&named).is_file());
+    }
+
+    /// V-25 (review 2026-10-18): saving the encrypted backup puts nothing but the finished file at the
+    /// destination (a cloud folder, a flash drive): the plain copy is packed in the profile's folder,
+    /// and a save that fails leaves neither it nor a half-written file anywhere.
+    #[test]
+    fn an_encrypted_backup_is_packed_in_the_profile_folder_and_a_failed_save_leaves_nothing() {
+        let base_dir = std::env::temp_dir()
+            .join("omni-stage-0-app-tests")
+            .join(format!("backup-staging-{}", unique_suffix()));
+        let profile_folder = base_dir.join("profile");
+        let destination = base_dir.join("cloud");
+        fs::create_dir_all(&profile_folder).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let app = OmniApp::init(AppInitRequest {
+            db_path: profile_folder.join("omni.db").to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        app.create_account("Alice", "Alice PC").unwrap();
+        let staging_in = |folder: &Path| {
+            fs::read_dir(folder)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".omni-backup-"))
+                .count()
+        };
+
+        // F05 (audit 2026-11-09): a file of the person's named like the half-written one stays.
+        fs::write(destination.join("copy.part"), "мой файл").unwrap();
+        fs::write(destination.join("blocked.part"), "мой файл").unwrap();
+        let saved = destination.join("copy.omnibackup");
+        app.export_current_database_backup_bundle(&saved).unwrap();
+        let mut at_destination: Vec<_> = fs::read_dir(&destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        at_destination.sort();
+        assert_eq!(at_destination, vec!["blocked.part".to_string(), "copy.omnibackup".to_string(), "copy.part".to_string()]);
+        assert_eq!(staging_in(&profile_folder), 0, "the staging copy goes once packed");
+
+        // The final name is taken by a folder: the rename fails after the file was written.
+        let blocked = destination.join("blocked.omnibackup");
+        fs::create_dir_all(blocked.join("inside")).unwrap();
+        assert!(app.export_current_database_backup_bundle(&blocked).is_err());
+        let half_written = fs::read_dir(&destination).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".omni-part")).count();
+        assert_eq!(half_written, 0, "the half-written file goes");
+        for name in ["copy.part", "blocked.part"] {
+            assert_eq!(fs::read_to_string(destination.join(name)).unwrap(), "мой файл", "{name} is the person's");
+        }
+        assert_eq!(staging_in(&destination), 0);
+        assert_eq!(staging_in(&profile_folder), 0);
+    }
+
+    /// Audit 2026-11-09: opening a backup stops with a plain reason when its entries do not fit on the
+    /// disk (the staging folder is on the system disk), and a name that comes twice is a damaged file,
+    /// not a second copy written over the first.
+    #[test]
+    fn opening_a_backup_needs_room_for_it_and_takes_each_name_once() {
+        let staging = std::env::temp_dir().join("omni-stage-0-app-tests").join(format!("unpack-{}", unique_suffix()));
+        let entry = |name: &str, bytes: &[u8]| {
+            let mut out = vec![crate::BACKUP_ENTRY_FILE];
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+            out
+        };
+        let file = |entries: &[Vec<u8>]| {
+            let mut out: Vec<u8> = entries.concat();
+            out.push(crate::BACKUP_ENTRY_END);
+            out
+        };
+        let plenty = |_: &Path| -> omni_types::OmniResult<Option<u64>> { Ok(Some(u64::MAX)) };
+        let unpack = |bytes: Vec<u8>, free: &dyn Fn(&Path) -> omni_types::OmniResult<Option<u64>>| {
+            let _ = fs::remove_dir_all(&staging);
+            fs::create_dir_all(&staging).unwrap();
+            crate::unpack_backup_entries(&mut bytes.as_slice(), &staging, free)
+        };
+
+        unpack(file(&[entry("omni.db", b"db"), entry("omni.db.bundle/a", b"one")]), &plenty).unwrap();
+        assert_eq!(fs::read(staging.join("omni.db.bundle").join("a")).unwrap(), b"one");
+
+        let twice = unpack(file(&[entry("omni.db", b"db"), entry("omni.db.bundle/a", b"one"), entry("omni.db.bundle/a", b"two")]), &plenty);
+        assert!(twice.unwrap_err().to_string().contains("damaged"), "a name twice is a damaged file");
+
+        let small_disk = |_: &Path| -> omni_types::OmniResult<Option<u64>> { Ok(Some(crate::BACKUP_KEEP_FREE_BYTES + 10)) };
+        let error = unpack(file(&[entry("omni.db", b"db"), entry("omni.db.bundle/big", &[7; 64])]), &small_disk).unwrap_err();
+        assert!(error.to_string().contains("not enough free disk space"), "{error}");
+        assert!(!staging.join("omni.db.bundle").join("big").exists(), "nothing of an entry that does not fit is written");
+
+        assert!(unpack(file(&[entry("omni.db.bundle/a", b"one")]), &plenty).is_err(), "no database");
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    /// Audit 2026-11-09: the sweep of stale backup staging folders leaves one an operation of this
+    /// process is still writing — a long save is not cut by another save or check.
+    #[test]
+    fn the_staging_sweep_leaves_a_folder_still_in_use() {
+        let folder = std::env::temp_dir().join("omni-stage-0-app-tests").join(format!("sweep-{}", unique_suffix()));
+        let (in_use, left) = (folder.join(".omni-backup-inuse"), folder.join(".omni-backup-left"));
+        for dir in [&in_use, &left] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("omni.db"), "plain copy").unwrap();
+        }
+        let live = crate::LiveStaging::new(&in_use);
+        crate::remove_backup_staging_older_than(&folder, std::time::Duration::ZERO);
+        assert!(in_use.join("omni.db").exists(), "a folder in use stays");
+        assert!(!left.exists(), "a left-over one goes");
+        drop(live);
+        crate::remove_backup_staging_older_than(&folder, std::time::Duration::ZERO);
+        assert!(!in_use.exists(), "once its operation ended, it goes too");
+        let _ = fs::remove_dir_all(&folder);
+    }
+
     #[test]
     fn a_backup_file_cannot_name_a_path_outside_itself() {
         use crate::backup_entry_path;
@@ -2633,7 +4316,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn bundle_backup_export_rejects_current_database_path() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-0-app-tests")
-            .join(format!("bundle-export-same-path-{}.db", unique_suffix()));
+            .join(format!("bundle-export-same-path-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -2762,7 +4445,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn create_account_baseline_creates_local_account_and_device_snapshots() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -2793,10 +4476,10 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn restore_account_from_mnemonic_reuses_account_identity_and_marks_restored_state() {
         let original_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("orig-{}.db", unique_suffix()));
+            .join(format!("orig-{}", unique_suffix())).join("omni.db");
         let restore_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("restore-{}.db", unique_suffix()));
+            .join(format!("restore-{}", unique_suffix())).join("omni.db");
 
         let original_app = OmniApp::init(AppInitRequest {
             db_path: original_db_path.to_string_lossy().into_owned(),
@@ -2831,10 +4514,10 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn restore_account_from_mnemonic_accepts_v2_phrase() {
         let original_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("orig-input-{}.db", unique_suffix()));
+            .join(format!("orig-input-{}", unique_suffix())).join("omni.db");
         let mnemonic_restore_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("restore-mnemonic-{}.db", unique_suffix()));
+            .join(format!("restore-mnemonic-{}", unique_suffix())).join("omni.db");
 
         let original_app = OmniApp::init(AppInitRequest {
             db_path: original_db_path.to_string_lossy().into_owned(),
@@ -2869,7 +4552,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn inspect_recovery_input_and_reopen_local_profile_are_distinct() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-app-tests")
-            .join(format!("recovery-contract-{}.db", unique_suffix()));
+            .join(format!("recovery-contract-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -2911,7 +4594,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn reopen_local_profile_rejects_locked_profiles() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-app-tests")
-            .join(format!("reopen-locked-{}.db", unique_suffix()));
+            .join(format!("reopen-locked-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -2936,7 +4619,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn restore_account_from_mnemonic_reports_existing_profile_conflict() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-app-tests")
-            .join(format!("restore-conflict-{}.db", unique_suffix()));
+            .join(format!("restore-conflict-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -2960,7 +4643,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn lifecycle_summaries_reflect_profile_gate_state() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-summary-{}.db", unique_suffix()));
+            .join(format!("lifecycle-summary-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3017,7 +4700,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn lifecycle_requires_explicit_active_profile_selection() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("active-profile-selection-{}.db", unique_suffix()));
+            .join(format!("active-profile-selection-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3063,7 +4746,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn lifecycle_invalid_transition_returns_typed_error_code() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-transition-{}.db", unique_suffix()));
+            .join(format!("lifecycle-transition-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3102,7 +4785,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn lifecycle_unlock_failures_return_typed_error_codes() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-unlock-errors-{}.db", unique_suffix()));
+            .join(format!("lifecycle-unlock-errors-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3149,7 +4832,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
     fn deleting_the_last_profile_wipes_its_groups_and_mls_state() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-delete-groups-{}.db", unique_suffix()));
+            .join(format!("lifecycle-delete-groups-{}", unique_suffix())).join("omni.db");
         let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
         let account = app.create_account("Alice", "Office PC").unwrap();
         let profile_id = account.local_profile_summary.as_ref().unwrap().profile_id.clone();
@@ -3163,7 +4846,7 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         // Negative half first: the state is really there before the delete.
         assert_eq!(count("SELECT COUNT(*) FROM groups"), 1);
         assert!(count("SELECT COUNT(*) FROM openmls_group_data") > 0);
-        assert_eq!(count("SELECT COUNT(*) FROM mls_storage_key"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM mls_storage_keys"), 1);
 
         confirm_sign_out_profile(&app, &profile_id);
         let token = app
@@ -3179,14 +4862,538 @@ fn confirm_sign_out_profile(app: &OmniApp, profile_id: &omni_identity::LocalProf
         assert_eq!(count("SELECT COUNT(*) FROM group_message_meta"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM openmls_group_data"), 0, "MLS group state wiped");
         assert_eq!(count("SELECT COUNT(*) FROM openmls_signature_keys") + count("SELECT COUNT(*) FROM openmls_key_packages"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM mls_storage_key"), 0, "the at-rest key is gone too");
+        assert_eq!(count("SELECT COUNT(*) FROM mls_storage_keys"), 0, "the at-rest key is gone too");
+    }
+
+    /// F3 (audit 2026-11-09 #5): deleting the profile takes its projects' data under the profile
+    /// folder and the content of an archive kept on another disk — not that folder itself, nor the
+    /// working folder the project was bound to, which are the person's.
+    #[test]
+    fn deleting_a_profile_takes_its_projects_data_and_leaves_the_persons_folders() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("delete-workspaces-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let account = app.create_account("Alice", "Office PC").unwrap();
+        let profile_id = account.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        let project = base.join("profile").join("workspaces").join("group-1").join("docs.files");
+        let (archive, work) = (base.join("archive-disk"), base.join("work"));
+        let object = project.join("content").join("objects").join("ab").join("cd").join("abcd");
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(&object, "PRIVATE PROJECT CONTENT").unwrap();
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("model.prt"), "the person's file").unwrap();
+        crate::app_workspace::content::configure_store(&project, &archive).unwrap();
+        let archived = archive.join("objects").join("ef").join("01").join("ef01");
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        fs::write(&archived, "ARCHIVED CONTENT").unwrap();
+        fs::write(archive.join("notes.txt"), "the person's file").unwrap();
+        // A task project's folder Omni made itself, and a plain copy handed to an outside program.
+        let tasks = omni_storage::ProfileFolder::WorkspaceTasks.path(&db_path).unwrap().join("group-1");
+        fs::create_dir_all(&tasks).unwrap();
+        fs::write(tasks.join("task.md"), "a task").unwrap();
+        let open_copy = omni_storage::ProfileFolder::Scratch.path(&db_path).unwrap().join("open").join("photo.jpg");
+        fs::create_dir_all(open_copy.parent().unwrap()).unwrap();
+        fs::write(&open_copy, "plain").unwrap();
+        app.storage
+            .upsert_workspace_repo(&omni_storage::WorkspaceRepoRecord {
+                group_id: "group-1".into(),
+                repo: "tasks".into(),
+                published_path: project.with_file_name("tasks.files").to_string_lossy().into_owned(),
+                work_path: Some(tasks.to_string_lossy().into_owned()),
+                announced_refs_json: None,
+                created_at_unix_ms: 1,
+            })
+            .unwrap();
+        app.storage
+            .upsert_workspace_repo(&omni_storage::WorkspaceRepoRecord {
+                group_id: "group-1".into(),
+                repo: "docs".into(),
+                published_path: project.to_string_lossy().into_owned(),
+                work_path: Some(work.to_string_lossy().into_owned()),
+                announced_refs_json: None,
+                created_at_unix_ms: 1,
+            })
+            .unwrap();
+
+        confirm_sign_out_profile(&app, &profile_id);
+        let token = app.preview_delete_local_profile(&profile_id).unwrap().unwrap().confirmation_token.unwrap();
+        app.confirm_delete_local_profile(&profile_id, Some(&token)).unwrap();
+
+        assert!(!project.exists(), "the project's data goes with the profile");
+        assert!(!base.join("profile").join("workspaces").exists(), "the last profile takes the whole folder");
+        assert!(!archive.join("objects").exists(), "the archive's content goes");
+        assert_eq!(fs::read_to_string(archive.join("notes.txt")).unwrap(), "the person's file", "the archive folder is the person's");
+        assert_eq!(fs::read_to_string(work.join("model.prt")).unwrap(), "the person's file", "the working folder stays");
+        assert!(!tasks.exists(), "a task folder Omni made goes");
+        assert!(!open_copy.exists(), "plain copies go");
+        // What the last profile leaves in its folder: the open database's own files, nothing else.
+        let left: Vec<String> = fs::read_dir(base.join("profile"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("omni.db"))
+            .collect();
+        assert!(left.is_empty(), "left in the profile folder: {left:?}");
+
+        // Nothing outside the profile's `workspaces` is taken for a project's data.
+        let outside = base.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        crate::app_workspace::remove_profile_workspace_data(&db_path, &[(outside.to_string_lossy().into_owned(), None)]);
+        assert!(outside.exists());
+    }
+
+    /// Blind audit 2026-11-12, pass 17: two profiles of one database in one group published one
+    /// repository (`workspaces/<group>/<repo>.git`), and the second announced the first one's local
+    /// branches as its own. Each profile's projects live in a folder of its own.
+    #[test]
+    fn two_profiles_of_a_database_in_one_group_keep_their_projects_apart() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("workspace-per-profile-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = app.create_account("Bob", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        for profile in [&alice, &bob] {
+            connection
+                .execute(
+                    "INSERT INTO groups (profile_id, group_id, name, my_member_pub, my_status, dialog_key, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, 'group-1', 'Group', 'pub', 'member', 'group:group-1', 1, 1)",
+                    [&profile.0],
+                )
+                .unwrap();
+        }
+        let published = |profile: &omni_identity::LocalProfileId| {
+            app.select_active_profile(profile).unwrap();
+            PathBuf::from(app.workspace_add_repo("group-1", "notes", None).unwrap().published_path)
+        };
+        let alices = published(&alice);
+        let bobs = published(&bob);
+        assert_ne!(alices, bobs, "a repository of each");
+        assert!(alices.starts_with(omni_storage::ProfileFolder::Workspaces.path(&db_path).unwrap().join(&alice.0)));
+        assert!(bobs.starts_with(omni_storage::ProfileFolder::Workspaces.path(&db_path).unwrap().join(&bob.0)));
+    }
+
+    /// Blind audit 2026-11-12, pass 17: the MLS engine had a connection of its own, so our Commit was
+    /// merged before its line went on the group's feed. A failure in between (a full disk) left our
+    /// group an epoch ahead of a Commit no member would ever get. The two are one step now.
+    #[test]
+    fn our_commit_that_cannot_go_on_the_feed_is_not_merged_either() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("commit-feed-atomic-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        app.create_account("Alice", "Office PC").unwrap();
+        let gid = app.create_group("Before").unwrap().group_id;
+        let gid_bytes = crate::app_groups::group_id_bytes(&gid).unwrap();
+        let epoch = || crate::app_groups::with_engine(&app.storage, |engine| engine.view(&gid_bytes)).unwrap().epoch;
+        let before = epoch();
+
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        connection
+            .execute_batch("CREATE TRIGGER feed_full BEFORE INSERT ON group_feed_outbox BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;")
+            .unwrap();
+        assert!(app.rename_group(&gid, "After").is_err());
+        assert_eq!(epoch(), before, "the Commit that did not go on the feed is not merged");
+        assert_eq!(app.storage.get_group(&gid).unwrap().unwrap().name, "Before");
+
+        connection.execute_batch("DROP TRIGGER feed_full;").unwrap();
+        app.rename_group(&gid, "After").unwrap();
+        assert_eq!(epoch(), before + 1);
+        assert_eq!(app.storage.get_group(&gid).unwrap().unwrap().name, "After");
+    }
+
+    /// Blind audit 2026-11-13, pass 18: our change made again after a lost branch sent its 1:1
+    /// invitations from inside the transaction of the Commit that called for it; a rollback after
+    /// took back the ratchet step the frame went out with. A 1:1 group control never goes out of an
+    /// open transaction.
+    #[test]
+    fn a_group_control_does_not_go_out_of_an_open_transaction() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-control-tx", "alice"), "Alice", "A");
+        let invite = omni_protocol::GroupInviteV2 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            group_id: "00".repeat(16),
+            name: "Group".into(),
+            inviter_name: "Alice".into(),
+            renew: false,
+            authored_at_unix_ms: 1,
+        };
+        let error = app
+            .storage
+            .with_immediate_transaction("test", |storage| crate::app_groups::send_device_offer(storage, &app.transport, "dialog:bob", &invite))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("open transaction"), "{error}");
+    }
+
+    /// Blind audit 2026-11-13, pass 18: the MLS tables were brought up to date on a connection of
+    /// their own at the first MLS step after a start — inside our open write transaction when that
+    /// step was part of one (a Commit, a line), and the second connection waited on the first.
+    #[test]
+    fn the_first_mls_step_after_a_start_inside_a_transaction_does_not_wait_on_itself() {
+        let app = create_app_with_active_profile(isolated_test_db_path("omni-mls-migrate", "alice"), "Alice", "A");
+        let gid = app.create_group("Before").unwrap().group_id;
+        crate::app_groups::forget_mls_migrated_for_tests(&app.storage);
+        app.rename_group(&gid, "After").unwrap();
+        assert_eq!(app.storage.get_group(&gid).unwrap().unwrap().name, "After");
+    }
+
+    /// Blind audit 2026-11-13, pass 18: a new group's MLS state was stored before its row here; a
+    /// failure between them left MLS state of a group nobody sees.
+    #[test]
+    fn a_group_that_cannot_be_written_here_leaves_no_mls_state() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("create-group-atomic-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        app.create_account("Alice", "Office PC").unwrap();
+        app.create_group("First").unwrap();
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        let groups = || -> i64 { connection.query_row("SELECT COUNT(*) FROM openmls_group_data", [], |row| row.get(0)).unwrap() };
+        let before = groups();
+        connection
+            .execute_batch("CREATE TRIGGER group_full BEFORE INSERT ON groups BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;")
+            .unwrap();
+        assert!(app.create_group("Second").is_err());
+        assert_eq!(groups(), before, "no MLS state of the group that failed");
+    }
+
+    /// Blind audit 2026-11-13, pass 18: a profile's MLS rows went first and on their own, so a delete
+    /// that failed after them left the profile here without its groups' keys. The profile goes with
+    /// its MLS rows, or neither does.
+    #[test]
+    fn a_profile_delete_that_fails_leaves_the_profile_its_groups() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("delete-atomic-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Office PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let gid = app.create_group("Alice's").unwrap().group_id;
+        let key = crate::app_groups::mls_storage_key_for_tests(&app.storage).unwrap();
+        let rows = crate::app_groups::mls_rows_sealed_with_for_tests(&app.storage, &key);
+        assert!(rows > 0);
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        connection
+            .execute_batch("CREATE TRIGGER profile_stays BEFORE DELETE ON profile_registry BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;")
+            .unwrap();
+        let token = app.preview_delete_local_profile(&alice).unwrap().unwrap().confirmation_token.unwrap();
+        assert!(app.confirm_delete_local_profile(&alice, Some(&token)).is_err());
+        assert_eq!(crate::app_groups::mls_rows_sealed_with_for_tests(&app.storage, &key), rows, "the profile keeps its MLS rows");
+        connection.execute_batch("DROP TRIGGER profile_stays;").unwrap();
+        app.select_active_profile(&alice).unwrap();
+        let gid_bytes = crate::app_groups::group_id_bytes(&gid).unwrap();
+        assert!(crate::app_groups::with_engine(&app.storage, |engine| engine.view(&gid_bytes)).is_ok(), "and its group opens");
+    }
+
+    /// Blind audit 2026-11-13, pass 18: the database's old MLS key went to the first profile that
+    /// asked; the groups of the others, sealed with it too, could no longer be read. Every profile
+    /// here takes it, and a profile's deletion leaves the rows that key seals for the others.
+    #[test]
+    fn the_databases_old_mls_key_goes_to_every_profile_here() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("legacy-mls-key-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = app.create_account("Bob", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        // The database as an older build left it: one key, no key of any profile.
+        let protected = omni_crypto::protect_bytes(&omni_crypto::generate_group_key()).unwrap();
+        let json = serde_json::to_string(&protected).unwrap();
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        connection.execute("DELETE FROM mls_storage_keys", []).unwrap();
+        connection.execute("INSERT INTO mls_storage_key (id, protected_json) VALUES (1, ?1)", [&json]).unwrap();
+
+        app.select_active_profile(&alice).unwrap();
+        let alices = crate::app_groups::mls_storage_key_for_tests(&app.storage).unwrap();
+        let alices_group = app.create_group("Old").unwrap().group_id;
+        app.select_active_profile(&bob).unwrap();
+        let bobs = crate::app_groups::mls_storage_key_for_tests(&app.storage).unwrap();
+        assert_eq!(alices, bobs, "both groups of before were sealed with the one key");
+
+        let token = app.preview_delete_local_profile(&bob).unwrap().unwrap().confirmation_token.unwrap();
+        app.confirm_delete_local_profile(&bob, Some(&token)).unwrap();
+        app.select_active_profile(&alice).unwrap();
+        let gid = crate::app_groups::group_id_bytes(&alices_group).unwrap();
+        assert!(crate::app_groups::with_engine(&app.storage, |engine| engine.view(&gid)).is_ok(), "Alice's group outlives Bob");
+    }
+
+    /// Blind audit 2026-11-13, pass 18, A18-06: two profiles of one database given the same workspace
+    /// root made the same project folders under it, and each took the other's files for its own. The
+    /// root stays free to share (maintainers' decision); a folder Omni picks itself goes beside the one
+    /// another profile works in, and one picked by hand there is refused.
+    #[test]
+    fn two_profiles_with_one_workspace_root_work_in_folders_of_their_own() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("workspace-root-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let root = base.join("Projects");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = app.create_account("Bob", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        for profile in [&alice, &bob] {
+            connection
+                .execute(
+                    "INSERT INTO groups (profile_id, group_id, name, my_member_pub, my_status, dialog_key, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, 'group-1', 'Bureau', 'pub', 'member', 'group:group-1', 1, 1)",
+                    [&profile.0],
+                )
+                .unwrap();
+        }
+        let tasks_folder = |profile: &omni_identity::LocalProfileId| {
+            app.select_active_profile(profile).unwrap();
+            app.storage.set_workspace_file_local("", "", "root", &root.to_string_lossy()).unwrap();
+            let group = app.storage.get_group("group-1").unwrap().unwrap();
+            PathBuf::from(crate::app_workspace::tasks::prepare(&app.storage, &group).unwrap().work_path.unwrap())
+        };
+        let alices = tasks_folder(&alice);
+        let bobs = tasks_folder(&bob);
+        assert_ne!(alices, bobs, "a tasks folder of each");
+        assert!(bobs.file_name().unwrap().to_string_lossy().ends_with("(2)"), "{}", bobs.display());
+
+        // Alice's folder, picked by hand for one of Bob's projects, is refused.
+        let error = app.workspace_add_files_repo("group-1", "cad", &alices.to_string_lossy()).unwrap_err().to_string();
+        assert!(error.contains("another profile"), "{error}");
+    }
+
+    /// Blind audit 2026-11-13, pass 19: a file's offer went on the group's queue before our line of it
+    /// was written; a failure between them sent the members a file our thread did not show. The
+    /// offer, the line and its author are one step.
+    #[test]
+    fn a_group_file_whose_line_cannot_be_written_is_not_offered_either() {
+        let tag = "omni-group-file-atomic";
+        let alice = create_app_with_active_profile(isolated_test_db_path(tag, "alice"), "Alice", "Laptop");
+        let gid = alice.create_group("Файлы").unwrap().group_id;
+        let source = std::env::temp_dir().join(tag).join(format!("file-{}.bin", unique_suffix()));
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"a small file").unwrap();
+        let queued = || alice.storage.list_group_feed_outbox(10_000).unwrap().len();
+        let before = queued();
+        let connection = omni_storage::Storage::open_keyed_connection(alice.storage.db_path()).unwrap();
+        connection
+            .execute_batch("CREATE TRIGGER meta_full BEFORE INSERT ON group_message_meta BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;")
+            .unwrap();
+        assert!(alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, false, None, None).is_err());
+        assert_eq!(queued(), before, "no offer of a file our thread does not show");
+        connection.execute_batch("DROP TRIGGER meta_full;").unwrap();
+        alice.send_group_attachment(&gid, "", &source.to_string_lossy(), None, false, None, None).unwrap();
+        assert!(queued() > before);
+    }
+
+    /// Blind audit 2026-11-13, pass 19: a profile's rows went, then one of its files could not (held
+    /// open by another program), and the delete reported a failure and stopped there — the active
+    /// profile was left pointing at one that was gone. The profile is deleted; the file stays.
+    #[cfg(windows)]
+    #[test]
+    fn a_profile_delete_with_a_file_held_open_still_deletes_the_profile() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("delete-held-file-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Office PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let source = base.join("photo.txt");
+        fs::write(&source, "a file of Alice's").unwrap();
+        app.storage
+            .prepare_outgoing_attachment(
+                "message-held",
+                &dialog_key_from_instance_id("held-inst"),
+                source.to_str().unwrap(),
+                None,
+                omni_types::AttachmentMediaProtectionMode::E2eeMedia,
+                1_000,
+            )
+            .unwrap();
+        let blob: String = omni_storage::Storage::open_keyed_connection(&db_path)
+            .unwrap()
+            .query_row("SELECT local_blob_path FROM message_attachments WHERE message_id = 'message-held'", [], |row| row.get(0))
+            .unwrap();
+        // Shared with nobody: not even a delete goes through while it is open.
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&blob).unwrap();
+
+        let token = app.preview_delete_local_profile(&alice).unwrap().unwrap().confirmation_token.unwrap();
+        app.confirm_delete_local_profile(&alice, Some(&token)).unwrap();
+        assert!(app.storage.get_local_profile_summary(&alice).unwrap().is_none(), "the profile is gone");
+        assert_eq!(app.get_active_profile_id().unwrap(), None, "and no longer the active one");
+        drop(held);
+    }
+
+    /// Blind audit 2026-11-13, pass 20: a message that waits for an epoch we are not in yet was
+    /// taken as handled even when it was not kept (the queue full of junk "from" that epoch, which
+    /// nobody checks before it opens) — the mesh did not bring it again, and it was lost. Not kept,
+    /// it is not handled: it comes again and opens in its turn.
+    #[test]
+    fn a_waiting_message_that_is_not_kept_comes_again_and_opens() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-retry", "alice"), "Alice", "A");
+        let bob = create_app_with_active_profile(isolated_test_db_path("omni-group-retry", "bob"), "Bob", "B");
+        let gid = alice.create_group("Retry").unwrap().group_id;
+        group_join_for_real(&alice, &bob, &gid, "dialog:bob");
+        deliver_group_feed(&alice, &[&bob]);
+        alice.rename_group(&gid, "Renamed").unwrap();
+        alice.send_group_text(&gid, "after the rename").unwrap();
+        let items: Vec<String> = alice
+            .storage
+            .list_group_feed_outbox(1_000)
+            .unwrap()
+            .into_iter()
+            .map(|(_, group_id, mls)| {
+                serde_json::to_string(&omni_protocol::GroupFeedItemV2 {
+                    version: omni_protocol::GROUP_WIRE_VERSION_V2,
+                    group_id,
+                    mls_b64: base64::engine::general_purpose::STANDARD.encode(mls),
+                })
+                .unwrap()
+            })
+            .collect();
+        let (commit, line) = (&items[items.len() - 2], &items[items.len() - 1]);
+        let gid_bytes = crate::app_groups::group_id_bytes(&gid).unwrap();
+        let epoch = crate::app_groups::with_engine(&bob.storage, |engine| engine.view(&gid_bytes)).unwrap().epoch;
+        for n in 0..omni_storage::GROUP_PENDING_INBOUND_MAX_ROWS {
+            assert!(bob.storage.push_group_pending_inbound(&gid, epoch + 1, format!("junk {n}").as_bytes(), 1).unwrap());
+        }
+        let ingest = |json: &str| super::app_groups::ingest_group_feed_item(&bob.storage, &bob.transport, json);
+        let refused = ingest(line);
+        assert!(refused.is_err(), "not kept, so not taken as handled");
+        // …nor held for as long as the network holds it: it took a place of the app's frames on
+        // their way all that time (pass 21).
+        assert!(crate::durable_outcome_for(&refused) == omni_mesh_runtime::MeshDurableOutcome::RetryAWhile);
+        ingest(commit).unwrap();
+        ingest(line).unwrap();
+        assert!(bob.list_group_messages(&gid).unwrap().iter().any(|m| m.body == "after the rename"));
+    }
+
+    /// Blind audit 2026-11-13, pass 23: a profile's plain copy (any name but `.omnibackup`) carried
+    /// every profile of the database, with their key wraps.
+    #[test]
+    fn backup_of_profile_a_never_contains_profile_b_regardless_of_extension() {
+        let db_path = isolated_test_db_path("omni-plain-copy-per-profile", "both");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.clone() }).unwrap();
+        let alice = app.create_account("Alice", "Office PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = app.create_account("Bob", "Laptop").unwrap().local_profile_summary.unwrap().profile_id;
+        app.select_active_profile(&alice).unwrap();
+        let folder = Path::new(&db_path).parent().unwrap().join(format!("copies-{}", unique_suffix()));
+        fs::create_dir_all(&folder).unwrap();
+        let bundle = folder.join("one.db");
+        let plain = folder.join("plain.db");
+        app.export_current_database_backup_bundle(&bundle).unwrap();
+        app.export_current_database_backup(plain.to_string_lossy()).unwrap();
+        for copy in [&bundle, &plain] {
+            let profiles: Vec<_> = Storage::open(copy).unwrap().list_local_profiles().unwrap().profiles.into_iter().map(|p| p.profile_id).collect();
+            assert_eq!(profiles, vec![alice.clone()], "{}: Bob is not in Alice's copy", copy.display());
+            assert!(!profiles.contains(&bob));
+        }
+    }
+
+    /// Blind audit 2026-11-13, pass 23: «findable by Omni-ID» and «by name» were one file per
+    /// database — a profile switched on published another profile of the same database.
+    #[test]
+    fn discoverability_stays_private_for_second_profile_when_first_is_public() {
+        let db_path = isolated_test_db_path("omni-discoverable-per-profile", "both");
+        let app = OmniApp::init(AppInitRequest { db_path }).unwrap();
+        let alice = app.create_account("Alice", "Office PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = app.create_account("Bob", "Laptop").unwrap().local_profile_summary.unwrap().profile_id;
+        app.select_active_profile(&alice).unwrap();
+        app.set_discoverability_mode(crate::DiscoverabilityMode::Public).unwrap();
+        app.set_name_findable(true).unwrap();
+        assert!(app.discoverability_mode().is_public() && app.name_findable());
+
+        // An older installation cannot say which profile opted in.
+        let db = app.storage.db_path().to_string_lossy();
+        fs::write(crate::profile_sidecar_path(&db, "discoverability-mode.json"), "public").unwrap();
+        fs::write(crate::profile_sidecar_path(&db, "name-findable.json"), "true").unwrap();
+        app.select_active_profile(&bob).unwrap();
+        assert_eq!(app.discoverability_mode(), crate::DiscoverabilityMode::Off, "Bob never asked to be found");
+        assert!(!app.name_findable());
+        app.select_active_profile(&alice).unwrap();
+        assert!(app.discoverability_mode().is_public() && app.name_findable(), "Alice's choice stays hers");
+    }
+
+    /// The local profiles of one database share its folder: deleting one profile leaves what another
+    /// profile here still keeps — a project folder both use, the projects of a group the other is in,
+    /// a working folder the other's project is bound to — and takes what was only its own.
+    #[test]
+    fn deleting_a_profile_leaves_the_projects_another_profile_here_keeps() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("delete-shared-workspaces-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Office PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = app.create_account("Bob", "Laptop").unwrap().local_profile_summary.unwrap().profile_id;
+        app.select_active_profile(&alice).unwrap();
+
+        let workspaces = omni_storage::ProfileFolder::Workspaces.path(&db_path).unwrap();
+        let tasks_root = omni_storage::ProfileFolder::WorkspaceTasks.path(&db_path).unwrap();
+        let both = workspaces.join("group-1").join("docs.files");
+        let alices_group = workspaces.join("group-2").join("cad.files");
+        let bobs_own = workspaces.join("group-3").join("own.files");
+        let shared_work = tasks_root.join("group-3");
+        for folder in [&both, &alices_group, &bobs_own, &shared_work] {
+            fs::create_dir_all(folder).unwrap();
+            fs::write(folder.join("data"), "data").unwrap();
+        }
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
+        let repo = |profile: &str, group: &str, name: &str, published: &Path, work: Option<&Path>| {
+            connection
+                .execute(
+                    "INSERT INTO workspace_repos (profile_id, group_id, repo, published_path, work_path, created_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    rusqlite::params![profile, group, name, path(published), work.map(path)],
+                )
+                .unwrap();
+        };
+        repo(&bob.0, "group-1", "docs", &both, None);
+        repo(&alice.0, "group-1", "docs", &both, None);
+        repo(&bob.0, "group-2", "cad", &alices_group, None);
+        repo(&bob.0, "group-3", "own", &bobs_own, Some(&shared_work));
+        repo(&alice.0, "group-4", "notes", &workspaces.join("group-4").join("notes.files"), Some(&shared_work));
+        // Alice is in group-2, though no project of it has come to her yet.
+        connection
+            .execute(
+                "INSERT INTO groups (profile_id, group_id, name, my_member_pub, my_status, dialog_key, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, 'group-2', 'Group 2', 'pub', 'member', 'group:group-2', 1, 1)",
+                [&alice.0],
+            )
+            .unwrap();
+
+        let token = app.preview_delete_local_profile(&bob).unwrap().unwrap().confirmation_token.unwrap();
+        app.confirm_delete_local_profile(&bob, Some(&token)).unwrap();
+
+        assert!(both.join("data").exists(), "a project folder Alice uses too stays");
+        assert!(alices_group.join("data").exists(), "the projects of Alice's group stay");
+        assert!(shared_work.join("data").exists(), "a working folder Alice's project is bound to stays");
+        assert!(!bobs_own.exists(), "what was only Bob's goes");
+    }
+
+    /// Class C (audit 2026-11-09 #6): every path in a profile's folder comes from its registry
+    /// (`omni_storage::ProfileFolder`), so deleting the last profile and resetting the device know
+    /// every folder there is. A path built from the database's folder anywhere else fails here —
+    /// that is how `workspaces`, `workspace-tasks` and `tmp/open` were left behind.
+    #[test]
+    fn every_path_in_the_profile_folder_comes_from_its_registry() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let needles = ["db_path().parent()", "db_path.parent()", "Path::new(db_path).parent()", "Path::new(&db_path).parent()"];
+        let mut built_elsewhere = Vec::new();
+        let mut folders = vec![crates.join("omni-app/src"), crates.join("omni-storage/src"), crates.join("omni-ffi/src"), crates.join("omni-mcp/src"), crates.join("omni-daemon/src"), crates.join("omni-node/src")];
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(&folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !name.ends_with(".rs") || name.starts_with("tests") || name == "storage_profile_folder.rs" {
+                    continue;
+                }
+                let text = fs::read_to_string(&path).unwrap();
+                // The code before its tests, without whitespace: a chain split over lines is one.
+                let code: String = text.split("#[cfg(test)]").next().unwrap().split_whitespace().collect();
+                if needles.iter().any(|needle| code.contains(needle)) {
+                    built_elsewhere.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(built_elsewhere.is_empty(), "a path in the profile folder built outside omni_storage::ProfileFolder: {built_elsewhere:?}");
     }
 
 #[test]
 fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-delete-confirm-{}.db", unique_suffix()));
+            .join(format!("lifecycle-delete-confirm-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3230,7 +5437,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn lifecycle_deleting_the_last_profile_wipes_the_device_mesh_identity() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-delete-traces-{}.db", unique_suffix()));
+            .join(format!("lifecycle-delete-traces-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3279,7 +5486,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn init_wipes_device_traces_left_behind_when_no_profile_owns_them() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("startup-orphan-traces-{}.db", unique_suffix()));
+            .join(format!("startup-orphan-traces-{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let db_file_name = db_path
             .file_name()
@@ -3328,7 +5535,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn lifecycle_direct_delete_local_profile_rejects_confirmation_bypass() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-delete-direct-{}.db", unique_suffix()));
+            .join(format!("lifecycle-delete-direct-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3354,7 +5561,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn lifecycle_direct_sign_out_rejects_confirmation_bypass() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-signout-direct-{}.db", unique_suffix()));
+            .join(format!("lifecycle-signout-direct-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3385,7 +5592,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn lifecycle_confirm_delete_active_profile_clears_active_context() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-delete-active-{}.db", unique_suffix()));
+            .join(format!("lifecycle-delete-active-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3423,7 +5630,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn lifecycle_confirm_sign_out_profile_keeps_explicit_profile_flow() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-signout-explicit-{}.db", unique_suffix()));
+            .join(format!("lifecycle-signout-explicit-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3465,7 +5672,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
     fn lifecycle_delete_non_active_profile_keeps_active_context() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-delete-non-active-{}.db", unique_suffix()));
+            .join(format!("lifecycle-delete-non-active-{}", unique_suffix())).join("omni.db");
 
         let app = OmniApp::init(AppInitRequest {
             db_path: db_path.to_string_lossy().into_owned(),
@@ -3533,7 +5740,7 @@ fn lifecycle_confirm_delete_requires_token_and_deletes_after_confirm() {
 fn lifecycle_sign_out_preview_respects_transition_preconditions() {
     let db_path = std::env::temp_dir()
         .join("omni-stage-10-app-tests")
-        .join(format!("lifecycle-signout-preview-{}.db", unique_suffix()));
+        .join(format!("lifecycle-signout-preview-{}", unique_suffix())).join("omni.db");
 
     let app = OmniApp::init(AppInitRequest {
         db_path: db_path.to_string_lossy().into_owned(),
@@ -3565,7 +5772,7 @@ fn lifecycle_sign_out_preview_respects_transition_preconditions() {
 fn lifecycle_confirm_sign_out_requires_token() {
     let db_path = std::env::temp_dir()
         .join("omni-stage-10-app-tests")
-        .join(format!("lifecycle-signout-confirm-{}.db", unique_suffix()));
+        .join(format!("lifecycle-signout-confirm-{}", unique_suffix())).join("omni.db");
 
     let app = OmniApp::init(AppInitRequest {
         db_path: db_path.to_string_lossy().into_owned(),
@@ -3584,7 +5791,7 @@ fn lifecycle_confirm_sign_out_requires_token() {
 fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-runtime-gates-{}.db", unique_suffix()));
+            .join(format!("lifecycle-runtime-gates-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3617,7 +5824,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn lifecycle_unlock_reopens_runtime_path_for_sensitive_operations() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("lifecycle-runtime-reopen-{}.db", unique_suffix()));
+            .join(format!("lifecycle-runtime-reopen-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3662,7 +5869,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn stage5_local_prekey_bundle_is_available_after_account_creation() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-app-tests")
-            .join(format!("bundle-{}.db", unique_suffix()));
+            .join(format!("bundle-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3685,10 +5892,10 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn stage5_session_bootstrap_foundation_persists_records() {
         let alice_db_path = std::env::temp_dir()
             .join("omni-stage-5-app-tests")
-            .join(format!("alice-{}.db", unique_suffix()));
+            .join(format!("alice-{}", unique_suffix())).join("omni.db");
         let bob_db_path = std::env::temp_dir()
             .join("omni-stage-5-app-tests")
-            .join(format!("bob-{}.db", unique_suffix()));
+            .join(format!("bob-{}", unique_suffix())).join("omni.db");
 
         let alice = OmniApp::init(AppInitRequest {
             db_path: alice_db_path.to_string_lossy().into_owned(),
@@ -3740,11 +5947,180 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             .is_some());
     }
 
+    fn bootstrap_test_app(name: &str) -> OmniApp {
+        let db_path = std::env::temp_dir()
+            .join("omni-bootstrap-admission-tests")
+            .join(format!("{name}-{}", unique_suffix())).join("omni.db");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() })
+            .unwrap();
+        app.create_account(name, format!("{name} PC")).unwrap();
+        app
+    }
+
+    fn session_with(app: &OmniApp, peer: &OmniApp) -> Option<omni_crypto::SessionRecord> {
+        let account = peer.get_local_account().unwrap().unwrap();
+        let device = peer.get_local_device().unwrap().unwrap();
+        app.storage
+            .get_session_record(&omni_crypto::SessionAddress {
+                remote_account_id: account.descriptor.account_id,
+                remote_device_id: device.device_id,
+            })
+            .unwrap()
+    }
+
+    /// V-01: a bootstrap must carry a device certificate chain that vouches for exactly its keys.
+    /// Without one, or with another device's (a real chain of the contact it claims to be, copied
+    /// from any of the contact's bootstraps), nothing is accepted and no session is written.
+    #[test]
+    fn session_bootstrap_without_a_matching_device_certificate_is_refused() {
+        let alice = bootstrap_test_app("Alice");
+        let bob = bootstrap_test_app("Bob");
+        let mallory = bootstrap_test_app("Mallory");
+        let bob_bundle = bob.get_local_prekey_bundle().unwrap();
+
+        let mut no_chain = mallory.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap();
+        no_chain.initiator_device_certificate_chain_json = None;
+        assert!(bob.accept_session_bootstrap(&no_chain).is_err());
+
+        let alices_chain = alice
+            .bootstrap_session_from_prekey_bundle(&bob_bundle)
+            .unwrap()
+            .initiator_device_certificate_chain_json;
+        let mut borrowed_chain = mallory.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap();
+        borrowed_chain.initiator_device_certificate_chain_json = alices_chain;
+        assert!(bob.accept_session_bootstrap(&borrowed_chain).is_err());
+
+        assert!(session_with(&bob, &mallory).is_none());
+        assert!(session_with(&bob, &alice).is_none());
+
+        let honest = mallory.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap();
+        bob.accept_session_bootstrap(&honest).unwrap();
+        assert!(session_with(&bob, &mallory).is_some(), "a bootstrap with its own chain is accepted");
+    }
+
+    /// V-01: a real bootstrap of a contact, relayed by another node (a holder of its durable frames, a
+    /// relay on the path), passes the certificate check — it is the contact's own — so the
+    /// first-contact branch of `on_wire` also checks that the sending node is the bootstrap's device.
+    /// Otherwise the relayer would get the contact's dialog route.
+    #[test]
+    fn a_real_bootstrap_relayed_by_another_node_does_not_bind_the_dialog_to_it() {
+        let alice = bootstrap_test_app("Alice");
+        let bob = bootstrap_test_app("Bob");
+        let mallory = bootstrap_test_app("Mallory");
+        let bob_bundle = bob.get_local_prekey_bundle().unwrap();
+        let bob_device = bob.get_local_device().unwrap().unwrap().device_id;
+        let node_of = |message: &super::SessionBootstrapMessageV1| {
+            let key = super::session_bootstrap_from_protocol(message).unwrap().initiator_identity_signing_key;
+            super::node_address_from_ed25519_pubkey(key.0).unwrap()
+        };
+
+        let from_alice = alice.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap();
+        let alice_node = node_of(&from_alice);
+        let mallory_node = node_of(&mallory.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap());
+        assert!(
+            super::verify_inbound_session_bootstrap_message(&bob.storage, &from_alice, &bob_device).is_ok(),
+            "the relayed bootstrap is genuine: the certificate check alone lets it through"
+        );
+
+        assert!(
+            super::verify_first_contact_bootstrap(&bob.storage, &from_alice, &bob_device, &mallory_node).is_err(),
+            "Alice's bootstrap arriving from Mallory's node must not bind Alice's dialog to Mallory"
+        );
+        super::verify_first_contact_bootstrap(&bob.storage, &from_alice, &bob_device, &alice_node)
+            .expect("from Alice's own node it is taken");
+    }
+
+    /// V-09: after the receiver rotates its signed prekey, a bootstrap made from its previous bundle
+    /// still opens; a bundle past its expiry is not bootstrapped from at all.
+    #[test]
+    fn a_bootstrap_from_the_previous_signed_prekey_opens_and_an_expired_one_is_refused() {
+        let alice = bootstrap_test_app("Alice");
+        let bob = bootstrap_test_app("Bob");
+        let old_bundle = bob.get_local_prekey_bundle().unwrap();
+        let from_old = alice.bootstrap_session_from_prekey_bundle(&old_bundle).unwrap();
+
+        let a_week_on = current_unix_ms() + omni_storage::SIGNED_PREKEY_ROTATION_MS;
+        assert!(bob.storage.maintain_local_prekeys(a_week_on).unwrap(), "Bob rotates");
+        assert_ne!(
+            bob.get_local_prekey_bundle().unwrap().signed_prekey.prekey_id,
+            old_bundle.signed_prekey.prekey_id
+        );
+        bob.accept_session_bootstrap(&from_old).unwrap();
+        assert!(session_with(&bob, &alice).is_some(), "the previous signed prekey still opens");
+
+        let mut expired = bob.get_local_prekey_bundle().unwrap();
+        expired.signed_prekey.expires_at_unix_ms = Some(current_unix_ms() - 1);
+        let error = alice.bootstrap_session_from_prekey_bundle(&expired).unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error}");
+    }
+
+    /// V-08/V-09: the newest accepted bootstrap is remembered on disk. After a restart an older one
+    /// (a captured bootstrap replayed) leaves the session the newer one built untouched.
+    #[test]
+    fn replayed_older_bootstrap_is_ignored_after_a_restart() {
+        let alice = bootstrap_test_app("Alice");
+        let bob = bootstrap_test_app("Bob");
+        let bob_bundle = bob.get_local_prekey_bundle().unwrap();
+
+        let old = alice.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let new = alice.bootstrap_session_from_prekey_bundle(&bob_bundle).unwrap();
+        assert!(new.created_at_unix_ms > old.created_at_unix_ms);
+        bob.accept_session_bootstrap(&old).unwrap();
+        bob.accept_session_bootstrap(&new).unwrap();
+        let session = session_with(&bob, &alice).unwrap();
+
+        let db_path = bob.storage.db_path().to_string_lossy().into_owned();
+        drop(bob);
+        let bob = OmniApp::init(AppInitRequest { db_path }).unwrap();
+        bob.accept_session_bootstrap(&old).unwrap();
+        assert_eq!(
+            session_with(&bob, &alice).unwrap().remote_ratchet_public_key,
+            session.remote_ratchet_public_key,
+            "the replayed bootstrap must not rebuild the session"
+        );
+    }
+
+    /// V-08: a bootstrap stamped far ahead of our clock is ignored and leaves no mark; a mark that is
+    /// already that far ahead (a peer clock since fixed) does not make the next bootstrap a replay.
+    #[test]
+    fn a_bootstrap_from_a_clock_far_ahead_leaves_no_mark_that_locks_out_the_fixed_clock() {
+        use super::InboundBootstrapAge;
+        let alice = bootstrap_test_app("Alice");
+        let bob = bootstrap_test_app("Bob");
+        let bundle = bob.get_local_prekey_bundle().unwrap();
+        let now = current_unix_ms();
+        let limit = super::BOOTSTRAP_AHEAD_OF_OUR_CLOCK_LIMIT_MS;
+        let stamped = |at: i64| {
+            let mut message = alice.bootstrap_session_from_prekey_bundle(&bundle).unwrap();
+            message.created_at_unix_ms = at;
+            message
+        };
+        let note = |message| super::note_inbound_session_bootstrap(&bob.storage, &message, now).unwrap();
+
+        assert_eq!(note(stamped(now + limit + 1)), InboundBootstrapAge::AheadOfOurClock);
+        assert_eq!(note(stamped(now)), InboundBootstrapAge::Newer(None), "no mark was left");
+
+        // A mark from before the check, a year ahead.
+        let a_year = 365 * 24 * 60 * 60 * 1000;
+        let message = stamped(now);
+        bob.storage
+            .record_inbound_bootstrap_at(
+                &omni_identity::AccountId(message.initiator_account_id.clone()),
+                &omni_identity::DeviceId(message.initiator_device_id.clone()),
+                now + a_year,
+                i64::MAX,
+            )
+            .unwrap();
+        assert_eq!(note(stamped(now + 10)), InboundBootstrapAge::Newer(None), "the far mark calls nothing old");
+        assert_eq!(note(stamped(now + 5)), InboundBootstrapAge::Older, "and the new one is the mark now");
+    }
+
     #[test]
     fn add_list_rename_block_and_remove_contact_work() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("contact-{}.db", unique_suffix()));
+            .join(format!("contact-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3783,67 +6159,10 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     }
 
     #[test]
-    fn add_contact_by_identifier_baseline_works() {
-        let db_path = std::env::temp_dir()
-            .join("omni-stage-4-app-tests")
-            .join(format!("contact-id-{}.db", unique_suffix()));
-
-        let app = create_app_with_active_profile(
-            db_path.to_string_lossy().into_owned(),
-            "Alice",
-            "Office PC",
-        );
-
-        let contact = app
-            .add_contact_by_identifier("acct-remote", "Alice", Some("Alice".to_string()))
-            .unwrap();
-
-        assert_eq!(contact.petname, "Alice");
-        assert_eq!(
-            contact.remote_account_id,
-            Some(omni_identity::AccountId("acct-remote".to_string()))
-        );
-        assert_eq!(contact.public_display_name.as_deref(), Some("Alice"));
-        assert_eq!(
-            contact.primary_dialog_key.as_deref(),
-            Some(omni_types::dialog_key_from_account_id("acct-remote").as_str())
-        );
-    }
-
-    #[test]
-    fn add_contact_by_identifier_is_idempotent_for_same_account() {
-        let db_path = std::env::temp_dir()
-            .join("omni-stage-10-app-tests")
-            .join(format!("contact-id-dedup-{}.db", unique_suffix()));
-
-        let app = create_app_with_active_profile(
-            db_path.to_string_lossy().into_owned(),
-            "Alice",
-            "Office PC",
-        );
-
-        let first = app
-            .add_contact_by_identifier("acct-remote", "Bob", Some("Alice".to_string()))
-            .unwrap();
-        let second = app
-            .add_contact_by_identifier("acct-remote", "Bob Duplicate", Some("Alice Duplicate".to_string()))
-            .unwrap();
-
-        assert_eq!(first.contact_id, second.contact_id);
-        let contacts = app.list_contacts().unwrap();
-        assert_eq!(contacts.len(), 1);
-        assert_eq!(contacts[0].petname, "Bob");
-        assert_eq!(
-            contacts[0].remote_account_id,
-            Some(omni_identity::AccountId("acct-remote".to_string()))
-        );
-    }
-
-    #[test]
     fn request_contact_by_identifier_creates_pending_contact() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("contact-request-{}.db", unique_suffix()));
+            .join(format!("contact-request-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3879,7 +6198,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn add_contact_from_payload_is_idempotent_for_same_account() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("contact-payload-dedup-{}.db", unique_suffix()));
+            .join(format!("contact-payload-dedup-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3926,7 +6245,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn trust_state_transitions_baseline_work() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("trust-{}.db", unique_suffix()));
+            .join(format!("trust-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -3976,7 +6295,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn a_contact_stays_verified_across_its_devices_and_asks_again_without_an_identity() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("device-change-{}.db", unique_suffix()));
+            .join(format!("device-change-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -4039,7 +6358,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn contact_storage_survives_restart() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("restart-{}.db", unique_suffix()));
+            .join(format!("restart-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -4085,10 +6404,10 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn add_contact_from_exported_payload_baseline_works() {
         let exporter_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("payload-exporter-{}.db", unique_suffix()));
+            .join(format!("payload-exporter-{}", unique_suffix())).join("omni.db");
         let importer_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("payload-importer-{}.db", unique_suffix()));
+            .join(format!("payload-importer-{}", unique_suffix())).join("omni.db");
 
         let exporter = OmniApp::init(AppInitRequest {
             db_path: exporter_db_path.to_string_lossy().into_owned(),
@@ -4132,10 +6451,10 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn add_contact_from_exported_payload_can_be_verified_manually() {
         let exporter_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("payload-verify-exporter-{}.db", unique_suffix()));
+            .join(format!("payload-verify-exporter-{}", unique_suffix())).join("omni.db");
         let importer_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("payload-verify-importer-{}.db", unique_suffix()));
+            .join(format!("payload-verify-importer-{}", unique_suffix())).join("omni.db");
 
         let exporter = OmniApp::init(AppInitRequest {
             db_path: exporter_db_path.to_string_lossy().into_owned(),
@@ -4186,7 +6505,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn verification_payload_mismatch_is_rejected() {
         let exporter_db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("payload-mismatch-{}.db", unique_suffix()));
+            .join(format!("payload-mismatch-{}", unique_suffix())).join("omni.db");
 
         let exporter = OmniApp::init(AppInitRequest {
             db_path: exporter_db_path.to_string_lossy().into_owned(),
@@ -4211,7 +6530,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn send_text_without_connection_stays_queued_until_attempt_starts() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-app-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -4333,7 +6652,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         // message never enters the queue at all.
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-app-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -4678,7 +6997,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn history_reloads_after_restart_from_same_database() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-app-tests")
-            .join(format!("restart-{}.db", unique_suffix()));
+            .join(format!("restart-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -4739,7 +7058,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn unsupported_legacy_database_is_reported_in_bootstrap_summary() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-app-tests")
-            .join(format!("legacy-{}.db", unique_suffix()));
+            .join(format!("legacy-{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
@@ -4825,17 +7144,12 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let client = create_stage5_peer("ack-fail-client", "Client", "Client PC");
         link_stage5_contact(&client.app, &server, "Raw Server");
 
-        // The server is reachable but cannot answer: its link is up, its profile is signed out, so
-        // the client's session bootstrap arrives and is never acknowledged.
+        // The server is reachable but cannot answer: its link is up, and the client's session
+        // bootstrap arrives and is never acknowledged. (This used to be a signed-out server; signing
+        // out now stops the mesh too, so the link went down instead and the reason became a failed
+        // write — whichever came first.)
+        crate::answer_no_session_bootstraps(&server.app.storage.db_path().to_string_lossy());
         link_stage5_peers_over_mesh(&client, &server);
-        let server_profile = server
-            .account
-            .local_profile_summary
-            .as_ref()
-            .expect("server profile summary")
-            .profile_id
-            .clone();
-        confirm_sign_out_profile(&server.app, &server_profile);
 
         let sent = client
             .app
@@ -4966,7 +7280,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn unsupported_legacy_stage2_database_is_reported_in_bootstrap_summary() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-app-tests")
-            .join(format!("coexist-{}.db", unique_suffix()));
+            .join(format!("coexist-{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         let connection = omni_storage::Storage::open_keyed_connection(&db_path).unwrap();
@@ -5009,6 +7323,11 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn receipt_is_sent_only_after_durable_accept() {
         let receiver = create_stage5_peer("receipt-order-receiver", "Receiver", "Receiver PC");
         let sender = create_stage5_peer("receipt-order-sender", "Sender", "Sender PC");
+        // A different local profile has already received the same wire id.
+        let original = receiver.app.storage.get_active_profile_id().unwrap().unwrap();
+        receiver.app.create_account("Second profile", "PC").unwrap();
+        receiver.app.storage.insert_incoming_message("receipt-msg", &sender.dialog_key, "private", 90).unwrap();
+        receiver.app.select_active_profile(&original).unwrap();
         let bootstrap = sender
             .app
             .bootstrap_session_from_prekey_bundle(&receiver.bundle)
@@ -5033,6 +7352,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         accept_incoming_text(
             &receiver.app.storage,
             omni_types::ChatTextV1 {
+                reply_to: None,
                 message_id: "receipt-msg".to_string(),
                 body: "hello".to_string(),
                 created_at_unix_ms: 100,
@@ -5173,57 +7493,11 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             .clone()
             .expect("server transport is up")
             .received_context_for_dialog_key(client.dialog_key.as_str());
-        let challenge_id = format!("challenge-fail-{}", unique_suffix());
-        let db_path = server.app.storage.db_path().to_string_lossy().to_string();
-        super::register_pending_verification_challenge_for_test(
-            &db_path,
-            challenge_id.clone(),
-            client.dialog_key.clone(),
-            server_context.peer_id.clone(),
-            Some(client.instance_id.clone()),
-            Some(client.account.descriptor.account_id.0.clone()),
-            b"bogus-challenge-bytes".to_vec(),
-            current_unix_ms() + 60_000,
-        );
-
-        let verification_payload_json =
-            serde_json::to_string(&client.app.get_my_verification_payload().unwrap()).unwrap();
-        let invalid_response = omni_types::VerificationChallengeResponseV1 {
-            version: omni_types::OMNI_PROTOCOL_VERSION_V1,
-            challenge_id,
-            verification_payload_json,
-            signature_r: "not-a-valid-signature".to_string(),
-            signature_s: "still-not-valid".to_string(),
-            responded_at_unix_ms: current_unix_ms(),
-        };
-
-        let client_session = client
-            .app
-            .storage
-            .get_latest_session_for_remote_account(&server.account.descriptor.account_id)
-            .unwrap()
-            .expect("client session should exist before sending the invalid response");
-        let outgoing = omni_messaging::build_encrypted_wire_envelope(
-            &client_session,
-            &omni_types::WirePayloadV1::VerificationChallengeResponse(invalid_response.clone()),
-            SecurityPayloadKind::VerificationChallengeResponse,
-            current_unix_ms(),
-        )
-        .unwrap();
-
-        let transport = client
-            .app
-            .transport_handle
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("client transport should still be available");
-        transport
-            .send_wire_envelope_for_dialog_key(server.dialog_key.as_str(), &outgoing.envelope)
-            .unwrap();
-
-        // A forged challenge response tears the server's session with the sender down.
-        wait_for_condition(Duration::from_secs(5), || {
+        // A forged response to OUR challenge drops the session. Each new activation of the session
+        // (another hello: the symmetric reply, a second link the LAN multicast brought up) issues a
+        // fresh challenge and supersedes the pending ones — a response to a superseded one is
+        // ignored, by design. So the forgery is retried on a challenge that was superseded first.
+        let session_gone = || {
             server
                 .app
                 .storage
@@ -5231,7 +7505,67 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 .ok()
                 .flatten()
                 .is_none()
-        });
+        };
+        for attempt in 0..3 {
+            let challenge_id = format!("challenge-fail-{attempt}-{}", unique_suffix());
+            let db_path = server.app.storage.db_path().to_string_lossy().to_string();
+            super::register_pending_verification_challenge_for_test(
+                &db_path,
+                challenge_id.clone(),
+                client.dialog_key.clone(),
+                server_context.peer_id.clone(),
+                Some(client.instance_id.clone()),
+                Some(client.account.descriptor.account_id.0.clone()),
+                b"bogus-challenge-bytes".to_vec(),
+                current_unix_ms() + 60_000,
+            );
+
+            let verification_payload_json =
+                serde_json::to_string(&client.app.get_my_verification_payload().unwrap()).unwrap();
+            let invalid_response = omni_types::VerificationChallengeResponseV1 {
+                version: omni_types::OMNI_PROTOCOL_VERSION_V1,
+                challenge_id,
+                verification_payload_json,
+                signature_r: "not-a-valid-signature".to_string(),
+                signature_s: "still-not-valid".to_string(),
+                responded_at_unix_ms: current_unix_ms(),
+            };
+
+            let client_session = client
+                .app
+                .storage
+                .get_latest_session_for_remote_account(&server.account.descriptor.account_id)
+                .unwrap()
+                .expect("client session should exist before sending the invalid response");
+            let outgoing = omni_messaging::build_encrypted_wire_envelope(
+                &client_session,
+                &omni_types::WirePayloadV1::VerificationChallengeResponse(invalid_response.clone()),
+                SecurityPayloadKind::VerificationChallengeResponse,
+                current_unix_ms(),
+            )
+            .unwrap();
+
+            let transport = client
+                .app
+                .transport_handle
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("client transport should still be available");
+            transport
+                .send_wire_envelope_for_dialog_key(server.dialog_key.as_str(), &outgoing.envelope)
+                .unwrap();
+
+            // A forged challenge response tears the server's session with the sender down.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline && !session_gone() {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if session_gone() {
+                return;
+            }
+        }
+        panic!("a forged verification response never dropped the session (3 attempts)");
     }
 
     #[test]
@@ -5513,6 +7847,11 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     /// lacks a multicast adapter (skip); negotiation never reaching `Negotiated`
     /// ⇒ the mesh wire plane is broken (panic); the Link + negotiation up but no
     /// datagrams drained ⇒ the packet→mesh routing regressed (panic).
+    ///
+    /// The media rides a real call, sealed end to end with the call's keys (docs/decisions/
+    /// call-media-e2e.md). Negative halves: before the call there is nothing to send with, and a
+    /// datagram put on the link unsealed — what a relay or a neighbour could inject — never reaches
+    /// Bob's engine.
     #[test]
     fn mesh_carries_realtime_media_packets() {
         let _guard = network_test_guard();
@@ -5593,6 +7932,27 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             alice_done && bob_done
         });
 
+        let route = alice
+            .app
+            .realtime_media_route(bob.dialog_key.as_str())
+            .expect("alice resolves the media route to bob");
+        assert!(
+            alice.app.send_realtime_media_packet(&route, &[0x01, 0x02]).is_err(),
+            "no call, no media keys: nothing may be sent"
+        );
+
+        // A real call: the invite carries Alice's key share, the accept Bob's.
+        let placed = alice.app.place_call(bob.dialog_key.as_str()).expect("alice calls bob");
+        wait_for_condition(Duration::from_secs(20), || {
+            current_call(&bob.app).is_some_and(|call| call.state == CallState::Ringing)
+        });
+        let ringing = current_call(&bob.app).unwrap();
+        bob.app.accept_call(&ringing.call_id).expect("bob answers");
+        wait_for_condition(Duration::from_secs(20), || {
+            current_call(&alice.app)
+                .is_some_and(|call| call.call_id == placed.call_id && call.state == CallState::Active)
+        });
+
         // Send a batch of distinct datagrams. With no legacy connection, the
         // only way these reach Bob is the mesh Link via the batch path.
         let expected: Vec<Vec<u8>> = vec![
@@ -5614,10 +7974,9 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 )
                 .expect("bob wires his receive side");
         }
-        let route = alice
-            .app
-            .realtime_media_route(bob.dialog_key.as_str())
-            .expect("alice resolves the media route to bob");
+        // What anyone on the link could put there: a datagram without the call's seal.
+        let mesh = alice.app.mesh_runtime().expect("alice's mesh runs");
+        mesh.send_media(bob_node, &[0x80, 0x60, 0xDE, 0xAD]).expect("the raw datagram is sent");
         for payload in &expected {
             alice
                 .app
@@ -5630,11 +7989,13 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         while Instant::now() < media_deadline && received.lock().unwrap().len() < expected.len() {
             thread::sleep(Duration::from_millis(100));
         }
+        // A moment more for a late raw datagram to show up, if it were going to.
+        thread::sleep(Duration::from_millis(300));
         let received = received.lock().unwrap().clone();
         assert_eq!(
             received.len(),
             expected.len(),
-            "every packet should arrive over the mesh"
+            "every sealed packet arrives, opened; the unsealed one does not: {received:?}"
         );
         for payload in &expected {
             assert!(
@@ -5642,6 +8003,19 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 "datagram {payload:?} should have been delivered over the mesh"
             );
         }
+
+        // F2 (audit 2026-11-09 #5): blocking the contact ends the call with them — not a packet more
+        // goes from the blocking side, and the other side hears the call is over.
+        let bob_contact = alice
+            .app
+            .storage
+            .find_contact_by_remote_account_id(&AccountId(bob.bundle.account.account_id.clone()))
+            .unwrap()
+            .expect("bob is alice's contact");
+        alice.app.block_contact(&bob_contact.contact_id).expect("alice blocks bob");
+        assert!(current_call(&alice.app).is_none(), "no call with a blocked contact");
+        assert!(alice.app.send_realtime_media_packet(&route, &[0x01]).is_err(), "nothing more is sent");
+        wait_for_condition(Duration::from_secs(20), || current_call(&bob.app).is_none());
 
         alice.app.stop_mesh();
         bob.app.stop_mesh();
@@ -5773,6 +8147,60 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         assert!(
             after.contacts.iter().any(|c| c.account_id == bob_account),
             "approved contact bob must appear in the connection-state DTO"
+        );
+    }
+
+    /// Our outgoing request says how far it got: with no session yet it waits for a link (a request
+    /// travels only over one), and when what we publish and what the contact publishes share no
+    /// address family — IPv6 only here, IPv4 only there — the reason names both instead of a bare
+    /// "not approved". The case behind docs/bugs/contact-request-said-sent-without-a-link.md.
+    #[test]
+    fn an_outgoing_request_without_a_link_says_it_waits_and_names_a_missing_address_family() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("request-progress-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("request-progress-bob", "Bob", "Bob PC");
+        alice.app.store_remote_prekey_bundle(&bob.bundle).unwrap();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        alice
+            .app
+            .request_contact_by_identifier(&bob_account.0, "Bob", None)
+            .unwrap();
+        alice.app.start_mesh_no_autoconnect().expect("start mesh");
+        let bob_row = |app: &OmniApp| {
+            app.mesh_connection_state()
+                .unwrap()
+                .contacts
+                .into_iter()
+                .find(|c| c.account_id == bob_account.0)
+                .expect("bob's row")
+        };
+
+        let row = bob_row(&alice.app);
+        assert_eq!(row.request, Some(crate::ContactRequestProgress::WaitingForLink));
+        assert_eq!(row.cannot_reach_reason, Some(crate::CannotReachReason::NotApproved));
+        assert!(row.address_family_gap.is_none());
+
+        let bob_bundle = alice
+            .app
+            .storage
+            .get_latest_remote_prekey_bundle_for_account(&bob_account)
+            .unwrap()
+            .expect("bob's stored bundle");
+        let bob_node =
+            omni_mesh_runtime::node_address_from_ed25519_pubkey(bob_bundle.identity_signing_key.0).unwrap();
+        let db_path = alice.app.storage.db_path().to_string_lossy().to_string();
+        let v6 = crate::app_nat_class::AddressFamilies { ipv4: false, ipv6: true };
+        let v4 = crate::app_nat_class::AddressFamilies { ipv4: true, ipv6: false };
+        crate::app_nat_class::set_local_address_families(&db_path, v6);
+        crate::app_nat_class::set_peer_address_families(&db_path, bob_node.as_bytes(), v4);
+        let row = bob_row(&alice.app);
+        assert_eq!(
+            row.cannot_reach_reason,
+            Some(crate::CannotReachReason::NoCommonAddressFamily)
+        );
+        assert_eq!(
+            row.address_family_gap,
+            Some(crate::AddressFamilyGap { ours: "IPv6".into(), theirs: "IPv4".into() })
         );
     }
 
@@ -6657,6 +9085,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             &alice_session,
             &format!("durable-msg-{}", unique_suffix()),
             "ping from the void",
+            None,
             now,
             now,
         )
@@ -6723,12 +9152,12 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let loaded_earlier = session.clone();
 
         // Meanwhile another path encrypts and stores: the ratchet moves on.
-        let mut other = omni_messaging::build_encrypted_text_envelope(&loaded_earlier, "m-1", "one", now, now)
+        let mut other = omni_messaging::build_encrypted_text_envelope(&loaded_earlier, "m-1", "one", None, now, now)
             .unwrap();
         alice.app.storage.store_session_record(&mut other.updated_session).unwrap();
 
         // The stale copy would hand out the very same counter again.
-        let reused = omni_messaging::build_encrypted_text_envelope(&loaded_earlier, "m-2", "two", now, now)
+        let reused = omni_messaging::build_encrypted_text_envelope(&loaded_earlier, "m-2", "two", None, now, now)
             .unwrap();
         assert_eq!(reused.updated_session.send_counter, other.updated_session.send_counter);
 
@@ -6736,7 +9165,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             .unwrap()
             .expect("the stored, advanced session");
         assert_eq!(fresh.send_counter, other.updated_session.send_counter);
-        let next = omni_messaging::build_encrypted_text_envelope(&fresh, "m-2", "two", now, now)
+        let next = omni_messaging::build_encrypted_text_envelope(&fresh, "m-2", "two", None, now, now)
             .unwrap();
         assert_eq!(next.updated_session.send_counter, other.updated_session.send_counter + 1);
 
@@ -6963,6 +9392,22 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         peer.app.stop_mesh();
     }
 
+    /// A55 (audit 2026-11-09): signing out stops the mesh in the core, not only when the shell asks —
+    /// otherwise it kept carrying the signed-out profile's groups and dialing its contacts.
+    #[test]
+    fn signing_out_stops_the_mesh() {
+        let _guard = network_test_guard();
+        let peer = create_stage5_peer("sign-out-mesh", "Peer", "Peer PC");
+        peer.app.start_mesh().expect("mesh should start");
+        assert!(peer.app.mesh_node_address_hex().unwrap().is_some());
+
+        let profile_id = peer.app.get_active_profile_id().unwrap().unwrap();
+        confirm_sign_out_profile(&peer.app, &profile_id);
+
+        assert!(peer.app.mesh_node_address_hex().unwrap().is_none(), "the mesh stops with the profile");
+        assert!(peer.app.mesh_runtime().is_none());
+    }
+
     /// Sending to an *offline* approved contact that has a known mesh route hands the
     /// outbound envelope to durable store-and-forward (a held frame), so it can
     /// reconcile to the peer later — the headline never-online-together promise.
@@ -7080,53 +9525,11 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         link_apps_over_mesh(&alice.app, &bob.app);
         let _ = &bob_node;
 
-        // The Link is up, so the on_wire pairing handler + contact-request trigger
-        // have run over the mesh: Bob must surface an incoming-Pending contact for
-        // Alice (a regression if it does not, since the Link exists).
-        wait_for_condition(Duration::from_secs(30), || {
-            bob.app
-                .storage
-                .find_contact_by_remote_account_id(&alice.account.descriptor.account_id)
-                .ok()
-                .flatten()
-                .is_some_and(|contact| {
-                    contact.relationship_state == ContactRelationshipState::Pending
-                        && contact.pending_request_direction
-                            == Some(omni_identity::ContactRequestDirection::Incoming)
-                })
-        });
-
-        // Alice's side is an outgoing-Pending contact for Bob, created by the
-        // on_wire pairing handler before the request was sent.
-        let alice_contact = alice
-            .app
-            .storage
-            .find_contact_by_remote_account_id(&bob.account.descriptor.account_id)
-            .unwrap()
-            .expect("alice should have a pending contact for bob");
-        assert_eq!(
-            alice_contact.relationship_state,
-            ContactRelationshipState::Pending,
-            "alice's freshly-paired contact starts Pending"
-        );
-        assert_eq!(
-            alice_contact.pending_request_direction,
-            Some(omni_identity::ContactRequestDirection::Outgoing),
-            "alice initiated the pairing, so her pending request is Outgoing"
-        );
-
-        // Bob approves (the one manual step — the user clicking Approve). The
-        // approval rides back over the mesh and Alice's outgoing-pending
-        // auto-promotes (no approve needed on the initiator side).
-        let bob_contact = bob
-            .app
-            .storage
-            .find_contact_by_remote_account_id(&alice.account.descriptor.account_id)
-            .unwrap()
-            .expect("bob should have an incoming-pending contact for alice");
-        bob.app
-            .approve_contact(&bob_contact.contact_id)
-            .expect("bob approves alice");
+        // The Link is up, so the on_wire pairing handler has sent Alice's request over the mesh.
+        // It answers Bob's own invite (its claim checks out against the invite he handed out), so
+        // Bob takes it as the person he invited: no «Принять» on either side
+        // (`an_invites_first_importer_is_approved_and_a_second_one_waits`). Alice's outgoing
+        // request is promoted by Bob's approval signal.
 
         // Both sides reach Approved over the mesh — stranger pairing without any
         // legacy connection is complete.
@@ -7552,12 +9955,15 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let sent = sender
             .app
             .send_attachment_request(omni_types::SendAttachmentRequest {
+                reply_to: None,
                 dialog_key: receiver.dialog_key.clone(),
                 body: String::new(),
                 source_file_path: source_path.to_string_lossy().into_owned(),
                 display_file_name: None,
                 media_protection_mode: omni_types::AttachmentMediaProtectionMode::E2eeMedia,
                 as_photo: true,
+                as_voice: false,
+                as_video_note: false,
             })
             .unwrap();
         let sent_attachment = sent.attachment.expect("a photo is an attachment");
@@ -7761,8 +10167,9 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let offered = offered().unwrap();
 
         // Blocks 0 and 2 on disk where the download keeps its file, and in the map.
-        let file_name = save_path.file_name().unwrap().to_string_lossy().into_owned();
-        let temp_path = dir.join(format!("{file_name}.{}.part", offered.id));
+        let file_name = save_path.file_name().unwrap().to_string_lossy();
+        let profile = server.app.storage.get_active_profile_id().unwrap().unwrap();
+        let temp_path = dir.join(format!("{file_name}.{}.{}.part", hex::encode(profile.0.as_bytes()), offered.id));
         let mut part = vec![0u8; payload.len()];
         part[..block].copy_from_slice(&payload[..block]);
         part[2 * block..].copy_from_slice(&payload[2 * block..]);
@@ -7837,7 +10244,14 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 .ok()
                 .and_then(|history| history.messages.into_iter().find(|message| message.body == "file from a peer with no hello held"))
         };
-        wait_for_condition(Duration::from_secs(60), || {
+        wait_for_state(Duration::from_secs(60), || {
+            format!(
+                "client {}; server {}; client-server link {}",
+                attachment_story(&client.app, server.dialog_key.as_str(), "file from a peer with no hello held"),
+                attachment_story(&server.app, client.dialog_key.as_str(), "file from a peer with no hello held"),
+                server.app.mesh_node_bytes().map(hex::encode).and_then(|node| client.app.mesh_has_link(&node).ok()).unwrap_or(false),
+            )
+        }, || {
             row().is_some_and(|message| {
                 message.attachment.is_some_and(|attachment| attachment.state == omni_types::AttachmentTransferState::Offered)
             })
@@ -7861,6 +10275,88 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         }
         let _ = fs::remove_file(&source_path);
         let _ = fs::remove_file(&save_path);
+    }
+
+    /// A blocked contact holds no direct link with us (owner, 2026-11-10): the link up goes, its dial
+    /// is refused; taken back, it connects again.
+    #[test]
+    fn a_blocked_contact_holds_no_direct_link_with_us_and_connects_again_once_unblocked() {
+        let _guard = network_test_guard();
+        let server = create_stage5_peer("mesh-blocked-server", "Server", "Server PC");
+        let client = create_stage5_peer("mesh-blocked-client", "Client", "Client PC");
+        link_stage5_contact(&client.app, &server, "mesh-blocked-peer");
+        link_stage5_peers_over_mesh(&client, &server);
+        let client_hex = client.app.mesh_node_address_hex().unwrap().unwrap();
+        let server_hex = server.app.mesh_node_address_hex().unwrap().unwrap();
+        assert!(crate::blocked_contact_nodes(&server.app.storage).unwrap().is_empty());
+
+        let contact = server
+            .app
+            .storage
+            .find_contact_by_remote_account_id(&client.account.descriptor.account_id)
+            .unwrap()
+            .expect("the client is the server's contact");
+        server.app.block_contact(&contact.contact_id).unwrap();
+        let blocked = crate::blocked_contact_nodes(&server.app.storage).unwrap();
+        assert_eq!(blocked.len(), 1, "the client's one device");
+        assert_eq!(blocked.iter().next().unwrap().to_string(), client_hex);
+        wait_for_condition(Duration::from_secs(10), || !server.app.mesh_has_link(&client_hex).unwrap_or(true));
+        // The client keeps dialing (it still has us as a contact): it is turned away.
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(!server.app.mesh_has_link(&client_hex).unwrap(), "no direct link with a blocked contact");
+
+        // Taken back: it connects again.
+        server.app.approve_contact(&contact.contact_id).unwrap();
+        assert!(crate::blocked_contact_nodes(&server.app.storage).unwrap().is_empty());
+        link_stage5_peers_over_mesh(&client, &server);
+        assert!(server.app.mesh_has_link(&client_hex).unwrap() && client.app.mesh_has_link(&server_hex).unwrap());
+        for peer in [&client, &server] {
+            peer.app.stop_mesh();
+        }
+    }
+
+    #[test]
+    fn a_blocked_contact_is_not_asked_for_its_file() {
+        // A03 (audit 2026-11-09 #6): a download waiting to be asked again stays unasked once its
+        // contact is blocked.
+        let _guard = network_test_guard();
+        let server = create_stage5_peer("attachment-blocked-server", "Server", "Server PC");
+        let client = create_stage5_peer("attachment-blocked-client", "Client", "Client PC");
+        link_stage5_contact(&client.app, &server, "blocked-attachment-peer");
+        let dir = std::env::temp_dir().join("omni-stage-5-app-tests");
+        fs::create_dir_all(&dir).unwrap();
+        let suffix = unique_suffix();
+        let source_path = dir.join(format!("attachment-blocked-source-{suffix}.bin"));
+        let save_path = dir.join(format!("attachment-blocked-downloaded-{suffix}.bin"));
+        fs::write(&source_path, b"the file").unwrap();
+        link_stage5_peers_over_mesh(&client, &server);
+        client
+            .app
+            .send_attachment(server.dialog_key.as_str(), "a file", source_path.to_string_lossy().as_ref(), None, omni_types::AttachmentMediaProtectionMode::E2eeMedia)
+            .unwrap();
+        let row = || {
+            server.app.list_messages(client.dialog_key.as_str()).ok().and_then(|history| history.messages.into_iter().find(|message| message.body == "a file"))
+        };
+        wait_for_condition(Duration::from_secs(60), || {
+            row().is_some_and(|message| message.attachment.is_some_and(|a| a.state == omni_types::AttachmentTransferState::Offered))
+        });
+        let offered = row().unwrap();
+        let client_contact = server
+            .app
+            .storage
+            .find_contact_by_remote_account_id(&client.account.descriptor.account_id)
+            .unwrap()
+            .expect("the client is the server's contact");
+        server.app.block_contact(&client_contact.contact_id).unwrap();
+        server.app.storage.mark_attachment_download_requested(&offered.id, &save_path, "transfer-after-block", current_unix_ms()).unwrap();
+        let db = server.app.storage.db_path().to_string_lossy().to_string();
+        let before = crate::download_requests_sent_for(&db, &offered.id);
+        assert!(crate::attempt_send_attachment_download_request(&server.app.storage, &server.app.transport, &offered.id).is_err());
+        assert_eq!(crate::download_requests_sent_for(&db, &offered.id), before, "nothing is asked of a blocked contact");
+        for peer in [&client, &server] {
+            peer.app.stop_mesh();
+        }
+        let _ = fs::remove_file(&source_path);
     }
 
     #[test]
@@ -9357,7 +11853,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         crate::sweep_stale_test_temp();
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-app-tests")
-            .join(format!("{prefix}-{}.db", unique_suffix()))
+            .join(format!("{prefix}-{}", unique_suffix())).join("omni.db")
             .to_string_lossy()
             .into_owned();
         if let Some(transport_mode) = transport_mode {
@@ -9525,24 +12021,25 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         );
     }
 
-    /// First contact the way the product makes it: `requester` imports `receiver`'s mesh pairing
-    /// invite and links to it (dialed at the receiver's loopback mesh address, so multicast is not
-    /// needed). The pairing handler sends the X3DH bootstrap — the contact request — so on return
-    /// the receiver holds an INCOMING-pending contact for the requester and an established session.
+    /// First contact by a request that waits for «Принять»: `requester` asks `receiver` by its
+    /// Omni-ID the way `find_contact_by_omni_id` does once the beacon is found (the outgoing request
+    /// plus the receiver's node as a pairing target) and links to it (dialed at the receiver's
+    /// loopback mesh address, so multicast is not needed). The pairing handler sends the X3DH
+    /// bootstrap — the contact request — so on return the receiver holds an INCOMING-pending contact
+    /// for the requester and an established session. Not by an invite: its first importer is
+    /// approved at once (`an_invites_first_importer_is_approved_and_a_second_one_waits`).
     fn pair_stage5_over_mesh(requester: &Stage5Peer, receiver: &Stage5Peer) {
         for peer in [requester, receiver] {
             if peer.app.mesh.lock().unwrap().is_none() {
                 peer.app.start_mesh().expect("mesh starts");
             }
         }
-        let invite = receiver
-            .app
-            .generate_mesh_pairing_invite()
-            .expect("receiver generates a pairing invite");
         requester
             .app
-            .register_mesh_pairing_invite(&invite)
-            .expect("requester imports the invite");
+            .request_contact_by_identifier(&receiver.account.descriptor.account_id.0, "Receiver", None)
+            .expect("requester asks the receiver by its Omni-ID");
+        let receiver_node = omni_mesh_runtime::MeshNodeAddress::from_bytes(receiver.app.mesh_node_bytes().unwrap());
+        requester.app.mesh_pairing_targets.lock().unwrap().insert(receiver_node);
         link_apps_over_mesh(&requester.app, &receiver.app);
         wait_for_condition(Duration::from_secs(30), || {
             receiver
@@ -9557,6 +12054,146 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                             == Some(omni_identity::ContactRequestDirection::Incoming)
                 })
         });
+    }
+
+    /// The live case of docs/bugs/contact-request-said-sent-without-a-link.md, first half: the
+    /// requester imported the receiver's invite, but the link came up from the OTHER side — the
+    /// receiver dialed the requester (by its «код связи»). The request must still arrive, and as the
+    /// answer to the receiver's own invite it makes both sides contacts.
+    #[test]
+    fn an_invite_request_arrives_when_the_inviter_is_the_one_who_dials() {
+        let _guard = network_test_guard();
+        let requester = create_stage5_peer("invite-dialed-back-req", "Requester", "Req PC");
+        let receiver = create_stage5_peer("invite-dialed-back-rcv", "Receiver", "Rcv PC");
+        for peer in [&requester, &receiver] {
+            peer.app.start_mesh().expect("mesh starts");
+        }
+        let invite = receiver.app.generate_mesh_pairing_invite().expect("invite");
+        requester.app.register_mesh_pairing_invite(&invite).expect("import");
+        link_apps_over_mesh(&receiver.app, &requester.app);
+        wait_for_condition(Duration::from_secs(30), || {
+            stage5_contact_state(&receiver, &requester) == Some(ContactRelationshipState::Approved)
+                && stage5_contact_state(&requester, &receiver) == Some(ContactRelationshipState::Approved)
+        });
+        stop_stage5_meshes(&[&requester, &receiver]);
+    }
+
+    fn stage5_contact_state(me: &Stage5Peer, other: &Stage5Peer) -> Option<ContactRelationshipState> {
+        me.app
+            .storage
+            .find_contact_by_remote_account_id(&other.account.descriptor.account_id)
+            .ok()
+            .flatten()
+            .map(|contact| contact.relationship_state)
+    }
+
+    /// Handing out an invite is consent to the person it was given to — once. Its first importer is
+    /// a contact on both sides without «Принять»; the invite is then spent, and a second importer of
+    /// the same invite (it was forwarded) waits for the inviter's approval.
+    #[test]
+    fn an_invites_first_importer_is_approved_and_a_second_one_waits() {
+        let _guard = network_test_guard();
+        let inviter = create_stage5_peer("invite-first-inviter", "Inviter", "Inv PC");
+        let first = create_stage5_peer("invite-first-first", "First", "First PC");
+        let second = create_stage5_peer("invite-first-second", "Second", "Second PC");
+        for peer in [&inviter, &first, &second] {
+            peer.app.start_mesh().expect("mesh starts");
+        }
+        let invite = inviter.app.generate_mesh_pairing_invite().expect("invite");
+        first.app.register_mesh_pairing_invite(&invite).expect("first imports");
+        second.app.register_mesh_pairing_invite(&invite).expect("second imports");
+
+        link_apps_over_mesh(&first.app, &inviter.app);
+        wait_for_condition(Duration::from_secs(30), || {
+            stage5_contact_state(&inviter, &first) == Some(ContactRelationshipState::Approved)
+                && stage5_contact_state(&first, &inviter) == Some(ContactRelationshipState::Approved)
+        });
+        let ours = inviter.app.storage.list_active_bootstrap_invites(current_unix_ms()).unwrap();
+        assert!(ours.iter().all(|row| row.inviter_node.is_some()), "the answered invite is spent: {ours:?}");
+
+        link_apps_over_mesh(&second.app, &inviter.app);
+        wait_for_condition(Duration::from_secs(30), || {
+            inviter
+                .app
+                .storage
+                .find_contact_by_remote_account_id(&second.account.descriptor.account_id)
+                .ok()
+                .flatten()
+                .is_some_and(|contact| {
+                    contact.relationship_state == ContactRelationshipState::Pending
+                        && contact.pending_request_direction == Some(omni_identity::ContactRequestDirection::Incoming)
+                })
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            stage5_contact_state(&inviter, &second),
+            Some(ContactRelationshipState::Pending),
+            "a second importer is not let in by the spent invite"
+        );
+        stop_stage5_meshes(&[&inviter, &first, &second]);
+    }
+
+    /// Second half: each side imported the other's invite — two requests crossing. Both sides must
+    /// end as contacts (`should_auto_approve_crossed_request`), not as two "Запрос отправлен".
+    #[test]
+    fn crossed_invite_requests_make_both_sides_contacts() {
+        let _guard = network_test_guard();
+        let a = create_stage5_peer("crossed-invites-a", "Alpha", "A PC");
+        let b = create_stage5_peer("crossed-invites-b", "Beta", "B PC");
+        for peer in [&a, &b] {
+            peer.app.start_mesh().expect("mesh starts");
+        }
+        let invite_a = a.app.generate_mesh_pairing_invite().expect("invite a");
+        let invite_b = b.app.generate_mesh_pairing_invite().expect("invite b");
+        a.app.register_mesh_pairing_invite(&invite_b).expect("a imports b");
+        b.app.register_mesh_pairing_invite(&invite_a).expect("b imports a");
+        link_apps_over_mesh(&a.app, &b.app);
+        let approved = |me: &Stage5Peer, other: &Stage5Peer| {
+            me.app
+                .storage
+                .find_contact_by_remote_account_id(&other.account.descriptor.account_id)
+                .ok()
+                .flatten()
+                .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved)
+        };
+        wait_for_condition(Duration::from_secs(30), || approved(&a, &b) && approved(&b, &a));
+        stop_stage5_meshes(&[&a, &b]);
+    }
+
+    /// The same by Omni-ID: each side sent the other a request by its ID («Найти по Omni-ID»). A
+    /// request to someone means we want them as a contact, so their request to us is the answer —
+    /// both sides end as contacts without anyone pressing «Принять».
+    #[test]
+    fn crossed_requests_by_omni_id_make_both_sides_contacts() {
+        let _guard = network_test_guard();
+        let a = create_stage5_peer("crossed-ids-a", "Alpha", "A PC");
+        let b = create_stage5_peer("crossed-ids-b", "Beta", "B PC");
+        a.app.store_remote_prekey_bundle(&b.bundle).unwrap();
+        b.app.store_remote_prekey_bundle(&a.bundle).unwrap();
+        // What `find_contact_by_omni_id` does once the beacon is found: the outgoing request plus the
+        // found device's node as a pairing target (the bootstrap ships on its hello).
+        for peer in [&a, &b] {
+            peer.app.start_mesh().expect("mesh starts");
+        }
+        for (me, other, name) in [(&a, &b, "Beta"), (&b, &a, "Alpha")] {
+            me.app.request_contact_by_identifier(&other.account.descriptor.account_id.0, name, None).unwrap();
+            let node = omni_mesh_runtime::MeshNodeAddress::from_bytes(other.app.mesh_node_bytes().unwrap());
+            me.app.mesh_pairing_targets.lock().unwrap().insert(node);
+        }
+        link_apps_over_mesh(&a.app, &b.app);
+        let approved = |me: &Stage5Peer, other: &Stage5Peer| {
+            me.app
+                .storage
+                .find_contact_by_remote_account_id(&other.account.descriptor.account_id)
+                .ok()
+                .flatten()
+                .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved)
+        };
+        wait_for_condition(Duration::from_secs(30), || approved(&a, &b) && approved(&b, &a));
+        for peer in [&a, &b] {
+            assert_eq!(peer.app.storage.list_contacts().unwrap().len(), 1, "the request became the contact, no second row");
+        }
+        stop_stage5_meshes(&[&a, &b]);
     }
 
     /// Sessions are made lazily, by the first frame. Send one `from` → `to` and wait for its receipt,
@@ -9577,7 +12214,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn get_contact_verification_state_returns_existing_card_snapshot() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("verification-state-{}.db", unique_suffix()));
+            .join(format!("verification-state-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -9586,7 +12223,14 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         );
 
         let contact = app
-            .add_contact_by_identifier("acct-remote", "Bob", Some("Bob".to_string()))
+            .add_contact(&AddContactInput {
+                petname: "Bob".to_string(),
+                remote_account_id: Some(AccountId("acct-remote".to_string())),
+                public_display_name: Some("Bob".to_string()),
+                remote_instance_id: None,
+                primary_dialog_key: None,
+                initial_observation: None,
+            })
             .unwrap();
 
         let state = app
@@ -9601,7 +12245,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn create_chat_from_contact_returns_stable_dialog_target() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("contact-chat-target-{}.db", unique_suffix()));
+            .join(format!("contact-chat-target-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -9635,7 +12279,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn session_activation_repairs_placeholder_instance_and_canonicalizes_account_dialog_selector() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("session-activation-repair-{}.db", unique_suffix()));
+            .join(format!("session-activation-repair-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -9920,6 +12564,40 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         assert!(!Path::new(r"C:\Windows\System32\omni-test-backup.db").exists());
     }
 
+    /// V-24 (review 2026-10-18): a plain copy saved into a folder that already holds other things
+    /// leaves them alone — it used to delete `attachments/` and `profile-media/` there — and a copy
+    /// over an existing one is refused instead of wiping it.
+    #[test]
+    fn plain_backup_copy_keeps_what_the_destination_folder_already_holds() {
+        let peer = create_stage5_peer("v24-copy-keeps-folder", "Alice", "Alice PC");
+        let folder = std::env::temp_dir()
+            .join("omni-stage-5-app-tests")
+            .join(format!("v24-folder-{}", unique_suffix()));
+        let theirs_attachment = folder.join("attachments").join("theirs.bin");
+        let theirs_media = folder.join("profile-media").join("theirs.png");
+        let theirs_note = folder.join("notes.txt");
+        for file in [&theirs_attachment, &theirs_media, &theirs_note] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"not Omni's").unwrap();
+        }
+
+        let copy_path = folder.join("copy.db");
+        peer.app
+            .export_current_database_backup_bundle(&copy_path)
+            .expect("a copy goes into a folder with other files");
+        assert!(copy_path.exists());
+        for file in [&theirs_attachment, &theirs_media, &theirs_note] {
+            assert_eq!(fs::read(file).unwrap(), b"not Omni's", "{} was touched", file.display());
+        }
+
+        let again = peer
+            .app
+            .export_current_database_backup_bundle(&copy_path)
+            .expect_err("a copy over an existing one is refused");
+        assert!(format!("{again}").contains("already has"), "unexpected error: {again}");
+        assert!(copy_path.exists(), "the refused copy left the existing one in place");
+    }
+
     #[test]
     #[cfg(windows)]
     fn tm006_request_attachment_download_rejects_system_save_path() {
@@ -10078,7 +12756,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             initiated_locally: false,
         };
 
-        handle_session_closed(&runtime_storage, &transport_handle, &receive_context).unwrap();
+        handle_session_closed(&runtime_storage, &transport_handle, &Arc::new(Mutex::new(())), &receive_context).unwrap();
 
         let still_pending = local
             .app
@@ -10101,7 +12779,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn session_activation_ignores_exact_self_context() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("session-activation-self-{}.db", unique_suffix()));
+            .join(format!("session-activation-self-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -10141,7 +12819,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn transport_contact_resolution_prefers_receive_context_identity_over_local_fallback() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-app-tests")
-            .join(format!("transport-contact-resolution-{}.db", unique_suffix()));
+            .join(format!("transport-contact-resolution-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -10204,7 +12882,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn trust_state_appears_in_chat_header_projection() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("chat-header-trust-{}.db", unique_suffix()));
+            .join(format!("chat-header-trust-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -10271,7 +12949,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn legacy_dialogs_without_contacts_are_rejected() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("legacy-dialog-usable-{}.db", unique_suffix()));
+            .join(format!("legacy-dialog-usable-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -10293,7 +12971,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
     fn removing_or_blocking_contact_does_not_corrupt_existing_dialog_history() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-app-tests")
-            .join(format!("remove-block-history-{}.db", unique_suffix()));
+            .join(format!("remove-block-history-{}", unique_suffix())).join("omni.db");
 
         let app = create_app_with_active_profile(
             db_path.to_string_lossy().into_owned(),
@@ -10487,6 +13165,29 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         );
     }
 
+    /// One line about the attachment of the message `body` in `dialog` as `app` holds it — state,
+    /// bytes, the last error — for a wait to say what it saw instead of only "not satisfied".
+    fn attachment_story(app: &OmniApp, dialog: &str, body: &str) -> String {
+        let message = app
+            .list_messages(dialog)
+            .ok()
+            .and_then(|history| history.messages.into_iter().find(|message| message.body == body));
+        match message {
+            None => "no row".to_string(),
+            Some(message) => match message.attachment {
+                None => format!("{:?}, no attachment", message.status),
+                Some(attachment) => format!(
+                    "{:?} {:?} {}/{} error={:?}",
+                    message.status,
+                    attachment.state,
+                    attachment.bytes_transferred,
+                    attachment.file_size_bytes,
+                    attachment.last_error
+                ),
+            },
+        }
+    }
+
     /// `wait_for_condition` that says what it actually saw when it gives up.
     ///
     /// Every entry in the "known flaky" table is a `wait_for_condition` timeout whose recorded
@@ -10663,7 +13364,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let app = create_app_with_active_profile(
             std::env::temp_dir()
                 .join("omni-stage-11-app-tests")
-                .join(format!("dialog-delta-{}.db", unique_suffix()))
+                .join(format!("dialog-delta-{}", unique_suffix())).join("omni.db")
                 .to_string_lossy()
                 .into_owned(),
             "Alice",
@@ -10782,11 +13483,85 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 runtime.summary.connected_at_unix_ms = None;
             }
             set_current_call_runtime(&db_path, Some(runtime)).unwrap();
-            crate::handle_incoming_call_ringing(&peer.app.storage, &ringing).unwrap();
+            let peer_device = omni_crypto::SessionAddress {
+                remote_account_id: AccountId("acct-remote".to_string()),
+                remote_device_id: DeviceId("dev-remote".to_string()),
+            };
+            crate::handle_incoming_call_ringing(&peer.app.storage, &ringing, &peer_device).unwrap();
             let now = current_call_runtime(&db_path).unwrap().unwrap().summary.state;
             assert_eq!(now, after, "from {before:?}, answered={answered}");
         }
         set_current_call_runtime(&db_path, None).unwrap();
+    }
+
+    /// Blind audit 2026-11-10: when sending the invite failed outright, the call stayed in its slot
+    /// («connecting») until the invite expired, and the next call was refused as «another call is in
+    /// progress». A call whose invite did not go out ends as failed at once.
+    #[test]
+    fn a_call_whose_invite_did_not_go_out_frees_its_slot() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("invite-failed-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("invite-failed-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "hi").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "hi", MessageStatus::Delivered);
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+
+        assert!(alice.app.place_call(bob.dialog_key.as_str()).is_err(), "nowhere for the invite to go");
+        assert!(current_call(&alice.app).is_none(), "the slot is free");
+        assert!(alice.app.place_call(bob.dialog_key.as_str()).is_err());
+        assert!(current_call(&alice.app).is_none());
+    }
+
+    /// Blind audit 2026-11-10: a call's events were taken from anyone naming its id — any contact
+    /// with a session could hang up our call with someone else, answer it in the callee's place, or
+    /// put it to «reconnecting». Only the call's peer (its account, one of its invited devices) moves
+    /// it now.
+    #[test]
+    fn a_call_is_moved_only_by_its_own_peer() {
+        let peer = create_stage5_peer("call-peer-only", "Alice", "Alice PC");
+        let db_path = peer.app.storage.db_path().to_string_lossy().to_string();
+        let address = |account: &str, device: &str| omni_crypto::SessionAddress {
+            remote_account_id: AccountId(account.to_string()),
+            remote_device_id: DeviceId(device.to_string()),
+        };
+        let stranger = address("acct-other", "dev-other");
+        let other_device_of_theirs = address("acct-remote", "dev-not-invited");
+        let state = || current_call_runtime(&db_path).unwrap().map(|runtime| runtime.summary.state);
+        let mut runtime = test_active_call_runtime(CallState::Active);
+        runtime.summary.contact_id = None;
+        set_current_call_runtime(&db_path, Some(runtime)).unwrap();
+
+        for from in [&stranger, &other_device_of_theirs] {
+            crate::handle_incoming_call_reconnect(
+                &peer.app.storage,
+                &omni_types::CallReconnectV1 { call_id: "call-test".to_string(), reconnecting_at_unix_ms: current_unix_ms() },
+                from,
+            )
+            .unwrap();
+            assert_eq!(state(), Some(CallState::Active), "{from:?} does not move the call");
+            crate::handle_incoming_call_cancel_or_hangup_or_timeout(
+                &peer.app.storage,
+                "call-test",
+                CallOutcome::Completed,
+                current_unix_ms(),
+                from,
+            )
+            .unwrap();
+            assert_eq!(state(), Some(CallState::Active), "{from:?} does not end the call");
+        }
+        crate::handle_incoming_call_cancel_or_hangup_or_timeout(
+            &peer.app.storage,
+            "call-test",
+            CallOutcome::Completed,
+            current_unix_ms(),
+            &address("acct-remote", "dev-remote"),
+        )
+        .unwrap();
+        assert_eq!(state(), None, "the call's peer ends it");
     }
 
     /// A call nobody answered yet has no link to lose: its dialog may be a dead one of the contact's
@@ -10831,7 +13606,88 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             remote_device_id: DeviceId("dev-remote".to_string()),
             invite_expires_at_unix_ms: now_unix_ms + 30_000,
             invited_devices: Vec::new(),
+            media: Default::default(),
         }
+    }
+
+    /// A 1:1 call's datagrams are sealed with the call's per-direction keys: the callee opens what
+    /// the caller sealed, exactly once. Negative halves: a replay, a flipped byte, a datagram on
+    /// another dialog, one sealed with the receiving direction's key, and sending before the keys
+    /// are agreed — none of it gets through.
+    #[test]
+    fn direct_call_datagrams_open_only_once_and_only_with_the_peers_key() {
+        use crate::{install_call_media_keys, open_direct_call_datagram, seal_direct_call_datagram};
+        let (caller_db, callee_db) = ("test-db-e2e-caller", "test-db-e2e-callee");
+        let mut caller = test_active_call_runtime(CallState::Active);
+        let mut callee = test_active_call_runtime(CallState::Active);
+        let dialog = caller.summary.dialog_key.clone();
+        let (caller_share, callee_share) =
+            (hex::encode(caller.media.own_share), hex::encode(callee.media.own_share));
+
+        set_current_call_runtime(caller_db, Some(caller.clone())).unwrap();
+        assert!(
+            seal_direct_call_datagram(caller_db, &dialog, b"rtp").is_err(),
+            "no keys yet: nothing may be sealed, and so nothing sent"
+        );
+        install_call_media_keys(&mut caller, &callee_share, true).unwrap();
+        install_call_media_keys(&mut callee, &caller_share, false).unwrap();
+        set_current_call_runtime(caller_db, Some(caller)).unwrap();
+        set_current_call_runtime(callee_db, Some(callee)).unwrap();
+
+        let sealed = seal_direct_call_datagram(caller_db, &dialog, b"rtp-1").unwrap();
+        assert_ne!(&sealed[omni_crypto::GROUP_CALL_MEDIA_HEADER_LEN..], b"rtp-1".as_slice());
+        assert_eq!(open_direct_call_datagram(callee_db, &dialog, &sealed).as_deref(), Some(b"rtp-1".as_slice()));
+        assert_eq!(open_direct_call_datagram(callee_db, &dialog, &sealed), None, "a replay");
+
+        let mut altered = seal_direct_call_datagram(caller_db, &dialog, b"rtp-2").unwrap();
+        *altered.last_mut().unwrap() ^= 0x01;
+        assert_eq!(open_direct_call_datagram(callee_db, &dialog, &altered), None, "an altered byte");
+
+        let other = seal_direct_call_datagram(caller_db, &dialog, b"rtp-3").unwrap();
+        assert_eq!(open_direct_call_datagram(callee_db, "dialog:instance:someone-else", &other), None);
+        let own_direction = seal_direct_call_datagram(callee_db, &dialog, b"echo").unwrap();
+        assert_eq!(open_direct_call_datagram(callee_db, &dialog, &own_direction), None, "the wrong direction's key");
+        assert_eq!(open_direct_call_datagram(caller_db, &dialog, &own_direction).as_deref(), Some(b"echo".as_slice()));
+
+        // Reordered but within the window: still opens; far behind it: dropped.
+        let early = seal_direct_call_datagram(caller_db, &dialog, b"early").unwrap();
+        for _ in 0..10 {
+            let _ = seal_direct_call_datagram(caller_db, &dialog, b"x").unwrap();
+        }
+        let late = seal_direct_call_datagram(caller_db, &dialog, b"late").unwrap();
+        assert!(open_direct_call_datagram(callee_db, &dialog, &late).is_some());
+        assert_eq!(open_direct_call_datagram(callee_db, &dialog, &early).as_deref(), Some(b"early".as_slice()));
+
+        set_current_call_runtime(caller_db, None).unwrap();
+        set_current_call_runtime(callee_db, None).unwrap();
+        assert!(seal_direct_call_datagram(caller_db, &dialog, b"after").is_err(), "the keys die with the call");
+    }
+
+    /// Blind audit 2026-11-12, pass 17: the keys set again (a contact's CallAccept sent again)
+    /// started the counter from 0 — the same nonce under the same key a second time.
+    #[test]
+    fn call_media_keys_set_again_do_not_restart_the_counter() {
+        use crate::install_call_media_keys;
+        let mut caller = test_active_call_runtime(CallState::Active);
+        let callee = test_active_call_runtime(CallState::Active);
+        let callee_share = hex::encode(callee.media.own_share);
+        install_call_media_keys(&mut caller, &callee_share, true).unwrap();
+        caller.media.keys.as_mut().unwrap().next_seq = 7;
+        install_call_media_keys(&mut caller, &callee_share, true).unwrap();
+        assert_eq!(caller.media.keys.as_ref().unwrap().next_seq, 7, "the counter goes on");
+    }
+
+    #[test]
+    fn media_replay_window_takes_each_counter_once_and_drops_the_too_old() {
+        use crate::MediaReplayWindow;
+        let mut window = MediaReplayWindow::default();
+        assert!(window.accept(5));
+        assert!(!window.accept(5));
+        assert!(window.accept(3), "reordered within the window");
+        assert!(window.accept(2000));
+        assert!(!window.accept(5), "now older than the window");
+        assert!(window.accept(1999));
+        assert!(!window.accept(1999));
     }
 
     /// Inbound media goes to the sink wired for its dialog, at once — and to nothing after the
@@ -11166,7 +14022,8 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let from_remote = stream_sent_by(&video, &remote.capabilities_id);
         assert_eq!((from_remote.width, from_remote.height, from_remote.fps), (1280, 720, 30));
         assert_eq!(from_remote.target_bitrate_bps, 6_000_000);
-        assert_eq!(selection.max_datagram_bytes, 1000);
+        // The safe budget less what sealing the datagram adds.
+        assert_eq!(selection.max_datagram_bytes, (1000 - omni_crypto::CALL_MEDIA_SEAL_OVERHEAD_BYTES) as u32);
         assert_eq!(video.capture_pixel_format, RealtimeVideoPixelFormat::Nv12);
         assert!(!video.rtcp_feedback_enabled);
     }
@@ -12848,7 +15705,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let offered_at_both = |body: &str| {
             wait_for_state(
                 Duration::from_secs(30),
-                || format!("{body}: at the pc {:?}, at the laptop {:?}", state(&bob.app, body), state(&laptop, body)),
+                || format!("{body}: pc {}; laptop {}; sender {}", attachment_story(&bob.app, &alice.dialog_key, body), attachment_story(&laptop, &alice.dialog_key, body), attachment_story(&alice.app, &bob.dialog_key, body)),
                 || state(&bob.app, body).is_some() && state(&laptop, body) == Some(omni_types::AttachmentTransferState::Offered),
             );
             row(&laptop, body).unwrap().id
@@ -12862,7 +15719,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         laptop.request_attachment_download(&first_id, at_laptop.to_string_lossy().as_ref()).unwrap();
         wait_for_state(
             Duration::from_secs(30),
-            || format!("laptop download {:?}", state(&laptop, "not on the pc")),
+            || format!("laptop {}; sender {}", attachment_story(&laptop, &alice.dialog_key, "not on the pc"), attachment_story(&alice.app, &bob.dialog_key, "not on the pc")),
             || at_laptop.exists() && state(&laptop, "not on the pc") == Some(omni_types::AttachmentTransferState::Downloaded),
         );
         assert_eq!(fs::read(&at_laptop).unwrap(), first);
@@ -12873,7 +15730,11 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let second_id = offered_at_both("on the pc");
         let at_pc = dir.join(format!("own-src-pc-2-{suffix}.bin"));
         bob.app.request_attachment_download(&second_id, at_pc.to_string_lossy().as_ref()).unwrap();
-        wait_for_condition(Duration::from_secs(30), || state(&bob.app, "on the pc") == Some(omni_types::AttachmentTransferState::Downloaded));
+        wait_for_state(
+            Duration::from_secs(30),
+            || format!("pc {}; sender {}", attachment_story(&bob.app, &alice.dialog_key, "on the pc"), attachment_story(&alice.app, &bob.dialog_key, "on the pc")),
+            || state(&bob.app, "on the pc") == Some(omni_types::AttachmentTransferState::Downloaded),
+        );
         let alice_hex = alice.app.mesh_node_address_hex().unwrap().expect("alice's mesh is up");
         alice.app.stop_mesh();
         wait_for_condition(Duration::from_secs(40), || !laptop.mesh_has_link(&alice_hex).unwrap_or(true));
@@ -12961,18 +15822,43 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let state = |app: &OmniApp, dialog: &str| row(app, dialog).and_then(|message| message.attachment).map(|attachment| attachment.state);
 
         // The desktop gets the copy and fetches its file from the laptop.
-        wait_for_condition(Duration::from_secs(30), || state(&desktop, &bob.dialog_key).is_some());
+        let linked = |a: &OmniApp, b: &OmniApp| {
+            b.mesh_node_bytes().map(hex::encode).and_then(|node| a.mesh_has_link(&node).ok()).unwrap_or(false)
+        };
+        wait_for_state(
+            Duration::from_secs(30),
+            || {
+                format!(
+                    "laptop {}; desktop rows {:?}; laptop-desktop link {}; desktop-bob link {}",
+                    attachment_story(&alice.app, &bob.dialog_key, "from the laptop"),
+                    desktop.list_messages(&bob.dialog_key).map(|history| history.messages.len()),
+                    linked(&alice.app, &desktop),
+                    linked(&desktop, &bob.app),
+                )
+            },
+            || state(&desktop, &bob.dialog_key).is_some(),
+        );
         let message_id = row(&desktop, &bob.dialog_key).unwrap().id;
         let at_desktop = dir.join(format!("md-file-desktop-{suffix}.bin"));
         desktop.request_attachment_download(&message_id, at_desktop.to_string_lossy().as_ref()).unwrap();
         wait_for_state(
             Duration::from_secs(30),
-            || format!("desktop copy {:?}", state(&desktop, &bob.dialog_key)),
+            || {
+                format!(
+                    "desktop {}; laptop {}",
+                    attachment_story(&desktop, &bob.dialog_key, "from the laptop"),
+                    attachment_story(&alice.app, &bob.dialog_key, "from the laptop")
+                )
+            },
             || state(&desktop, &bob.dialog_key) == Some(omni_types::AttachmentTransferState::Downloaded),
         );
 
         // The laptop goes away; Bob asks.
-        wait_for_condition(Duration::from_secs(30), || state(&bob.app, &alice.dialog_key) == Some(omni_types::AttachmentTransferState::Offered));
+        wait_for_state(
+            Duration::from_secs(30),
+            || format!("bob {}", attachment_story(&bob.app, &alice.dialog_key, "from the laptop")),
+            || state(&bob.app, &alice.dialog_key) == Some(omni_types::AttachmentTransferState::Offered),
+        );
         let laptop = alice.app.mesh_node_address_hex().unwrap().expect("the laptop's mesh is up");
         alice.app.stop_mesh();
         wait_for_condition(Duration::from_secs(40), || !bob.app.mesh_has_link(&laptop).unwrap_or(true));
@@ -12980,7 +15866,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         bob.app.request_attachment_download(&message_id, at_bob.to_string_lossy().as_ref()).unwrap();
         wait_for_state(
             Duration::from_secs(30),
-            || format!("bob's download {:?}", row(&bob.app, &alice.dialog_key).and_then(|m| m.attachment).map(|a| (a.state, a.bytes_transferred))),
+            || format!("bob {}; desktop {}", attachment_story(&bob.app, &alice.dialog_key, "from the laptop"), attachment_story(&desktop, &bob.dialog_key, "from the laptop")),
             || at_bob.exists() && state(&bob.app, &alice.dialog_key) == Some(omni_types::AttachmentTransferState::Downloaded),
         );
         assert_eq!(fs::read(&at_bob).unwrap(), payload);
@@ -13282,6 +16168,71 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         );
     }
 
+    /// A member card's account must be its device chain's: a card that names another account than the
+    /// chain it carries, or carries another device's chain, does not pass the engine's check
+    /// (audit 2026-11-09, F01).
+    #[test]
+    fn a_member_card_must_name_the_account_its_device_chain_proves() {
+        let alice = create_stage5_peer("grp-card-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("grp-card-bob", "Bob", "Bob PC");
+        let (_, alice_card) = crate::app_groups::local_mls_identity(&alice.app.storage).unwrap();
+        let (_, bob_card) = crate::app_groups::local_mls_identity(&bob.app.storage).unwrap();
+        let key = |card: &omni_group_mls::MemberCard| base64::engine::general_purpose::STANDARD.decode(&card.member_pub).unwrap();
+        assert!(!bob_card.device_chain.is_empty(), "a card carries its device chain");
+        assert!(crate::app_groups::check_member_card_for_tests(&bob_card, &key(&bob_card)).is_ok());
+
+        let claims_alice = omni_group_mls::MemberCard { account_id: alice_card.account_id.clone(), ..bob_card.clone() };
+        assert!(crate::app_groups::check_member_card_for_tests(&claims_alice, &key(&bob_card)).is_err(), "Bob's chain, Alice's account");
+        let alices_chain = omni_group_mls::MemberCard { device_chain: alice_card.device_chain.clone(), account_id: alice_card.account_id.clone(), ..bob_card.clone() };
+        assert!(crate::app_groups::check_member_card_for_tests(&alices_chain, &key(&bob_card)).is_err(), "Alice's chain, Bob's key");
+
+        // What the app trusts a member's account for, it reads only from a proven card: a card from
+        // before chains (or a forged one) names no account there.
+        assert_eq!(crate::app_groups::card_with_proven_account(&bob_card).account_id, bob_card.account_id);
+        let from_before = omni_group_mls::MemberCard { device_chain: String::new(), ..claims_alice.clone() };
+        assert_eq!(crate::app_groups::card_with_proven_account(&from_before).account_id, "");
+        assert_eq!(crate::app_groups::card_with_proven_account(&claims_alice).account_id, "");
+    }
+
+    /// The account takes its desktop back while the desktop is the group's only admin: the laptop, a
+    /// plain member, takes it out of the group; what the desktop says afterwards is dropped and what is
+    /// said after does not open for it — its own wipe is not relied on (audit 2026-11-09, F02).
+    #[test]
+    fn a_revoked_device_is_taken_out_of_its_groups_by_another_device_of_its_account() {
+        let alice = create_stage5_peer("grp-revoke-alice", "Alice", "Alice Laptop");
+        let desktop = copy_to_second_device(&alice, "grp-revoke-desktop");
+        let gid = desktop.create_group("Свои").unwrap().group_id;
+        group_join_for_real(&desktop, &alice.app, &gid, "dialog:laptop");
+        deliver_group_feed(&desktop, &[&alice.app]);
+        let laptop_pub = alice.app.storage.get_group(&gid).unwrap().unwrap().my_member_pub;
+        let desktop_pub = desktop.storage.get_group(&gid).unwrap().unwrap().my_member_pub;
+        // The laptop met the desktop (over the mesh in life).
+        let desktop_chain = desktop.storage.get_local_device_certificate_chain().unwrap().expect("a certified desktop");
+        alice.app.storage.record_own_device(&desktop_chain, "Alice Desktop", "dialog:desktop", 1_000).unwrap();
+        assert!(crate::app_workspace::is_own_live_device(&alice.app.storage, &desktop_pub), "the desktop is ours");
+
+        let desktop_id = desktop.get_local_device().unwrap().unwrap().device_id;
+        alice.app.revoke_own_device(&desktop_id.0, None).unwrap();
+        assert!(!crate::app_workspace::is_own_live_device(&alice.app.storage, &desktop_pub), "not after the revocation");
+        let members = alice.app.storage.list_group_members(&gid).unwrap();
+        assert!(members.iter().all(|m| m.member_pub != desktop_pub || m.status != "member"), "out of the group: {members:?}");
+        assert!(members.iter().any(|m| m.member_pub == laptop_pub && m.status == "member"));
+        // The desktop was the only admin: the laptop took its place, so the group keeps one.
+        let gid_bytes = crate::app_groups::group_id_bytes(&gid).unwrap();
+        let view = crate::app_groups::with_engine(&alice.app.storage, |engine| engine.view(&gid_bytes)).unwrap();
+        assert!(view.members.iter().any(|m| m.is_me && m.is_admin), "the laptop is the admin now");
+
+        // The desktop, ignoring its order to wipe, still speaks in the old epoch: dropped.
+        desktop.send_group_text(&gid, "я ещё здесь").unwrap();
+        deliver_group_feed(&desktop, &[&alice.app]);
+        assert!(alice.app.list_group_messages(&gid).unwrap().iter().all(|m| m.body != "я ещё здесь"));
+        // And takes the removal, after which nothing new opens for it.
+        deliver_group_feed(&alice.app, &[&desktop]);
+        alice.app.send_group_text(&gid, "без него").unwrap();
+        deliver_group_feed(&alice.app, &[&desktop]);
+        assert!(desktop.list_group_messages(&gid).unwrap_or_default().iter().all(|m| m.body != "без него"));
+    }
+
     /// The account takes its desktop back: the laptop stops routing to it, the revoked device and the
     /// contact both hear it from the laptop, and what the revoked device sends afterwards is not
     /// listened to.
@@ -13306,6 +16257,15 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             })
         });
 
+        // Bob is in a call with the desktop when it is taken back (A26, audit 2026-11-09 #6).
+        let alice_on_bob = bob.app.storage.find_contact_by_remote_account_id(&account_id).unwrap().expect("alice is bob's contact");
+        let mut call = test_active_call_runtime(CallState::Active);
+        call.remote_account_id = account_id.clone();
+        call.remote_device_id = desktop_id.clone();
+        call.summary.contact_id = Some(alice_on_bob.contact_id.0.clone());
+        call.summary.dialog_key = alice.dialog_key.to_string();
+        set_current_call_runtime(&bob.app.storage.db_path().to_string_lossy(), Some(call)).unwrap();
+
         alice.app.revoke_own_device(&desktop_id.0, None).unwrap();
         assert!(alice.app.storage.is_device_revoked(&account_id, &desktop_id).unwrap());
         assert!(alice.app.storage.list_own_device_dialogs().unwrap().is_empty());
@@ -13314,6 +16274,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         wait_for_condition(Duration::from_secs(30), || {
             bob.app.storage.is_device_revoked(&account_id, &desktop_id).unwrap_or(false)
         });
+        assert!(current_call(&bob.app).is_none(), "the call with the device taken back ends");
         // The desktop learns it was taken back and erases its profile at once.
         wait_for_condition(Duration::from_secs(30), || {
             desktop.storage.get_local_account().is_ok_and(|account| account.is_none())
@@ -13325,19 +16286,16 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 history.messages.iter().any(|message| message.body == "from the laptop")
             })
         });
-        // What the revoked device sent is not listened to; the laptop still is. (The desktop has
-        // erased itself by now, so the guard is exercised on bob's side directly.)
+        // Nothing the revoked device sends is listened to — revocations included (V-17: a stolen
+        // device still holds the working key and must not take the owner's other devices back
+        // through its contacts); the laptop still is. (The desktop has erased itself by now, so the
+        // guard is exercised on bob's side directly.)
         let address = |device_id: &DeviceId| omni_crypto::SessionAddress {
             remote_account_id: account_id.clone(),
             remote_device_id: device_id.clone(),
         };
-        let text = omni_types::WirePayloadV1::ChatText(omni_types::ChatTextV1 {
-            message_id: "m-after".to_string(),
-            body: "after the revocation".to_string(),
-            created_at_unix_ms: 1,
-        });
         let revoked_session = bob.app.storage.get_session_record(&address(&desktop_id)).unwrap().unwrap();
-        assert!(crate::sender_is_revoked_device(&bob.app.storage, &revoked_session, &text).unwrap());
+        assert!(crate::sender_is_revoked_device(&bob.app.storage, &revoked_session).unwrap());
         let laptop_session = bob
             .app
             .storage
@@ -13345,12 +16303,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             .unwrap()
             .expect("bob talks to the laptop on its dialog");
         assert_ne!(laptop_session.session_address.remote_device_id, desktop_id);
-        assert!(!crate::sender_is_revoked_device(&bob.app.storage, &laptop_session, &text).unwrap());
-        // ...except that it may still be told it was taken back.
-        let revocation_notice = omni_types::WirePayloadV1::LogicalEvent(
-            omni_types::LogicalEventEnvelopeV1::device_revocation("{}".to_string()),
-        );
-        assert!(!crate::sender_is_revoked_device(&bob.app.storage, &revoked_session, &revocation_notice).unwrap());
+        assert!(!crate::sender_is_revoked_device(&bob.app.storage, &laptop_session).unwrap());
 
         let history = bob.app.list_messages(&alice.dialog_key).unwrap();
         assert!(history.messages.iter().any(|message| message.body == "before the revocation"));
@@ -13641,6 +16594,1303 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         assert!(alice.app.storage.find_contact_by_remote_account_id(&bob_account).unwrap().is_none());
     }
 
+    /// A01 (audit 2026-11-09 #6): a contact blocked on one device of ours ends a call with them on
+    /// the other — the sync does what blocking there did.
+    #[test]
+    fn a_contact_blocked_on_another_device_of_ours_ends_the_call_with_them_here() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("md-block-call-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("md-block-call-bob", "Bob", "Bob PC");
+        let desktop = copy_to_second_device(&alice, "md-block-call-desktop");
+        link_apps_over_mesh(&desktop, &alice.app);
+        let desktop_id = desktop.get_local_device().unwrap().unwrap().device_id;
+        wait_for_condition(Duration::from_secs(30), || {
+            alice.app.storage.list_own_device_dialogs().unwrap_or_default().iter().any(|(device_id, _)| device_id == &desktop_id)
+        });
+        let bob_on_laptop = link_stage5_contact(&alice.app, &bob, "Bob");
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let bob_on_desktop = || desktop.storage.find_contact_by_remote_account_id(&bob_account).ok().flatten();
+        wait_for_condition(Duration::from_secs(90), || {
+            bob_on_desktop().is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved)
+        });
+        // The desktop is in a call with Bob.
+        let desktop_db = desktop.storage.db_path().to_string_lossy().to_string();
+        let bob_here = bob_on_desktop().unwrap();
+        let mut call = test_active_call_runtime(CallState::Active);
+        call.remote_account_id = bob_account.clone();
+        call.summary.contact_id = Some(bob_here.contact_id.0.clone());
+        call.summary.dialog_key = bob_here.primary_dialog_key.clone().unwrap_or_else(|| bob.dialog_key.to_string());
+        set_current_call_runtime(&desktop_db, Some(call)).unwrap();
+
+        alice.app.block_contact(&bob_on_laptop.contact_id).unwrap();
+        wait_for_condition(Duration::from_secs(90), || {
+            bob_on_desktop().is_some_and(|contact| contact.relationship_state != ContactRelationshipState::Approved)
+        });
+        assert!(current_call(&desktop).is_none(), "the call with the blocked contact ends on the other device too");
+        desktop.stop_mesh();
+        alice.app.stop_mesh();
+    }
+
+    /// A02 (audit 2026-11-09 #6): the right a 1:1 file is sent under, asked before its first chunk and
+    /// again as it goes: the contact approved and not blocked, or a device of ours.
+    #[test]
+    fn a_file_goes_out_only_while_its_contact_is_still_approved() {
+        let alice = create_stage5_peer("serve-right-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("serve-right-bob", "Bob", "Bob PC");
+        let bob_contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        let bob_device = omni_crypto::SessionAddress {
+            remote_account_id: bob.account.descriptor.account_id.clone(),
+            remote_device_id: bob.device.device_id.clone(),
+        };
+        assert!(crate::attachment_still_servable(&alice.app.storage, "no-such-message", &bob_device).is_ok());
+        alice.app.block_contact(&bob_contact.contact_id).unwrap();
+        let refused = crate::attachment_still_servable(&alice.app.storage, "no-such-message", &bob_device);
+        assert!(refused.is_err(), "a blocked contact is sent nothing more");
+        assert!(!crate::attachment_transfer_failure_is_final(&refused.unwrap_err()), "and is told no final word about the file");
+    }
+
+    /// A04 (audit 2026-11-09 #6): the owner withdraws remote access while we control their computer:
+    /// our side of the session ends.
+    #[test]
+    fn a_withdrawn_remote_access_ends_our_controlling_session() {
+        let alice = create_stage5_peer("ra-withdrawn-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("ra-withdrawn-bob", "Bob", "Bob PC");
+        let bob_contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        let db = alice.app.storage.db_path().to_string_lossy().to_string();
+        let mut call = test_active_call_runtime(CallState::Active);
+        call.summary.contact_id = Some(bob_contact.contact_id.0.clone());
+        call.summary.remote_control = Some(omni_types::RemoteControlSession {
+            role: omni_types::RemoteControlRole::Controller,
+            phase: omni_types::RemoteControlPhase::Approved,
+            answer_deadline_unix_ms: None,
+        });
+        set_current_call_runtime(&db, Some(call)).unwrap();
+        let withdrawn = omni_types::RemoteAccessGrantV1 { mode: None, sent_at_unix_ms: current_unix_ms() };
+        crate::app_remote_access::handle_incoming_remote_access_grant(&alice.app.storage, bob.dialog_key.as_str(), &withdrawn).unwrap();
+        assert!(current_call(&alice.app).is_none(), "no controlling session after the grant is withdrawn");
+    }
+
+    /// Breaking pass (2026-11-10): the receiver's process dies after a message's session step was
+    /// stored and before the message was. The sender's resend must still bring it — its key is spent
+    /// here, so the very same envelope is a replay.
+    #[test]
+    fn a_message_whose_receiver_died_after_its_session_step_still_arrives() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("die-after-session-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("die-after-session-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "first").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "first", MessageStatus::Delivered);
+
+        crate::die_after_session_store_once(&bob.app.storage.db_path().to_string_lossy());
+        alice.app.send_text(bob.dialog_key.as_str(), "lost, then found").unwrap();
+        let arrived = || {
+            bob.app
+                .list_messages(alice.dialog_key.as_str())
+                .is_ok_and(|history| history.messages.iter().any(|m| m.body == "lost, then found"))
+        };
+        wait_for_state(
+            Duration::from_secs(120),
+            || format!("bob has it: {}", arrived()),
+            arrived,
+        );
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "lost, then found", MessageStatus::Delivered);
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
+    /// Blind audit 2026-11-10: a restore from a backup deleted the profile's data and then copied the
+    /// backup in. A copy that failed half way (a full disk) left neither. The old data is set aside
+    /// now and comes back when the copy fails.
+    #[test]
+    fn a_restore_that_fails_half_way_leaves_the_profile_as_it_was() {
+        let alice = create_stage5_peer("restore-fails", "Alice", "Alice PC");
+        let backup = Path::new(&alice.db_path).parent().unwrap().join("backup").join("omni.db");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        alice.app.export_current_database_backup_bundle(&backup).unwrap();
+        let mnemonic = alice.account.recovery_phrase_v2.as_ref().unwrap().mnemonic.clone();
+        let token = OmniApp::inspect_account_backup_manifest(backup.to_string_lossy(), &mnemonic)
+            .unwrap()
+            .inspection_token;
+        alice.app.update_local_public_profile("Alice after the backup", None, false).unwrap();
+        let db = alice.db_path.clone();
+        drop(alice.app);
+
+        crate::fail_the_next_restore_copy_to(Path::new(&db));
+        assert!(OmniApp::import_database_backup_bundle(&db, &backup, &token).is_err());
+        let reopened = OmniApp::init(AppInitRequest { db_path: db.clone() }).unwrap();
+        assert_eq!(
+            reopened.storage.get_local_public_profile_state().unwrap().display_name,
+            "Alice after the backup",
+            "the profile is as it was before the failed restore"
+        );
+        assert!(
+            !fs::read_dir(Path::new(&db).parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".omni-restore-previous-")),
+            "nothing is left aside"
+        );
+    }
+
+    /// Blind audit 2026-11-10: choosing another profile changed only the active id — the previous
+    /// profile's mesh (with its node identity), call and registries, kept by the database path the
+    /// next profile shares, went on. Making another profile active now stops them, as signing out
+    /// does; choosing the active one again stops nothing.
+    #[test]
+    fn making_another_profile_active_stops_the_previous_ones_runtime() {
+        let _guard = network_test_guard();
+        let peer = create_stage5_peer("switch-profile", "Alice", "Alice PC");
+        let alice = peer.app.get_active_profile_id().unwrap().unwrap();
+        let mesh_up = || peer.app.mesh_node_address_hex().unwrap().is_some();
+        peer.app.start_mesh().unwrap();
+        assert!(mesh_up());
+
+        let bob = peer.app.create_account("Bob", "Bob PC").unwrap();
+        let bob = bob.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        assert!(!mesh_up(), "a new profile made active stops the previous one's mesh");
+
+        peer.app.select_active_profile(&bob).unwrap();
+        peer.app.start_mesh().unwrap();
+        peer.app.select_active_profile(&bob).unwrap();
+        assert!(mesh_up(), "choosing the active profile again stops nothing");
+        peer.app.select_active_profile(&alice).unwrap();
+        assert!(!mesh_up(), "choosing another profile stops the previous one's mesh");
+
+        peer.app.start_mesh().unwrap();
+        peer.app.clear_active_profile().unwrap();
+        assert!(!mesh_up(), "leaving for no profile stops it too");
+    }
+
+    /// Blind audit 2026-11-10: the MLS storage key was cached by the database path alone. Wiping the
+    /// MLS state (the last profile deleted) or restoring a backup over the database left the old key
+    /// in the cache, and new groups were sealed with a key the database no longer held — unreadable
+    /// after a restart. The key handed out is always the one the database holds.
+    #[test]
+    fn the_mls_key_handed_out_is_the_one_the_database_holds() {
+        let alice = create_stage5_peer("mls-key-cache", "Alice", "Alice PC");
+        let stored = || {
+            let json = alice.app.storage.get_mls_storage_key_protected().unwrap().expect("a stored key");
+            let protected: omni_crypto::ProtectedSecret = serde_json::from_str(&json).unwrap();
+            let raw = omni_crypto::unprotect_bytes(&protected).unwrap();
+            <[u8; 32]>::try_from(raw.as_slice()).unwrap()
+        };
+        let first = crate::app_groups::mls_storage_key_for_tests(&alice.app.storage).unwrap();
+        assert_eq!(first, stored());
+        alice.app.storage.wipe_mls_state().unwrap();
+        let second = crate::app_groups::mls_storage_key_for_tests(&alice.app.storage).unwrap();
+        assert_ne!(first, second, "the wiped key is not handed out again");
+        assert_eq!(second, stored());
+    }
+
+    /// Blind audit 2026-11-12, pass 17: the MLS state was one per database. A second profile of the
+    /// database opened the first one's groups as its own, a copy of one profile carried the others'
+    /// MLS rows, and a deleted profile that was not the active one left them all. Each profile's
+    /// state is sealed with its own key now, and goes by it.
+    #[test]
+    fn each_profile_of_a_database_has_its_own_mls_state() {
+        let base = std::env::temp_dir().join("omni-stage-10-app-tests").join(format!("mls-per-profile-{}", unique_suffix()));
+        let db_path = base.join("profile").join("omni.db");
+        let backup_path = base.join("backup").join("copy.omnibackup");
+        fs::create_dir_all(base.join("backup")).unwrap();
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.to_string_lossy().into_owned() }).unwrap();
+        let alice = app.create_account("Alice", "Shared PC").unwrap().local_profile_summary.unwrap().profile_id;
+        let alices_group = app.create_group("Alice's").unwrap().group_id;
+        let alices_key = crate::app_groups::mls_storage_key_for_tests(&app.storage).unwrap();
+        let bob_account = app.create_account("Bob", "Shared PC").unwrap();
+        let bob = bob_account.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        let mnemonic = bob_account.recovery_phrase_v2.as_ref().unwrap().mnemonic.clone();
+        app.select_active_profile(&bob).unwrap();
+        let bobs_group = app.create_group("Bob's").unwrap().group_id;
+        let bobs_key = crate::app_groups::mls_storage_key_for_tests(&app.storage).unwrap();
+        assert_ne!(alices_key, bobs_key, "a key per profile");
+
+        let view = |gid: &str| {
+            let gid = crate::app_groups::group_id_bytes(gid).unwrap();
+            crate::app_groups::with_engine(&app.storage, |engine| engine.view(&gid))
+        };
+        assert!(view(&bobs_group).is_ok());
+        assert!(view(&alices_group).is_err(), "Bob does not open Alice's group");
+        assert!(crate::app_groups::mls_rows_sealed_with_for_tests(&app.storage, &alices_key) > 0);
+
+        app.export_current_database_backup_bundle(&backup_path).unwrap();
+        // The inspection opens the copy.
+        OmniApp::inspect_account_backup_manifest(backup_path.to_string_lossy(), &mnemonic).unwrap();
+        let opened = crate::opened_backups()
+            .lock()
+            .unwrap()
+            .values()
+            .find(|db| Storage::open(db).ok().and_then(|copy| copy.get_local_profile_summary(&bob).ok().flatten()).is_some())
+            .cloned()
+            .expect("the inspection opened the copy");
+        let copy = Storage::open(&opened).unwrap();
+        assert_eq!(crate::app_groups::mls_rows_sealed_with_for_tests(&copy, &alices_key), 0, "none of Alice's MLS rows in Bob's copy");
+        assert!(crate::app_groups::mls_rows_sealed_with_for_tests(&copy, &bobs_key) > 0, "Bob's are");
+
+        let token = app.preview_delete_local_profile(&alice).unwrap().unwrap().confirmation_token.unwrap();
+        app.confirm_delete_local_profile(&alice, Some(&token)).unwrap();
+        assert_eq!(crate::app_groups::mls_rows_sealed_with_for_tests(&app.storage, &alices_key), 0, "Alice's MLS rows went with her");
+        assert!(view(&bobs_group).is_ok(), "Bob's group stays");
+    }
+
+    /// Breaking pass (2026-11-10): a device brought back from a backup holds an older ratchet state
+    /// of its sessions than its contacts saw — its next frames reuse counters the contact already
+    /// took. The conversation must still come back without anyone resetting it by hand.
+    #[test]
+    fn a_device_restored_to_an_older_session_state_is_heard_again() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("restored-ratchet-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("restored-ratchet-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "before the backup").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "before the backup", MessageStatus::Delivered);
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let backed_up = alice.app.storage.get_session_for_dialog(&bob_account, bob.dialog_key.as_str()).unwrap().expect("a session");
+        for n in 0..5 {
+            let text = format!("after the backup {n}");
+            alice.app.send_text(bob.dialog_key.as_str(), &text).unwrap();
+            wait_for_message_status(&alice.app, bob.dialog_key.as_str(), &text, MessageStatus::Delivered);
+        }
+        // The backup comes back: the session as it was then.
+        let mut restored = backed_up.clone();
+        alice.app.storage.replace_session_record(&mut restored).unwrap();
+
+        alice.app.send_text(bob.dialog_key.as_str(), "from the restored device").unwrap();
+        let arrived = || {
+            bob.app
+                .list_messages(alice.dialog_key.as_str())
+                .is_ok_and(|history| history.messages.iter().any(|m| m.body == "from the restored device"))
+        };
+        wait_for_state(Duration::from_secs(120), || format!("bob has it: {}", arrived()), arrived);
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
+    /// A message sent and waiting for its receipt, when the dialog's session comes up anew (the
+    /// peer's fresh bootstrap taken): it went out on the session just replaced, so it goes again at
+    /// once instead of sitting out the receipt wait first (live 2026-11-10: 18 s). An ordinary pass
+    /// leaves it waiting.
+    #[test]
+    fn a_message_sent_on_a_replaced_session_goes_again_when_the_new_one_comes_up() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("replaced-session-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("replaced-session-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "first").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "first", MessageStatus::Delivered);
+        bob.app.stop_mesh();
+
+        let sent = alice.app.send_text(bob.dialog_key.as_str(), "on the old session").unwrap();
+        let row = || {
+            alice.app.storage.outbound_queue_snapshot().unwrap().items.into_iter().find(|item| item.message_id == sent.id)
+        };
+        wait_for_condition(Duration::from_secs(10), || row().is_some_and(|item| item.status == MessageStatus::Sent));
+        let attempts = row().unwrap().attempt_count;
+
+        crate::process_pending_for_active_dialog(&alice.app.storage, &alice.app.transport, bob.dialog_key.as_str()).unwrap();
+        assert_eq!(row().unwrap().attempt_count, attempts, "an ordinary pass waits for the receipt");
+        crate::process_pending_for_dialog_whose_session_came_up(&alice.app.storage, &alice.app.transport, bob.dialog_key.as_str())
+            .unwrap();
+        assert!(row().unwrap().attempt_count > attempts, "a session that came up sends it again now");
+        alice.app.stop_mesh();
+    }
+
+    /// A session waiting for the contact to take its bootstrap, whose bootstrap was lost (live
+    /// 2026-11-11: sent by a device restored from a backup before its mesh was up). The contact's
+    /// frames, on the session it still holds, do not open — and that is the sign: the bootstrap goes
+    /// again at once, not after the fresh-session grace (30 s) and the failure count.
+    #[test]
+    fn a_bootstrap_the_contact_never_got_goes_again_when_its_frames_do_not_open() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("lost-bootstrap-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("lost-bootstrap-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "first").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "first", MessageStatus::Delivered);
+
+        // Alice starts a fresh session; its bootstrap never leaves.
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let mut bundle = alice.app.storage.get_latest_remote_prekey_bundle_for_account(&bob_account).unwrap().unwrap();
+        bundle.one_time_prekey = None;
+        crate::bootstrap_session_for_remote_bundle(&alice.app.storage, &bundle, current_unix_ms()).unwrap();
+        std::thread::sleep(Duration::from_millis(crate::SESSION_BOOTSTRAP_REISSUE_AFTER_MS as u64 + 100));
+
+        bob.app.send_text(alice.dialog_key.as_str(), "on the session bob holds").unwrap();
+        let arrived = || {
+            alice
+                .app
+                .list_messages(bob.dialog_key.as_str())
+                .is_ok_and(|history| history.messages.iter().any(|m| m.body == "on the session bob holds"))
+        };
+        wait_for_state(Duration::from_secs(15), || format!("alice has it: {}", arrived()), arrived);
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
+    /// A bootstrap that could not leave (no path to the contact yet) does not count as sent: its
+    /// session shows none waiting, so the contact's first frame once the link is up sends one at
+    /// once. It looked sent for the reissue interval, and the frames that came in it went unanswered
+    /// (live 2026-11-11: 10 s until the contact's next frame).
+    #[test]
+    fn a_bootstrap_with_no_path_to_the_contact_does_not_count_as_sent() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("unsent-bootstrap-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("unsent-bootstrap-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        alice.app.send_text(bob.dialog_key.as_str(), "no link yet").unwrap();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let session = || alice.app.storage.get_session_for_dialog(&bob_account, bob.dialog_key.as_str()).ok().flatten();
+        // The session is made first and marked once its send fails: read until it is marked (a read
+        // between the two saw it fresh — the full run caught that).
+        wait_for_state(
+            Duration::from_secs(10),
+            || format!("{:?}", session().map(|s| (s.bootstrap_state, s.updated_at_unix_ms))),
+            || session().is_some_and(|s| s.updated_at_unix_ms == 0),
+        );
+        assert_eq!(session().unwrap().bootstrap_state, omni_crypto::SessionBootstrapState::InitiatorBootstrapCreated);
+    }
+
+    /// Blind audit 2026-11-11, F1: a hello names its dialog by an instance id anyone can claim. Mallory,
+    /// a contact with a session of his own, says he is Alice's instance: what he writes next must not
+    /// land in Alice's chat, and his hello takes nothing of hers — his text stays in his own chat.
+    #[test]
+    fn a_hello_naming_another_contacts_instance_does_not_put_its_text_in_that_chat() {
+        let _guard = network_test_guard();
+        let victim = create_stage5_peer("hello-claim-victim", "Victim", "Victim PC");
+        let alice = create_stage5_peer("hello-claim-alice", "Alice", "Alice PC");
+        let mallory = create_stage5_peer("hello-claim-mallory", "Mallory", "Mallory PC");
+        link_stage5_contact(&victim.app, &alice, "Alice");
+        link_stage5_contact(&victim.app, &mallory, "Mallory");
+        link_stage5_contact(&mallory.app, &victim, "Victim");
+        link_stage5_peers_over_mesh(&victim, &mallory);
+        mallory.app.send_text(victim.dialog_key.as_str(), "hi").unwrap();
+        wait_for_message_status(&mallory.app, victim.dialog_key.as_str(), "hi", MessageStatus::Delivered);
+
+        let envelope = mallory.app.transport.build_local_session_hello_envelope();
+        let omni_transport::TransportRequestPayloadV1::SessionHello(mut hello) = envelope.payload.clone() else {
+            panic!("a hello");
+        };
+        hello.instance_id = alice.instance_id.clone();
+        let forged = omni_transport::TransportRequestEnvelopeV1 {
+            protocol_version: envelope.protocol_version,
+            payload: omni_transport::TransportRequestPayloadV1::SessionHello(hello),
+        };
+        let victim_node = mallory.app.mesh_node_for_dialog(victim.dialog_key.as_str()).unwrap().expect("victim's node");
+        mallory
+            .app
+            .mesh_runtime()
+            .expect("mesh up")
+            .send_wire(victim_node, &serde_json::to_vec(&forged).unwrap())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        // His hello took no route of Alice's: what the victim sends Alice does not go to his node.
+        let mallory_node = victim.app.mesh_node_for_dialog(mallory.dialog_key.as_str()).unwrap().expect("his node");
+        assert_ne!(
+            victim.app.mesh_node_for_dialog(alice.dialog_key.as_str()).unwrap(),
+            Some(mallory_node),
+            "Alice's dialog is not routed to Mallory's node"
+        );
+        mallory.app.send_text(victim.dialog_key.as_str(), "I am Alice").unwrap();
+        let has = |dialog: &str, body: &str| {
+            victim.app.list_messages(dialog).is_ok_and(|history| history.messages.iter().any(|m| m.body == body))
+        };
+        wait_for_state(
+            Duration::from_secs(20),
+            || format!("in Mallory's chat: {}, in Alice's: {}", has(&mallory.dialog_key, "I am Alice"), has(&alice.dialog_key, "I am Alice")),
+            || has(&mallory.dialog_key, "I am Alice"),
+        );
+        assert!(!has(&alice.dialog_key, "I am Alice"), "nothing of Mallory's lands in Alice's chat");
+        victim.app.stop_mesh();
+        mallory.app.stop_mesh();
+
+        // And should a frame still come with Alice's dialog on it, opened by Mallory's session, it is
+        // not taken: the session is another account's than the dialog's contact.
+        let session = mallory
+            .app
+            .storage
+            .get_session_for_dialog(&victim.account.descriptor.account_id, victim.dialog_key.as_str())
+            .unwrap()
+            .expect("his session with the victim");
+        let outgoing = omni_messaging::build_encrypted_text_envelope(&session, "forged-1", "as Alice", None, current_unix_ms(), current_unix_ms()).unwrap();
+        let storage = Arc::new(Mutex::new(Storage::open(&victim.db_path).unwrap()));
+        let receive_context = ReceivedChatContext {
+            peer_id: "forged".to_string(),
+            dialog_key: alice.dialog_key.clone(),
+            remote_instance_id: alice.instance_id.clone(),
+            remote_prekey_bundle: Some(mallory.bundle.clone()),
+            initiated_locally: false,
+        };
+        let _ = crate::handle_incoming_wire_envelope(
+            &storage,
+            &Arc::new(Mutex::new(Some(victim.app.transport.clone()))),
+            &Arc::new(Mutex::new(())),
+            outgoing.envelope,
+            &receive_context,
+        );
+        assert!(!has(&alice.dialog_key, "as Alice"), "a frame Mallory's session opened is not Alice's");
+    }
+
+    /// Blind audit 2026-11-11, G1: a 1:1 call is for an approved contact. A pending one — with a
+    /// session already, as after a request — could be called: the incoming invite was checked, the
+    /// outgoing call was not.
+    #[test]
+    fn a_call_is_placed_to_an_approved_contact_only() {
+        let _guard = network_test_guard();
+        let requester = create_stage5_peer("call-pending-requester", "Requester", "Requester PC");
+        let receiver = create_stage5_peer("call-pending-receiver", "Receiver", "Receiver PC");
+        pair_stage5_over_mesh(&requester, &receiver);
+        let error = receiver.app.place_call(requester.dialog_key.as_str()).expect_err("a pending contact is not called");
+        assert!(error.to_string().contains("approved contact only"), "{error}");
+        requester.app.stop_mesh();
+        receiver.app.stop_mesh();
+    }
+
+    /// Blind audit 2026-11-11, G2: the invitation was spent before its accept was read. An accept
+    /// whose KeyPackage does not read leaves it for the next, good one.
+    #[test]
+    fn an_invite_whose_accept_does_not_read_stays_for_the_next_one() {
+        let alice = create_stage5_peer("invite-kp-alice", "Alice", "Alice PC");
+        let group = alice.app.create_group("Team").unwrap();
+        alice.app.storage.record_group_sent_invite(&group.group_id, "dialog:bob", current_unix_ms()).unwrap();
+        let junk = omni_protocol::GroupInviteAcceptV2 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            group_id: group.group_id.clone(),
+            key_package_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 64]),
+        };
+        assert!(crate::app_groups::add_invitee(&alice.app.storage, "dialog:bob", &junk).is_err(), "the junk KeyPackage does not read");
+        assert!(
+            alice.app.storage.take_group_sent_invite(&group.group_id, "dialog:bob").unwrap(),
+            "the invitation is still there for the next accept"
+        );
+    }
+
+    /// Blind audit 2026-11-11, G3: a beacon's addresses were dialed whatever they named — loopback, a
+    /// private network. Only public ones are.
+    #[test]
+    fn a_beacon_is_dialed_at_its_public_addresses_only() {
+        let listed: Vec<String> = ["127.0.0.1:9000", "192.168.1.10:22", "10.0.0.1:443", "1.1.1.1:443", "not an address", "1.1.1.1:0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let dialable = crate::dialable_beacon_endpoints(&listed);
+        assert_eq!(dialable, vec!["1.1.1.1:443".parse::<std::net::SocketAddr>().unwrap()]);
+    }
+
+    /// Blind audit 2026-11-11, G5: the table that paces our answers to hellos forgets nodes past the
+    /// window — it kept every node a hello ever came from.
+    #[test]
+    fn the_hello_reply_pace_forgets_nodes_past_its_window() {
+        let mut throttle = std::collections::HashMap::new();
+        let start = std::time::Instant::now();
+        for n in 0..100u8 {
+            let node = omni_mesh_runtime::MeshNodeAddress::from_bytes([n; 20]);
+            assert!(crate::hello_reply_due(&mut throttle, node, start));
+        }
+        let first = omni_mesh_runtime::MeshNodeAddress::from_bytes([0; 20]);
+        assert!(!crate::hello_reply_due(&mut throttle, first, start), "within the window: not again");
+        let later = start + crate::HELLO_REPLY_EVERY;
+        assert!(crate::hello_reply_due(&mut throttle, omni_mesh_runtime::MeshNodeAddress::from_bytes([200; 20]), later));
+        assert_eq!(throttle.len(), 1, "the nodes past the window are forgotten");
+        assert!(crate::hello_reply_due(&mut throttle, first, later), "and answered again");
+    }
+
+    /// Blind audit 2026-11-11, H3: the nodes refused for a blocked account were those of the devices
+    /// we held bundles of. A device of it we did not know, its certificate vouching for it, is
+    /// recognised by its hello, refused, and its node joins the refused ones.
+    #[test]
+    fn a_blocked_accounts_device_we_did_not_know_is_refused_too() {
+        let alice = create_stage5_peer("blocked-new-device-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("blocked-new-device-bob", "Bob", "Bob PC");
+        let contact = link_stage5_contact(&bob.app, &alice, "Alice");
+        let desktop = copy_to_second_device(&alice, "blocked-new-device-desktop");
+        let hello = match desktop.transport.build_local_session_hello_envelope().payload {
+            omni_transport::TransportRequestPayloadV1::SessionHello(hello) => hello,
+            _ => panic!("a hello"),
+        };
+        assert!(!crate::hello_is_from_a_blocked_accounts_device(&bob.app.storage, &hello), "not blocked yet");
+        bob.app.block_contact(&contact.contact_id).unwrap();
+        let refused = || crate::blocked_contact_nodes(&bob.app.storage).unwrap_or_default().len();
+        assert_eq!(refused(), 1, "the device we knew of");
+        assert!(crate::hello_is_from_a_blocked_accounts_device(&bob.app.storage, &hello));
+        assert_eq!(refused(), 2, "and now the one we did not");
+    }
+
+    /// Owner's decision 2026-11-11 (blind audit M6): an agent puts projects inside its own folder only.
+    #[test]
+    fn an_agent_keeps_projects_inside_its_own_folder() {
+        let db_path = isolated_test_db_path("omni-agent-own-folder", "agent");
+        let app = create_app_with_active_profile(db_path.clone(), "Robo", "agent");
+        let root = fs::canonicalize(std::path::Path::new(&db_path).parent().unwrap()).unwrap();
+        let root = std::path::PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\").to_string());
+        let inside = app.agent_own_folder("work/model").unwrap();
+        assert!(std::path::Path::new(&inside).starts_with(&root), "{inside}");
+        assert!(std::path::Path::new(&inside).is_dir(), "made");
+        assert_eq!(app.agent_own_folder(&root.join("work").join("model").to_string_lossy()).unwrap(), inside, "in full, the same");
+        let elsewhere = std::env::temp_dir().join(format!("omni-agent-elsewhere-{}", unique_suffix()));
+        assert!(app.agent_own_folder(&elsewhere.to_string_lossy()).is_err(), "a folder elsewhere");
+        assert!(!elsewhere.exists(), "and it is not made");
+        assert!(app.agent_own_folder("../outside").is_err(), "not by stepping up");
+        assert!(app.agent_own_folder(&root.to_string_lossy()).is_err(), "not the agent's folder itself");
+    }
+
+    /// Blind audit 2026-11-11, M7: «Забрать» and «Опубликовать ветку» reached the working folder of a
+    /// profile that had signed out, through a handle that outlived the sign-out.
+    #[test]
+    fn a_signed_out_profiles_working_folder_is_not_handed_out() {
+        let db_path = isolated_test_db_path("omni-workspace-sign-out", "alice");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.clone() }).unwrap();
+        let account = app.create_account("Alice", "Laptop").unwrap();
+        let profile_id = account.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        let gid = app.create_group("Project").unwrap().group_id;
+        let work = std::env::temp_dir().join("omni-workspace-sign-out").join(format!("work-{}", unique_suffix()));
+        fs::create_dir_all(&work).unwrap();
+        let out = std::process::Command::new("git").arg("-C").arg(&work).args(["init", "--quiet", "--initial-branch=main"]).output().expect("git is installed");
+        assert!(out.status.success());
+        app.workspace_add_repo(&gid, "api", Some(&work.to_string_lossy())).unwrap();
+        assert!(app.workspace_folder(&gid, "api").is_ok(), "signed in");
+        confirm_sign_out_profile(&app, &profile_id);
+        assert!(app.workspace_folder(&gid, "api").is_err(), "signed out: no folder to pull into or push from");
+    }
+
+    /// Blind audit 2026-11-11, pass 13 (class 4): a handle that outlived the sign-out still read the
+    /// profile's contacts, chats and workspace and changed its network settings — the methods did
+    /// not ask whether the profile was signed in.
+    #[test]
+    fn a_signed_out_profile_is_neither_read_nor_changed_through_its_handle() {
+        let db_path = isolated_test_db_path("omni-signed-out-handle", "alice");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.clone() }).unwrap();
+        let account = app.create_account("Alice", "Laptop").unwrap();
+        let profile_id = account.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        let gid = app.create_group("Project").unwrap().group_id;
+        assert!(app.list_contacts().is_ok() && app.workspace_repos(&gid).is_ok() && app.outbound_queue_snapshot().is_ok(), "signed in");
+        confirm_sign_out_profile(&app, &profile_id);
+        assert!(app.list_contacts().is_err(), "contacts");
+        assert!(app.list_messages("nobody").is_err(), "chats");
+        assert!(app.workspace_repos(&gid).is_err(), "workspace");
+        assert!(app.outbound_queue_snapshot().is_err(), "the queue");
+        assert!(app.set_carrier_policy(omni_types::CarrierPolicy::default()).is_err(), "network settings");
+        assert!(app.export_current_database_backup(db_path.replace(".db", "-copy.db")).is_err(), "a copy of the base");
+    }
+
+    /// Blind audit 2026-11-11, M1: a chat that was empty when the passport was made had no
+    /// fingerprint in it, so a restored device had nothing to hold the contact's copy against — and
+    /// lines «by us» the contact made up for it showed unmarked. Counted now, as empty.
+    #[test]
+    fn a_line_by_us_a_contact_makes_up_for_a_chat_that_was_empty_is_marked() {
+        let alice = create_stage5_peer("hs-empty-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-empty-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let fingerprint = crate::passport_chat_fingerprints(&alice.app.storage, &own, 100)
+            .into_iter()
+            .find(|(account, ..)| account == &bob_account.0)
+            .expect("the empty chat is in the passport");
+        assert_eq!(fingerprint.1, 0, "no lines");
+
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: true };
+        let from = omni_crypto::SessionAddress { remote_account_id: bob_account.clone(), remote_device_id: DeviceId("bob-pc".into()) };
+        crate::start_account_recovery(&alice.app.storage, 0);
+        let mut recovery = crate::load_account_recovery(&alice.app.storage).unwrap();
+        recovery.chat_fingerprints.push(fingerprint);
+        crate::save_account_recovery(&alice.app.storage, &recovery);
+        crate::check_recovered_chat(&alice.app.storage, &peer, 1_000);
+        assert_eq!(alice.app.storage.get_chat_history_check(&bob_account).unwrap(), Some(omni_storage::ChatHistoryCheck::Verified), "empty as counted");
+
+        let forged = omni_types::HistoryLineV1 {
+            message_id: "made-up".into(),
+            author_account_id: own.0.clone(),
+            body: "I agreed to it".into(),
+            created_at_unix_ms: 20,
+            attachment: None,
+        };
+        crate::merge_history_lines(&alice.app.storage, &from, "dialog:bob-pc", &peer, &chat, &[forged], 1_001);
+        crate::check_recovered_chat(&alice.app.storage, &peer, 1_001);
+        assert_eq!(alice.app.storage.get_chat_history_check(&bob_account).unwrap(), Some(omni_storage::ChatHistoryCheck::Mismatch));
+    }
+
+    /// Blind audit 2026-11-11, I2 and I8: a signed-out profile's files were read through the core,
+    /// plaintext (its storage key stays in the process), and its plain copies for outside programs
+    /// stayed on the disk until the next start. Neither now.
+    #[test]
+    fn a_signed_out_profile_shows_no_media_and_leaves_no_plain_copies() {
+        let db_path = isolated_test_db_path("omni-media-sign-out", "alice");
+        let app = OmniApp::init(AppInitRequest { db_path: db_path.clone() }).unwrap();
+        let account = app.create_account("Alice", "Laptop").unwrap();
+        let profile_id = account.local_profile_summary.as_ref().unwrap().profile_id.clone();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let packets: Vec<Vec<u8>> = (0..50).map(|_| vec![72, 1, 2, 3, 4, 5]).collect();
+        let staged = app
+            .stage_voice_recording(&b64.encode(omni_storage::voice::join_voice_packets(&packets)), &b64.encode([200u8; 64]))
+            .unwrap();
+        assert!(app.read_media_file(&staged.path).is_ok(), "signed in: shown");
+        let open_dir = crate::media_open_copies_dir(app.storage.db_path()).unwrap().join("copy");
+        fs::create_dir_all(&open_dir).unwrap();
+        fs::write(open_dir.join("report.pdf"), b"plain").unwrap();
+
+        confirm_sign_out_profile(&app, &profile_id);
+        assert!(app.read_media_file(&staged.path).is_err(), "signed out: not read");
+        assert!(app.read_voice_file(&staged.path).is_err());
+        assert!(app.open_media_file_copy(&staged.path, "x.ogg").is_err());
+        assert!(!open_dir.exists(), "its plain copies went with it");
+    }
+
+    /// What a contact wrote while we had it blocked is not shown when it comes after the block is
+    /// lifted (maintainers' decision 2026-11-11): a block means «I do not see it». It is answered with a
+    /// receipt, so its sender stops sending it; what it writes after the block is lifted is shown.
+    #[test]
+    fn what_a_contact_wrote_while_blocked_is_not_shown_after_the_block_is_lifted() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("written-blocked-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("written-blocked-bob", "Bob", "Bob PC");
+        let contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        bob.app.send_text(alice.dialog_key.as_str(), "before").unwrap();
+        wait_for_message_status(&bob.app, alice.dialog_key.as_str(), "before", MessageStatus::Delivered);
+
+        alice.app.block_contact(&contact.contact_id).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        bob.app.send_text(alice.dialog_key.as_str(), "while blocked").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        alice.app.approve_contact(&contact.contact_id).unwrap();
+        link_stage5_peers_over_mesh(&alice, &bob);
+        wait_for_message_status(&bob.app, alice.dialog_key.as_str(), "while blocked", MessageStatus::Delivered);
+        bob.app.send_text(alice.dialog_key.as_str(), "after").unwrap();
+        wait_for_message_status(&bob.app, alice.dialog_key.as_str(), "after", MessageStatus::Delivered);
+        let shown: Vec<String> = alice.app.list_messages(bob.dialog_key.as_str()).unwrap().messages.into_iter().map(|m| m.body).collect();
+        assert!(shown.contains(&"before".to_string()) && shown.contains(&"after".to_string()), "{shown:?}");
+        assert!(!shown.contains(&"while blocked".to_string()), "what came while blocked is not shown: {shown:?}");
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
+    /// A Welcome lost on the way (maintainers' decision 2026-11-11, the rest of G2): past the Commit the
+    /// invitation is spent, and the invitee was left in the tree and out of the group. The Welcome is
+    /// kept: the invitee asking again gets it again, and joins from it.
+    #[test]
+    fn a_welcome_that_did_not_arrive_goes_again_when_the_invitee_asks_again() {
+        let admin = create_app_with_active_profile(isolated_test_db_path("omni-welcome-again", "admin"), "Admin", "Laptop");
+        let newcomer = create_app_with_active_profile(isolated_test_db_path("omni-welcome-again", "newcomer"), "Newcomer", "Laptop");
+        let group_id = admin.create_group("Team").unwrap().group_id;
+        admin.storage.record_group_sent_invite(&group_id, "dialog:newcomer", 1).unwrap();
+        newcomer
+            .storage
+            .upsert_group_invite(&omni_storage::GroupInviteRecord {
+                group_id: group_id.clone(),
+                name: "group".into(),
+                inviter_name: "admin".into(),
+                inviter_dialog_key: "dialog:admin".into(),
+                status: "accepted".into(),
+                received_at_unix_ms: 1,
+            })
+            .unwrap();
+        let kp = super::app_groups::own_key_package(&newcomer.storage).unwrap();
+        let accept = omni_protocol::GroupInviteAcceptV2 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            group_id: group_id.clone(),
+            key_package_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &kp),
+        };
+        let lost = super::app_groups::add_invitee(&admin.storage, "dialog:newcomer", &accept).unwrap().expect("added");
+        // It never arrived; the invitee asks again.
+        let again = super::app_groups::add_invitee(&admin.storage, "dialog:newcomer", &accept)
+            .unwrap()
+            .expect("the kept Welcome goes again");
+        assert_eq!(again.welcome_b64, lost.welcome_b64);
+        super::app_groups::join_from_welcome(&newcomer.storage, &newcomer.transport, "dialog:admin", &again).unwrap();
+        assert_eq!(newcomer.storage.get_group(&group_id).unwrap().unwrap().my_status, "member");
+    }
+
+    /// Blind audit 2026-11-11, J4: a pending contact — a request never answered — counted as a carrier
+    /// of our talk with others and got our hello whole. Approved contacts only.
+    #[test]
+    fn a_pending_contact_carries_nothing_of_ours_and_gets_a_hello_without_our_name() {
+        let _guard = network_test_guard();
+        let requester = create_stage5_peer("pending-carrier-requester", "Requester", "Requester PC");
+        let receiver = create_stage5_peer("pending-carrier-receiver", "Receiver", "Receiver PC");
+        pair_stage5_over_mesh(&requester, &receiver);
+        let key: [u8; 32] = hex::decode(requester.bundle.account.identity_signing_public_key.trim()).unwrap().try_into().unwrap();
+        let requester_node = omni_mesh_runtime::node_address_from_ed25519_pubkey(key).unwrap();
+        assert!(!crate::durable_carrier_nodes(&receiver.app.storage).contains(&requester_node), "no carrier");
+        let ours = receiver.app.transport.build_local_session_hello_envelope();
+        let reply = crate::hello_reply_for(&receiver.app.storage, requester_node, false, ours).unwrap();
+        match reply.payload {
+            omni_transport::TransportRequestPayloadV1::SessionHello(hello) => assert!(hello.device_name.is_empty(), "no name"),
+            _ => panic!("a hello"),
+        }
+        requester.app.stop_mesh();
+        receiver.app.stop_mesh();
+    }
+
+    /// Live 2026-11-11: a block refused the contact's direct links at once, but taking it back lifted
+    /// the refusal only on the next mesh tick — the contact's first dial after it was refused, and
+    /// on a mesh without the tick every one.
+    #[test]
+    fn unblocking_a_contact_lets_it_link_with_us_at_once() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("unblock-link-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("unblock-link-bob", "Bob", "Bob Laptop");
+        let contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        alice.app.store_remote_prekey_bundle(&bob.bundle).unwrap();
+        alice.app.start_mesh().unwrap();
+        let runtime = alice.app.mesh_runtime().unwrap();
+        let nobody = std::collections::HashSet::new();
+        assert!(runtime.refuses_direct_links_with_exactly(&nobody));
+        alice.app.block_contact(&contact.contact_id).unwrap();
+        assert!(!runtime.refuses_direct_links_with_exactly(&nobody), "blocked: refused");
+        alice.app.approve_contact(&contact.contact_id).unwrap();
+        assert!(runtime.refuses_direct_links_with_exactly(&nobody), "taken back: not refused, without a tick");
+        alice.app.stop_mesh();
+    }
+
+    /// Blind audit 2026-11-11, L4: consent to carry a contact's traffic was given and taken back for the
+    /// one device picked to dial; taken back while another was the one picked, it stayed with the
+    /// first. Every device of the contact in good standing now, and none its account took back.
+    #[test]
+    fn taking_back_a_friend_relay_consent_takes_it_from_every_device_of_the_contact() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("relay-consent-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("relay-consent-bob", "Bob", "Bob Laptop");
+        let contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        let desktop = copy_to_second_device(&bob, "relay-consent-desktop");
+        alice.app.store_remote_prekey_bundle(&desktop.get_local_prekey_bundle().unwrap()).unwrap();
+        alice.app.start_mesh().unwrap();
+        let runtime = alice.app.mesh_runtime().unwrap();
+        let nodes: Vec<omni_mesh_runtime::MeshNodeAddress> = alice
+            .app
+            .storage
+            .list_every_remote_prekey_bundle_of_account(&bob.account.descriptor.account_id)
+            .unwrap()
+            .into_iter()
+            .map(|bundle| omni_mesh_runtime::node_address_from_ed25519_pubkey(bundle.identity_signing_key.0).unwrap())
+            .collect();
+        assert_eq!(nodes.len(), 2);
+        alice.app.set_contact_friend_relay_consent(&contact.contact_id, true).unwrap();
+        assert!(nodes.iter().all(|node| runtime.relay_consent_for(node)), "given to both");
+        alice.app.set_contact_friend_relay_consent(&contact.contact_id, false).unwrap();
+        assert!(nodes.iter().all(|node| !runtime.relay_consent_for(node)), "taken from both");
+
+        // A device its account took back is not carried for, whatever the consent says.
+        let laptop_id = bob.app.get_local_device().unwrap().unwrap().device_id;
+        let laptop_bundle = alice.app.storage.get_remote_prekey_bundle(&bob.account.descriptor.account_id, &laptop_id).unwrap().unwrap();
+        let laptop_node = omni_mesh_runtime::node_address_from_ed25519_pubkey(laptop_bundle.identity_signing_key.0).unwrap();
+        let revocation = desktop.storage.issue_local_device_revocation(&laptop_id, None, current_unix_ms()).unwrap();
+        alice.app.storage.apply_device_revocation(&revocation, current_unix_ms()).unwrap();
+        alice.app.set_contact_friend_relay_consent(&contact.contact_id, true).unwrap();
+        assert!(!runtime.relay_consent_for(&laptop_node), "not to the device taken back");
+        assert!(nodes.iter().filter(|node| **node != laptop_node).all(|node| runtime.relay_consent_for(node)), "to the other");
+        alice.app.stop_mesh();
+    }
+
+    /// Blind audit 2026-11-11, K1: a node saying hello under ever new instance ids left an entry per
+    /// dialog for good. One node, one dialog.
+    #[test]
+    fn a_node_naming_ever_new_dialogs_keeps_one_entry() {
+        let mut map = crate::MeshDialogMap::default();
+        let node = omni_mesh_runtime::MeshNodeAddress::from_bytes([5; 20]);
+        for n in 0..1000 {
+            map.insert(format!("dialog:instance:probe-{n}"), node);
+        }
+        assert_eq!(map.node_for_dialog("dialog:instance:probe-0"), None, "the old ones went");
+        assert_eq!(map.node_for_dialog("dialog:instance:probe-999"), Some(node));
+        assert_eq!(map.dialog_for_node(&node).as_deref(), Some("dialog:instance:probe-999"));
+    }
+
+    /// Blind audit 2026-11-11, K4: an agent's «to main» ask sent straight into the group, past the
+    /// client check, was taken by the owner's yes with no independent review. The change itself checks.
+    #[test]
+    fn an_agents_ask_to_main_without_an_independent_review_is_not_taken() {
+        let owner = create_app_with_active_profile(isolated_test_db_path("omni-agent-unreviewed", "owner"), "Owner", "Laptop");
+        let group_id = owner.create_group("Team").unwrap().group_id;
+        let me = owner.storage.get_local_account().unwrap().unwrap().descriptor.account_id.0;
+        crate::app_workspace::agents::put_main_ask_for_tests(&owner.storage, &group_id, "ask-1", "acct-agent", &me);
+        let error = owner.workspace_agent_answer(&group_id, "ask-1", true, "").expect_err("not taken");
+        assert!(error.to_string().contains("независимого ревью"), "{error}");
+        assert_eq!(crate::app_workspace::agents::ask_answer_for_tests(&owner.storage, &group_id, "ask-1"), None);
+    }
+
+    /// Blind audit 2026-11-11, K6: an answer to an agent was recorded here before it was said to the
+    /// group; when saying failed, it stayed answered here and could not be given again.
+    #[test]
+    fn an_answer_to_an_agent_the_group_did_not_get_can_be_given_again() {
+        let owner = create_app_with_active_profile(isolated_test_db_path("omni-agent-answer-unsaid", "owner"), "Owner", "Laptop");
+        let group_id = owner.create_group("Team").unwrap().group_id;
+        let me = owner.storage.get_local_account().unwrap().unwrap().descriptor.account_id.0;
+        crate::app_workspace::agents::put_main_ask_for_tests(&owner.storage, &group_id, "ask-1", "acct-agent", &me);
+        owner.storage.wipe_mls_state().unwrap();
+        assert!(owner.workspace_agent_answer(&group_id, "ask-1", false, "later").is_err(), "the group cannot take it now");
+        assert_eq!(
+            crate::app_workspace::agents::ask_answer_for_tests(&owner.storage, &group_id, "ask-1"),
+            None,
+            "so it is not answered here either, to answer again"
+        );
+    }
+
+    /// Blind audit 2026-11-11, L5: «to main» moved `main` and announced it before the answer was said;
+    /// when saying failed, the error said nothing was done while `main` already had the commit.
+    #[test]
+    fn an_agents_commit_is_not_left_in_main_when_the_answer_could_not_be_said() {
+        let owner = create_app_with_active_profile(isolated_test_db_path("omni-agent-main-unsaid", "owner"), "Owner", "Laptop");
+        let group_id = owner.create_group("Team").unwrap().group_id;
+        let me = owner.storage.get_local_account().unwrap().unwrap().descriptor.account_id.0;
+        let work = std::env::temp_dir().join("omni-agent-main-unsaid").join(format!("work-{}", unique_suffix()));
+        fs::create_dir_all(&work).unwrap();
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().expect("git is installed");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit = |name: &str| {
+            fs::write(work.join(name), name).unwrap();
+            git_in(&work, &["add", name]);
+            git_in(&work, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", name]);
+            git_in(&work, &["rev-parse", "HEAD"])
+        };
+        git_in(&work, &["init", "--quiet", "--initial-branch=main"]);
+        let published = std::path::PathBuf::from(owner.workspace_add_repo(&group_id, "project", Some(&work.to_string_lossy())).unwrap().published_path);
+        let ours = commit("ours");
+        git_in(&work, &["push", "--quiet", "omni", "main"]);
+        let agents_branch = "HEAD:refs/omni/members/acct-agent/heads/agent/change-1";
+        let main = || git_in(&published, &["rev-parse", "refs/heads/main"]);
+        let answer = |id: &str| crate::app_workspace::agents::ask_answer_for_tests(&owner.storage, &group_id, id);
+        assert_eq!(main(), ours);
+
+        // Said: the commit is in main and the ask is answered.
+        let first = commit("first");
+        git_in(&work, &["push", "--quiet", "omni", agents_branch]);
+        crate::app_workspace::agents::put_reviewed_main_ask_for_tests(&owner.storage, &group_id, "ask-1", "acct-agent", &me, "project", &first);
+        owner.workspace_agent_answer(&group_id, "ask-1", true, "").unwrap();
+        assert_eq!(main(), first, "taken");
+        assert_eq!(answer("ask-1"), Some(true));
+
+        // Not said: main stays where it was and the ask is open, to answer again.
+        let second = commit("second");
+        git_in(&work, &["push", "--quiet", "omni", agents_branch]);
+        crate::app_workspace::agents::put_reviewed_main_ask_for_tests(&owner.storage, &group_id, "ask-2", "acct-agent", &me, "project", &second);
+        owner.storage.wipe_mls_state().unwrap();
+        assert!(owner.workspace_agent_answer(&group_id, "ask-2", true, "").is_err(), "the group cannot take the answer now");
+        assert_eq!(main(), first, "so main is where it was");
+        assert_eq!(answer("ask-2"), None, "and the ask is open");
+    }
+
+    /// Blind audit 2026-11-11, J7: a group call whose Invite could not be published was not on, yet
+    /// held the profile's one call slot after the error said it did not start.
+    #[test]
+    fn a_group_call_that_could_not_be_announced_frees_the_call_slot() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-call-unannounced", "alice"), "Alice", "Laptop");
+        let group_id = alice.create_group("Talk").unwrap().group_id;
+        alice.storage.wipe_mls_state().unwrap();
+        assert!(alice.start_group_call(&group_id).is_err(), "the group cannot take the Invite now");
+        let db_path = alice.storage.db_path().to_string_lossy().to_string();
+        assert!(crate::app_group_calls::group_call_in_progress(&db_path).is_none(), "and the slot is free");
+    }
+
+    /// Blind audit 2026-11-11, I6: a group message deleted for everyone was gone here before the
+    /// deletion was queued for the others; when queuing failed, it reached nobody and could not be
+    /// asked again. Failed now, the line stays, to delete again.
+    #[test]
+    fn a_group_deletion_that_could_not_be_queued_leaves_the_line_to_delete_again() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-delete-fail", "alice"), "Alice", "Laptop");
+        let group_id = alice.create_group("Team").unwrap().group_id;
+        alice.send_group_text(&group_id, "take it back").unwrap();
+        let line = alice
+            .list_group_messages(&group_id)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.body == "take it back")
+            .expect("our line");
+        alice.storage.wipe_mls_state().unwrap();
+        assert!(alice.delete_message(&line.message_id, true).is_err(), "the group cannot take the deletion now");
+        assert!(alice.storage.get_message(&line.message_id).is_ok(), "so the line stays, to delete again");
+    }
+
+    /// Blind audit 2026-11-11, pass 13 (class 2; maintainers' decision: one transaction): a thing done
+    /// in a group and its line to the group were separate writes — a failure between them left it
+    /// done here and never said. Not queued now, nothing is done here; asked again, it goes.
+    #[test]
+    fn a_group_action_whose_line_could_not_be_queued_is_not_done_here() {
+        let alice = create_app_with_active_profile(isolated_test_db_path("omni-group-act-and-say", "alice"), "Alice", "Laptop");
+        let group_id = alice.create_group("Team").unwrap().group_id;
+        let dialog_key = alice.storage.get_group(&group_id).unwrap().unwrap().dialog_key;
+        alice.send_group_text(&group_id, "the first").unwrap();
+        let line = alice.list_group_messages(&group_id).unwrap().into_iter().find(|m| m.body == "the first").unwrap().message_id;
+        let queued = || alice.storage.count_group_feed_outbox(&group_id).unwrap();
+        let before = queued();
+        let failing = |fail: bool| crate::app_groups::FAIL_GROUP_QUEUE.with(|f| f.set(fail));
+
+        failing(true);
+        assert!(alice.send_group_text(&group_id, "the second").is_err());
+        assert!(!alice.list_group_messages(&group_id).unwrap().iter().any(|m| m.body == "the second"), "a line not queued is not in our thread");
+        assert!(alice.pin_message(&line, true).is_err());
+        assert!(alice.storage.pinned_messages(&dialog_key).unwrap().is_empty(), "not pinned here");
+        assert!(alice.react_to_message(&line, "👍").is_err());
+        assert!(alice.storage.message_reactions(&line).unwrap().is_empty(), "no reaction here");
+        assert!(alice.delete_message(&line, true).is_err());
+        assert!(alice.storage.get_message(&line).is_ok(), "the line stays");
+        assert!(alice.workspace_set_main_rule(&group_id, "api", true).is_err());
+        assert!(!alice.storage.get_workspace_main_rule(&group_id, "api").unwrap().main_needs_approval, "the rule is not set here");
+        assert_eq!(queued(), before, "and nothing went into the group's queue");
+
+        failing(false);
+        alice.pin_message(&line, true).unwrap();
+        assert_eq!(alice.storage.pinned_messages(&dialog_key).unwrap().len(), 1, "asked again, done");
+        alice.react_to_message(&line, "👍").unwrap();
+        alice.workspace_set_main_rule(&group_id, "api", true).unwrap();
+        assert!(alice.storage.get_workspace_main_rule(&group_id, "api").unwrap().main_needs_approval);
+        alice.delete_message(&line, true).unwrap();
+        assert!(alice.storage.get_message(&line).is_err());
+        assert_eq!(queued(), before + 4, "each with its line");
+    }
+
+    /// Our hello to a node that sent one (maintainers' decision 2026-11-11, the rest of H4): a contact's node
+    /// gets it whole; a node we do not know gets it without our device's name.
+    #[test]
+    fn our_hello_to_a_node_we_do_not_know_says_less_or_nothing() {
+        let alice = create_stage5_peer("hello-policy-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("hello-policy-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let ours = || alice.app.transport.build_local_session_hello_envelope();
+        let name = |envelope: &omni_transport::TransportRequestEnvelopeV1| match &envelope.payload {
+            omni_transport::TransportRequestPayloadV1::SessionHello(hello) => hello.device_name.clone(),
+            _ => panic!("a hello"),
+        };
+        assert!(!name(&ours()).is_empty(), "our hello names the device");
+        let key: [u8; 32] = hex::decode(bob.bundle.account.identity_signing_public_key.trim()).unwrap().try_into().unwrap();
+        let bobs_node = omni_mesh_runtime::node_address_from_ed25519_pubkey(key).unwrap();
+        let stranger = omni_mesh_runtime::MeshNodeAddress::from_bytes([77; 20]);
+
+        let to_bob = crate::hello_reply_for(&alice.app.storage, bobs_node, false, ours()).expect("a contact is answered");
+        assert_eq!(name(&to_bob), name(&ours()), "whole");
+        let paired = crate::hello_reply_for(&alice.app.storage, stranger, true, ours()).expect("one we pair with is answered");
+        assert_eq!(name(&paired), name(&ours()), "whole");
+        let to_stranger = crate::hello_reply_for(&alice.app.storage, stranger, false, ours()).expect("answered");
+        assert!(name(&to_stranger).is_empty(), "without our device's name");
+    }
+
+    /// A message held until the contact's revocations are read says so in the chat's header, rather
+    /// than looking stuck (maintainers' decision 2026-11-11); once it goes, the note goes.
+    #[test]
+    fn a_message_held_for_the_contacts_revocations_says_so_in_the_header() {
+        let alice = create_stage5_peer("revocation-hint-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("revocation-hint-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let header = || alice.app.get_chat_header_contact_summary(bob.dialog_key.clone()).unwrap().subtitle;
+        let sent = alice.app.send_text(bob.dialog_key.as_str(), "hi").unwrap();
+        let now = current_unix_ms();
+        alice
+            .app
+            .storage
+            .mark_queue_retry(&sent.id, QueueFailureKind::NoActiveSession, crate::WAITING_FOR_REVOCATIONS, now + 60_000, now)
+            .unwrap();
+        assert!(header().contains("проверяем устройства собеседника"), "{}", header());
+        alice
+            .app
+            .storage
+            .mark_queue_retry(&sent.id, QueueFailureKind::NoActiveSession, "something else", now + 60_000, now)
+            .unwrap();
+        assert!(!header().contains("проверяем устройства собеседника"), "{}", header());
+    }
+
+    /// Blind audit 2026-11-11, I5: the refused nodes of a blocked account were its live devices only —
+    /// a revoked one's key, still its owner's to dial us with, was left out.
+    #[test]
+    fn a_blocked_accounts_revoked_device_is_refused_too() {
+        let alice = create_stage5_peer("blocked-revoked-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("blocked-revoked-bob", "Bob", "Bob PC");
+        let contact = link_stage5_contact(&bob.app, &alice, "Alice");
+        let desktop = copy_to_second_device(&alice, "blocked-revoked-desktop");
+        let desktop_bundle = desktop.get_local_prekey_bundle().unwrap();
+        bob.app.store_remote_prekey_bundle(&desktop_bundle).unwrap();
+        let connection = omni_storage::Storage::open_keyed_connection(std::path::Path::new(&bob.db_path)).unwrap();
+        connection
+            .execute(
+                "INSERT INTO device_revocations (account_id, device_id, revocation_json, working_key_version,
+                    revoked_at_unix_ms, received_at_unix_ms, kind)
+                 VALUES (?1, ?2, '{}', 1, 2000, 2000, 'revoked')",
+                rusqlite::params![alice.account.descriptor.account_id.0, desktop_bundle.device.device_id],
+            )
+            .unwrap();
+        drop(connection);
+        bob.app.block_contact(&contact.contact_id).unwrap();
+        assert_eq!(crate::blocked_contact_nodes(&bob.app.storage).unwrap_or_default().len(), 2, "the revoked device too");
+    }
+
+    /// Blind audit 2026-11-11, I4: a blocked account's hellos of ever new devices each wrote a bundle.
+    /// Past a bound the hello is refused all the same, and nothing is written.
+    #[test]
+    fn a_blocked_accounts_new_devices_are_kept_within_a_bound() {
+        let alice = create_stage5_peer("blocked-bound-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("blocked-bound-bob", "Bob", "Bob PC");
+        let contact = link_stage5_contact(&bob.app, &alice, "Alice");
+        bob.app.block_contact(&contact.contact_id).unwrap();
+        let mut fake = crate::prekey_bundle_from_protocol(&alice.bundle).unwrap();
+        for n in 1..crate::BLOCKED_ACCOUNT_DEVICES_KEPT_MAX {
+            fake.device_id = DeviceId(format!("dev-fake-{n}"));
+            bob.app.storage.record_remote_prekey_bundle(&fake, None, Some("fake"), 1).unwrap();
+        }
+        let held = || bob.app.storage.list_every_remote_prekey_bundle_of_account(&alice.account.descriptor.account_id).unwrap().len();
+        assert_eq!(held(), crate::BLOCKED_ACCOUNT_DEVICES_KEPT_MAX);
+        let desktop = copy_to_second_device(&alice, "blocked-bound-desktop");
+        let hello = match desktop.transport.build_local_session_hello_envelope().payload {
+            omni_transport::TransportRequestPayloadV1::SessionHello(hello) => hello,
+            _ => panic!("a hello"),
+        };
+        assert!(crate::hello_is_from_a_blocked_accounts_device(&bob.app.storage, &hello), "refused all the same");
+        assert_eq!(held(), crate::BLOCKED_ACCOUNT_DEVICES_KEPT_MAX, "nothing written past the bound");
+    }
+
+    /// Blind audit 2026-11-11, H5: an add the MLS engine refused changed nothing, yet the invitation
+    /// was spent. It goes back for another accept.
+    #[test]
+    fn an_add_the_engine_refused_gives_the_invitation_back() {
+        let admin = create_stage5_peer("engine-refused-admin", "Admin", "Admin PC");
+        let newcomer = create_stage5_peer("engine-refused-newcomer", "Newcomer", "Newcomer PC");
+        let group = admin.app.create_group("Team").unwrap();
+        let kp = crate::app_groups::own_key_package(&newcomer.app.storage).unwrap();
+        let accept = omni_protocol::GroupInviteAcceptV2 {
+            version: omni_protocol::GROUP_WIRE_VERSION_V2,
+            group_id: group.group_id.clone(),
+            key_package_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &kp),
+        };
+        admin.app.storage.record_group_sent_invite(&group.group_id, "dialog:newcomer", 1).unwrap();
+        crate::app_groups::add_invitee(&admin.app.storage, "dialog:newcomer", &accept).unwrap().expect("added");
+        // The same KeyPackage again: the engine refuses a member it holds already.
+        admin.app.storage.record_group_sent_invite(&group.group_id, "dialog:newcomer", 2).unwrap();
+        assert!(crate::app_groups::add_invitee(&admin.app.storage, "dialog:newcomer", &accept).is_err(), "the engine refuses it");
+        assert!(
+            admin.app.storage.take_group_sent_invite(&group.group_id, "dialog:newcomer").unwrap(),
+            "the invitation is back"
+        );
+    }
+
+    /// Blind audit 2026-11-11, F2: a receipt advances the ratchet; the advanced session goes to disk
+    /// BEFORE the receipt goes on the wire. Sent first, a store that then failed left the sent step
+    /// off the disk, to be taken again by the next frame. Here the store fails once: no receipt went.
+    #[test]
+    fn a_receipt_goes_out_only_once_its_session_is_stored() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("receipt-order-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("receipt-order-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "first").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "first", MessageStatus::Delivered);
+
+        crate::refuse_the_next_receipt_session_store(&bob.db_path);
+        alice.app.send_text(bob.dialog_key.as_str(), "second").unwrap();
+        let bob_has = || {
+            bob.app
+                .list_messages(alice.dialog_key.as_str())
+                .is_ok_and(|history| history.messages.iter().any(|m| m.body == "second"))
+        };
+        wait_for_condition(Duration::from_secs(20), bob_has);
+        std::thread::sleep(Duration::from_millis(1_500));
+        let status = || {
+            alice
+                .app
+                .list_messages(bob.dialog_key.as_str())
+                .unwrap()
+                .messages
+                .into_iter()
+                .find(|m| m.body == "second")
+                .map(|m| m.status)
+        };
+        assert_ne!(status(), Some(MessageStatus::Delivered), "the receipt whose session was not stored did not go");
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
+    /// Blind audit 2026-11-11, F3: every download request with a new transfer id made a sender
+    /// thread. One requester has a bounded number in flight, and so has the profile.
+    #[test]
+    fn send_workers_are_bounded_per_requester_and_per_profile() {
+        let db = "test-db-send-worker-bound";
+        let mut held = Vec::new();
+        for n in 0..crate::ATTACHMENT_SEND_WORKERS_PER_REQUESTER {
+            held.push(crate::reserve_attachment_send_worker(db, &format!("t-a-{n}"), "dialog:a").expect("within the bound"));
+        }
+        assert!(crate::reserve_attachment_send_worker(db, "t-a-over", "dialog:a").is_none(), "past the requester's bound");
+        let mut n = 0;
+        while held.len() < crate::ATTACHMENT_SEND_WORKERS_PER_PROFILE {
+            let dialog = format!("dialog:other-{}", n / 8);
+            held.push(crate::reserve_attachment_send_worker(db, &format!("t-o-{n}"), &dialog).expect("within the profile's bound"));
+            n += 1;
+        }
+        assert!(crate::reserve_attachment_send_worker(db, "t-new", "dialog:new").is_none(), "past the profile's bound");
+        for (n, worker) in held.iter().enumerate().take(crate::ATTACHMENT_SEND_WORKERS_PER_REQUESTER) {
+            crate::release_attachment_send_worker(db, &format!("t-a-{n}"), worker);
+        }
+        assert!(crate::reserve_attachment_send_worker(db, "t-a-again", "dialog:a").is_some(), "released, served again");
+    }
+
+    /// Blind audit 2026-11-11, F6: history coming back is not news, yet the chat's read mark is one
+    /// time: moved to the line handed over, it read a message nobody had opened, older than that line.
+    #[test]
+    fn history_coming_back_does_not_read_a_message_nobody_opened() {
+        let alice = create_stage5_peer("hs-unread-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-unread-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: true };
+        let from = omni_crypto::SessionAddress { remote_account_id: bob_account.clone(), remote_device_id: DeviceId("bob-pc".into()) };
+        let line = |id: &str, at: i64| omni_types::HistoryLineV1 {
+            message_id: id.into(),
+            author_account_id: bob_account.0.clone(),
+            body: format!("line {id}"),
+            created_at_unix_ms: at,
+            attachment: None,
+        };
+        // Nothing unread: the line handed over is old talk, it lights nothing.
+        crate::merge_history_lines(&alice.app.storage, &from, "dialog:bob-pc", &peer, &chat, &[line("old", 50)], 1_000);
+        assert_eq!(alice.app.storage.count_unread_in_dialog(&chat.chat_dialog_key).unwrap(), 0);
+        // A message nobody opened, then a later line handed over.
+        alice.app.storage.insert_incoming_message("unopened", &chat.chat_dialog_key, "news", 100).unwrap();
+        crate::merge_history_lines(&alice.app.storage, &from, "dialog:bob-pc", &peer, &chat, &[line("later", 200)], 1_000);
+        assert_eq!(
+            alice.app.storage.count_unread_in_dialog(&chat.chat_dialog_key).unwrap(),
+            2,
+            "the unopened message stays unread (and the line after it with it)"
+        );
+    }
+
+    /// Blind audit 2026-11-11, F7: a note no courier took counted as published and waited out the
+    /// republish interval. Not taken, it is posted again on the next round; taken, it is not.
+    #[test]
+    fn a_mailbox_note_no_courier_took_is_posted_again() {
+        let db = "test-db-mailbox-posted";
+        let note_of = |device: &str| serde_json::to_vec(&serde_json::json!({"device_id": device, "written_at_unix_ms": 1, "entries": []})).unwrap();
+        let note = note_of("dev-a");
+        let newer = note_of("dev-b");
+        let marked = || crate::with_account_mailbox(db, |state| state.published_fingerprint);
+        crate::with_account_mailbox(db, |state| state.published_fingerprint = crate::account_mailbox_fingerprint(&note));
+        crate::note_account_mailbox_posted(db, &note, 1);
+        assert_eq!(marked(), crate::account_mailbox_fingerprint(&note), "taken: published");
+        crate::note_account_mailbox_posted(db, &note, 0);
+        assert_eq!(marked(), 0, "not taken: the next round posts it");
+        crate::with_account_mailbox(db, |state| state.published_fingerprint = crate::account_mailbox_fingerprint(&newer));
+        crate::note_account_mailbox_posted(db, &note, 0);
+        assert_eq!(marked(), crate::account_mailbox_fingerprint(&newer), "a newer note set since stays");
+    }
+
+    /// Blind audit 2026-11-11, F8: declining a contact is blocking it, and its direct link goes at
+    /// once — a copy of the block without that step left it up until the next tick.
+    #[test]
+    fn declining_a_contact_drops_its_direct_link_at_once() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("decline-link-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("decline-link-bob", "Bob", "Bob PC");
+        let contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        let node = alice.app.mesh_node_for_dialog(bob.dialog_key.as_str()).unwrap().expect("bob's node");
+        let runtime = alice.app.mesh_runtime().expect("mesh up");
+        assert!(runtime.has_link(&node));
+        alice.app.decline_contact(&contact.contact_id).unwrap();
+        // Gone by the time the call returns, not a moment later (blind audit 2026-11-11, G7).
+        assert!(!runtime.has_link(&node), "the link went with the decline");
+        alice.app.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
+    /// The same, through a real restore from a backup: the device knows its sessions are old, so it
+    /// does not wait for the contact to count failed frames (~50 s) — it starts fresh ones, and the
+    /// pair talks both ways at once.
+    #[test]
+    fn a_device_restored_from_a_backup_talks_again_at_once() {
+        let _guard = network_test_guard();
+        let alice = create_stage5_peer("restored-backup-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("restored-backup-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        link_stage5_contact(&bob.app, &alice, "Alice");
+        link_stage5_peers_over_mesh(&alice, &bob);
+        alice.app.send_text(bob.dialog_key.as_str(), "before the backup").unwrap();
+        wait_for_message_status(&alice.app, bob.dialog_key.as_str(), "before the backup", MessageStatus::Delivered);
+
+        let backup = Path::new(&alice.db_path).parent().unwrap().join("backup").join("omni.db");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        alice.app.export_current_database_backup_bundle(&backup).unwrap();
+        let mnemonic = alice.account.recovery_phrase_v2.as_ref().unwrap().mnemonic.clone();
+        let token = OmniApp::inspect_account_backup_manifest(backup.to_string_lossy(), &mnemonic)
+            .unwrap()
+            .inspection_token;
+
+        // Both sides move on past the copy, both ways.
+        for n in 0..3 {
+            let text = format!("after the backup {n}");
+            alice.app.send_text(bob.dialog_key.as_str(), &text).unwrap();
+            wait_for_message_status(&alice.app, bob.dialog_key.as_str(), &text, MessageStatus::Delivered);
+            let reply = format!("reply {n}");
+            bob.app.send_text(alice.dialog_key.as_str(), &reply).unwrap();
+            wait_for_message_status(&bob.app, alice.dialog_key.as_str(), &reply, MessageStatus::Delivered);
+        }
+
+        alice.app.stop_mesh();
+        let (alice_db, alice_dialog, bob_dialog) = (alice.db_path.clone(), alice.dialog_key.clone(), bob.dialog_key.clone());
+        drop(alice.app);
+        OmniApp::import_database_backup_bundle(&alice_db, &backup, &token).unwrap();
+        let restored = OmniApp::init(AppInitRequest { db_path: alice_db }).unwrap();
+        let session_with_bob = || {
+            restored
+                .storage
+                .get_session_for_dialog(&bob.account.descriptor.account_id, &bob_dialog)
+                .unwrap()
+                .expect("a session with Bob")
+        };
+        // It stays, for its rendezvous pair secret — how the device finds Bob again — but marked.
+        assert!(restored.storage.is_ratchet_session_from_a_restored_copy(&session_with_bob()).unwrap());
+        // And nothing is sent on it: not established, a send starts a fresh session first.
+        assert_ne!(session_with_bob().bootstrap_state, omni_crypto::SessionBootstrapState::Established);
+
+        // Both write while they cannot reach each other, and the queue puts the next try off (live
+        // it was a minute; here an hour, so only the session coming up can send them).
+        let mine = restored.send_text(bob_dialog.as_str(), "from the restored device").unwrap();
+        let bobs = bob.app.send_text(alice_dialog.as_str(), "to the restored device").unwrap();
+        let later = current_unix_ms() + 3_600_000;
+        for (app, id) in [(&restored, &mine.id), (&bob.app, &bobs.id)] {
+            app.storage
+                .mark_queue_retry(id, QueueFailureKind::TransportWriteFailed, "no link", later, current_unix_ms())
+                .unwrap();
+        }
+        link_apps_over_mesh(&restored, &bob.app);
+        let has = |app: &OmniApp, dialog: &str, body: &str| {
+            app.list_messages(dialog).is_ok_and(|history| history.messages.iter().any(|m| m.body == body))
+        };
+        wait_for_state(
+            Duration::from_secs(20),
+            || {
+                format!(
+                    "bob has it: {}, the restored device has Bob's: {}",
+                    has(&bob.app, &alice_dialog, "from the restored device"),
+                    has(&restored, &bob_dialog, "to the restored device")
+                )
+            },
+            || {
+                has(&bob.app, &alice_dialog, "from the restored device")
+                    && has(&restored, &bob_dialog, "to the restored device")
+            },
+        );
+        assert!(
+            !restored.storage.is_ratchet_session_from_a_restored_copy(&session_with_bob()).unwrap(),
+            "a fresh session took the copy's place"
+        );
+        restored.stop_mesh();
+        bob.app.stop_mesh();
+    }
+
     /// Linked contacts learn where each other posts and looks, and hear again when that changes: Alice
     /// turns ntfy to "only read", and Bob learns she no longer posts there but still looks.
     #[test]
@@ -13679,10 +17929,25 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                 !set.publish.contains(&"https://ntfy.sh".to_string()) && set.read.contains(&"https://ntfy.sh".to_string())
             })
         });
+
+        // V-13: couriers of Alice's that point into a network — hers is fine for her — are not
+        // taken by Bob: his helper would call them inside his own network.
+        for local in ["http://192.168.1.1", "https://printer.local", "wss://127.0.0.1:443"] {
+            alice.app.add_rendezvous_provider(local).unwrap();
+        }
+        alice.app.add_rendezvous_provider("wss://relay.example.org").unwrap();
+        wait_for_condition(Duration::from_secs(60), || {
+            heard().is_some_and(|set| set.read.contains(&"wss://relay.example.org".to_string()))
+        });
+        let set = heard().unwrap();
+        for local in ["http://192.168.1.1", "https://printer.local", "wss://127.0.0.1:443"] {
+            assert!(!set.publish.contains(&local.to_string()) && !set.read.contains(&local.to_string()), "{local}");
+        }
     }
 
     /// A pair goes where the other device looks and looks where it posts: its own server (not in our
-    /// list) becomes a pair-only courier, a courier we only read is not posted to, one we turned off
+    /// list) becomes a pair-only courier once the user allows it (V-13), a courier we only read is not
+    /// posted to, one we turned off
     /// is used for nobody — and when nothing is common one way, that way falls back to our own set and
     /// says so (for the contact's warning).
     #[test]
@@ -13706,9 +17971,15 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             )
             .unwrap();
         assert!(
-            alice.app.configured_rendezvous_providers().contains(&"https://bob.example#pair".to_string()),
-            "Bob's own server is a pair-only courier for us"
+            !alice.app.configured_rendezvous_providers().iter().any(|entry| entry.contains("bob.example")),
+            "Bob's own server is not used before we said yes to it"
         );
+        alice.app.allow_contact_courier("https://bob.example").unwrap();
+        assert!(
+            alice.app.configured_rendezvous_providers().contains(&"https://bob.example#pair".to_string()),
+            "once allowed, Bob's own server is a pair-only courier for us"
+        );
+        assert!(alice.app.allow_contact_courier("https://nobody-named.example").is_err(), "only a server a device named");
         let mode = |url: &str, mode: &str| {
             let id = alice.app.list_rendezvous_providers().unwrap().into_iter().find(|p| p.url == url).unwrap().id;
             alice.app.set_rendezvous_provider_mode(id, mode).unwrap();
@@ -13771,6 +18042,28 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         );
         alice.app.set_rendezvous_provider_mode(mom.id, "publish_read").unwrap();
         assert_eq!(crate::contact_courier_gap(&alice.app.storage, &bob_account), (false, Vec::new()));
+    }
+
+    /// A contact reachable only through its own server: the card says so and asks to allow it — not
+    /// used before (V-13) — and once allowed, the gap closes.
+    #[test]
+    fn a_contacts_own_server_is_asked_for_before_it_is_used() {
+        let alice = create_stage5_peer("courier-allow-alice", "Alice", "Alice PC");
+        let bob = create_stage5_peer("courier-allow-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let bob_device = bob.app.get_local_device().unwrap().unwrap().device_id;
+        let own_server = omni_storage::PeerCourierSet {
+            publish: vec!["https://bob.example".to_string()],
+            read: vec!["https://bob.example".to_string()],
+        };
+        alice.app.storage.record_peer_courier_set(&bob_account, &bob_device, &own_server, 1_000).unwrap();
+        assert!(crate::contact_courier_gap(&alice.app.storage, &bob_account).0, "nothing common before the yes");
+        assert_eq!(crate::contact_couriers_to_allow(&alice.app.storage, &bob_account), vec!["https://bob.example".to_string()]);
+
+        alice.app.allow_contact_courier("https://bob.example").unwrap();
+        assert_eq!(crate::contact_courier_gap(&alice.app.storage, &bob_account), (false, Vec::new()));
+        assert!(crate::contact_couriers_to_allow(&alice.app.storage, &bob_account).is_empty());
     }
 
     /// A courier in memory for the account's mailbox (topic → posted blobs).
@@ -13866,16 +18159,21 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let (laptop, desktop) = ([1u8; 32], [2u8; 32]);
         let mut state = crate::RevocationNoticeState::default();
         let start = 1_000_000;
-        assert!(!crate::revocations_settled_in(&mut state, &[laptop, desktop], start), "nothing read yet");
+        assert!(!crate::revocations_settled_in(&mut state, "acct-a", &[laptop, desktop], start), "nothing read yet");
         state.beacons_read.insert(laptop);
-        assert!(!crate::revocations_settled_in(&mut state, &[laptop, desktop], start + 1_000), "one pair of two");
+        assert!(!crate::revocations_settled_in(&mut state, "acct-a", &[laptop, desktop], start + 1_000), "one pair of two");
         state.beacons_read.insert(desktop);
-        assert!(crate::revocations_settled_in(&mut state, &[laptop, desktop], start + 2_000));
+        assert!(crate::revocations_settled_in(&mut state, "acct-a", &[laptop, desktop], start + 2_000));
         state.inbox.push((desktop, sample_device_revocation()));
-        assert!(!crate::revocations_settled_in(&mut state, &[laptop, desktop], start + 3_000), "read, not applied");
-        assert!(crate::revocations_settled_in(&mut state, &[laptop, desktop], start + 15_000), "the grace ran out");
+        assert!(!crate::revocations_settled_in(&mut state, "acct-a", &[laptop, desktop], start + 3_000), "read, not applied");
+        assert!(crate::revocations_settled_in(&mut state, "acct-a", &[laptop, desktop], start + 15_000), "the grace ran out");
         let mut fresh = crate::RevocationNoticeState::default();
-        assert!(crate::revocations_settled_in(&mut fresh, &[], start), "an account without pairs");
+        assert!(crate::revocations_settled_in(&mut fresh, "acct-a", &[], start), "an account without pairs");
+        // The grace is each account's own: one that ran out for one account does not count for
+        // another asked later (blind audit 2026-11-11, J2).
+        let other = [3u8; 32];
+        assert!(!crate::revocations_settled_in(&mut state, "acct-b", &[other], start + 30_000), "its own grace");
+        assert!(crate::revocations_settled_in(&mut state, "acct-b", &[other], start + 45_000), "which runs out in its turn");
     }
 
     /// After a key move, what the old key revoked is not passed on any more (whoever applies it refuses
@@ -14342,7 +18640,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         alice.app.stop_mesh();
         let restored_db = std::env::temp_dir()
             .join("omni-stage-5-app-tests")
-            .join(format!("pp-alice-restored-{}.db", unique_suffix()));
+            .join(format!("pp-alice-restored-{}", unique_suffix())).join("omni.db");
         let restored = OmniApp::init(AppInitRequest { db_path: restored_db.to_string_lossy().into_owned() }).unwrap();
         let account = restored
             .restore_account_from_mnemonic(
@@ -14381,6 +18679,26 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             !crate::adopt_passport_holder_mark(&restored.storage, &mark, current_unix_ms()).unwrap(),
             "a mark read twice is one holder"
         );
+        // Bob turns: knowing the mark secret, he posts a mark for another account of his, Eve's
+        // (blind audit 2026-11-10). Until the passport is in, she is taken as a holder like him.
+        let eve = create_stage5_peer("pp-eve", "Eve", "Eve PC");
+        eve.app.start_mesh().unwrap();
+        let eve_beacon =
+            crate::build_signed_identity_beacon(&eve.app.storage, &eve.app.mesh_runtime().unwrap(), None).unwrap();
+        let eve_wire = omni_rendezvous::seal_mailbox(&mark_secret, &topic, &eve_beacon.to_wire());
+        let eve_mark = omni_rendezvous::IdentityBeacon::from_wire(
+            &omni_rendezvous::open_mailbox(&mark_secret, &topic, &eve_wire).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::adopt_passport_holder_mark(&restored.storage, &eve_mark, current_unix_ms()).unwrap());
+        let eve_account = eve.account.descriptor.account_id.clone();
+        // And until then she is no approved contact (maintainers' decision 2026-11-11, closing E2): a holder
+        // by its mark alone stays pending — before, she was approved for that time.
+        assert_eq!(
+            restored.storage.find_contact_by_remote_account_id(&eve_account).unwrap().map(|c| c.relationship_state),
+            Some(ContactRelationshipState::Pending),
+            "a holder by its mark alone is not approved before the passport"
+        );
         if mark_before_link {
             link_apps_over_mesh(&restored, &bob.app);
         }
@@ -14394,7 +18712,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
                     bob.account.descriptor.account_id.0,
                     contacts.iter().map(|c| (c.petname.clone(), c.remote_account_id.clone(), c.relationship_state)).collect::<Vec<_>>(),
                     contacts.iter().map(|c| restored.storage.list_contact_device_dialogs(&c.contact_id).unwrap()).collect::<Vec<_>>(),
-                    restored.storage.get_app_meta("account_recovery_v1").unwrap(),
+                    restored.storage.get_profile_meta("account_recovery_v1").unwrap(),
                 )
             },
             || {
@@ -14409,7 +18727,12 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             named("Bob").is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved),
             "{contacts:?}"
         );
-        assert_eq!(contacts.len(), 2, "Dave was removed, Bob is not doubled: {contacts:?}");
+        assert_eq!(contacts.len(), 2, "Dave was removed, Bob is not doubled, Eve is gone: {contacts:?}");
+        assert!(
+            restored.storage.find_contact_by_remote_account_id(&eve_account).unwrap().is_none(),
+            "a holder the passport does not name is not a contact"
+        );
+        eve.app.stop_mesh();
         assert_eq!(restored.storage.get_local_public_profile_state().unwrap().display_name, "Алиса");
         // Bob still keeps the real passport: nothing smaller replaced it while the device was empty.
         assert!(bob_holds().unwrap().version >= held.version);
@@ -14851,6 +19174,7 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: false };
         let laptop = omni_crypto::SessionAddress { remote_account_id: own.clone(), remote_device_id: DeviceId("alice-laptop".into()) };
         let offer = |id: &str| omni_types::AttachmentOfferV1 {
+            reply_to: None,
             message_id: id.into(),
             body: "отчёт".into(),
             file_name: "report.txt".into(),
@@ -14944,6 +19268,153 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
         assert!(header.subtitle.contains("история не сходится"), "{}", header.subtitle);
     }
 
+    /// Blind audit 2026-11-13, pass 22: forgetting a contact took the chat away, and a history sync
+    /// brought it back once the account was a contact again. What the chat held before is gone for
+    /// good; what is written after comes as ever.
+    #[test]
+    fn forgotten_contact_history_is_not_reimported_after_reapproval() {
+        let alice = create_stage5_peer("hs-forgotten-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-forgotten-bob", "Bob", "Bob PC");
+        let contact = link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let before = current_unix_ms() - 60_000;
+        alice.app.storage.insert_incoming_message("old-b-1", &chat.chat_dialog_key, "old", before).unwrap();
+        alice.app.forget_contact(&contact.contact_id).unwrap();
+        assert!(!alice.app.storage.message_exists("old-b-1").unwrap());
+
+        let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: true };
+        let from = omni_crypto::SessionAddress { remote_account_id: bob_account.clone(), remote_device_id: DeviceId("bob-pc".into()) };
+        let line = |id: &str, at: i64| omni_types::HistoryLineV1 {
+            message_id: id.into(),
+            author_account_id: bob_account.0.clone(),
+            body: "a line".into(),
+            created_at_unix_ms: at,
+            attachment: None,
+        };
+        let later = current_unix_ms() + 1_000;
+        let added = crate::merge_history_lines(&alice.app.storage, &from, "dialog:bob-pc", &peer, &chat, &[line("old-b-1", before), line("new-b-1", later)], later);
+        assert_eq!(added, 1);
+        assert!(!alice.app.storage.message_exists("old-b-1").unwrap(), "forgotten");
+        assert!(alice.app.storage.message_exists("new-b-1").unwrap(), "written after");
+    }
+
+    /// Blind audit 2026-11-13, pass 22: a deletion our own device told us of a line not here yet kept
+    /// nothing, and the line came back with a copy from a device behind on sync.
+    #[test]
+    fn own_device_delete_before_history_line_stays_deleted() {
+        let alice = create_stage5_peer("hs-own-delete-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-own-delete-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        crate::app_message_actions::receive_own_device_deletions(&alice.app.storage, &["x-27".to_string()], 1_000).unwrap();
+
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: false };
+        let from = omni_crypto::SessionAddress { remote_account_id: own.clone(), remote_device_id: DeviceId("alice-old-pc".into()) };
+        let line = omni_types::HistoryLineV1 {
+            message_id: "x-27".into(),
+            author_account_id: bob_account.0.clone(),
+            body: "deleted on another device".into(),
+            created_at_unix_ms: 500,
+            attachment: None,
+        };
+        crate::merge_history_lines(&alice.app.storage, &from, "dialog:alice-old-pc", &peer, &chat, &[line], 1_001);
+        assert!(!alice.app.storage.message_exists("x-27").unwrap(), "deleted here before it came");
+    }
+
+    /// Blind audit 2026-11-13, pass 22: while this device was being restored, a contact's line «by us»
+    /// dated after the time the passport counted the chat was checked against nothing, and showed as
+    /// ours unflagged. Only lines the fingerprint covers come back that way.
+    #[test]
+    fn recovery_rejects_contact_forged_outgoing_line() {
+        let alice = create_stage5_peer("hs-forged-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-forged-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: true };
+        let from = omni_crypto::SessionAddress { remote_account_id: bob_account.clone(), remote_device_id: DeviceId("bob-pc".into()) };
+        let line = |id: &str, at: i64| omni_types::HistoryLineV1 {
+            message_id: id.into(),
+            author_account_id: own.0.clone(),
+            body: "I agreed to it".into(),
+            created_at_unix_ms: at,
+            attachment: None,
+        };
+        let counted = crate::LocalChat {
+            contact_account_id: bob_account.clone(),
+            chat_dialog_key: chat.chat_dialog_key.clone(),
+            lines: vec![omni_storage::ChatHistoryLine { id: "h1".into(), outgoing: true, body: "I agreed to it".into(), created_at_unix_ms: 10 }],
+        };
+        let digest = crate::local_chat_digest(&own, &counted);
+        crate::start_account_recovery(&alice.app.storage, 0);
+        let mut recovery = crate::load_account_recovery(&alice.app.storage).unwrap();
+        recovery.chat_fingerprints.push((bob_account.0.clone(), digest.count, hex::encode(digest.root), 100));
+        crate::save_account_recovery(&alice.app.storage, &recovery);
+
+        let added = crate::merge_history_lines(&alice.app.storage, &from, "dialog:bob-pc", &peer, &chat, &[line("h1", 10), line("fake-a-0001", 500)], 1_000);
+        assert_eq!(added, 1, "the counted line comes back");
+        assert!(alice.app.storage.message_exists("h1").unwrap());
+        assert!(!alice.app.storage.message_exists("fake-a-0001").unwrap(), "past the count: checked against nothing");
+    }
+
+    /// V-19: outside a restore, a contact adds to our copy of the chat only what it wrote itself —
+    /// a line it says is ours is not taken (we never wrote it, or our own devices would have it),
+    /// and no line dated in the future is taken from anyone.
+    #[test]
+    fn a_contact_cannot_put_words_in_our_mouth_outside_a_restore() {
+        let alice = create_stage5_peer("hs-ours-alice", "Alice", "Alice Laptop");
+        let bob = create_stage5_peer("hs-ours-bob", "Bob", "Bob PC");
+        link_stage5_contact(&alice.app, &bob, "Bob");
+        let own = alice.account.descriptor.account_id.clone();
+        let bob_account = bob.account.descriptor.account_id.clone();
+        let chat = crate::local_chat(&alice.app.storage, &bob_account).unwrap();
+        let peer = crate::HistoryPeer { own_account_id: own.clone(), contact_account_id: bob_account.clone(), from_contact: true };
+        let from = omni_crypto::SessionAddress { remote_account_id: bob_account.clone(), remote_device_id: DeviceId("bob-pc".into()) };
+        let line = |id: &str, author: &AccountId, body: &str, at: i64| omni_types::HistoryLineV1 {
+            message_id: id.into(),
+            author_account_id: author.0.clone(),
+            body: body.into(),
+            created_at_unix_ms: at,
+            attachment: None,
+        };
+        let now = current_unix_ms();
+        assert!(crate::load_account_recovery(&alice.app.storage).is_none(), "not being restored");
+        let added = crate::merge_history_lines(
+            &alice.app.storage,
+            &from,
+            "dialog:bob-pc",
+            &peer,
+            &chat,
+            &[
+                line("o1", &own, "я должна тебе денег", now - 60_000),
+                line("b1", &bob_account, "his own words", now - 50_000),
+                line("b2", &bob_account, "from the future", now + 3_600_000),
+            ],
+            now,
+        );
+        assert_eq!(added, 1, "only Bob's own line, dated now or before");
+        assert!(alice.app.storage.message_exists("b1").unwrap());
+        assert!(!alice.app.storage.message_exists("o1").unwrap(), "a line «by Alice» from Bob is not taken");
+        assert!(!alice.app.storage.message_exists("b2").unwrap(), "a line from the future is not taken");
+
+        // While Alice's device is being restored, Bob's copy is how her side comes back — up to the
+        // time the passport counted the chat (pass 22).
+        crate::start_account_recovery(&alice.app.storage, now);
+        let mut recovery = crate::load_account_recovery(&alice.app.storage).unwrap();
+        recovery.chat_fingerprints.push((bob_account.0.clone(), 1, String::new(), now - 30_000));
+        crate::save_account_recovery(&alice.app.storage, &recovery);
+        let added = crate::merge_history_lines(
+            &alice.app.storage, &from, "dialog:bob-pc", &peer, &chat, &[line("o2", &own, "мои слова", now - 40_000)], now,
+        );
+        assert_eq!(added, 1);
+        assert!(alice.app.storage.history_import_source("o2").unwrap().is_some(), "marked «со слов собеседника»");
+    }
+
     /// A real identity beacon fits what ntfy reads (4096 hex characters = 2 KB), and the finder gets
     /// the whole prekey bundle back from its compact parts (it was JSON of 4.5 KB — read by Nostr only).
     #[test]
@@ -14961,6 +19432,8 @@ fn lifecycle_runtime_gates_block_sensitive_operations_while_locked() {
             reflexive: vec!["203.0.113.9:51820".into(), "[2001:db8::1]:51820".into()],
             tcp_direct: vec!["203.0.113.9:40000".into()],
             relay_bundle: None,
+            tcp_punch: Some("203.0.113.9:40001".into()),
+            knock_key: Some([9; 32]),
             ts_ms: now as u64,
             ttl_secs: 46_800,
             seq: now as u64,

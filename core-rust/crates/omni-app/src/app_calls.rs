@@ -174,6 +174,173 @@ struct ActiveCallRuntime {
     /// `remote_device_id` and `summary.dialog_key` move to it — and the rest are cancelled. Empty for
     /// an incoming call, and for a contact whose devices are not known yet (one device, as before).
     invited_devices: Vec<CallDevice>,
+    /// The call's end-to-end media keys (docs/decisions/call-media-e2e.md).
+    media: CallMediaState,
+}
+
+/// End-to-end encryption of a 1:1 call's datagram plane — audio, video, screen sharing, RTCP and
+/// screen control alike. Each side contributes a random share (the caller in its invite, the callee
+/// in its accept, both inside the pair's ratchet session); the keys exist once both are known, and
+/// die with the call. Until then, and without them, nothing is sent: there is no unencrypted path.
+#[derive(Clone)]
+struct CallMediaState {
+    /// This side's share, sent in our invite or accept.
+    own_share: [u8; omni_crypto::DIRECT_CALL_MEDIA_SHARE_BYTES],
+    keys: Option<CallMediaKeys>,
+}
+
+impl Default for CallMediaState {
+    fn default() -> Self {
+        Self { own_share: omni_crypto::generate_group_key(), keys: None }
+    }
+}
+
+/// Key bytes never reach a log: `Debug` says only whether the keys are there.
+impl std::fmt::Debug for CallMediaState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallMediaState").field("keys_agreed", &self.keys.is_some()).finish()
+    }
+}
+
+#[derive(Clone)]
+struct CallMediaKeys {
+    send: [u8; 32],
+    receive: [u8; 32],
+    /// Counter of the next datagram we seal: the AEAD nonce, never reused under one key.
+    next_seq: u64,
+    replay: MediaReplayWindow,
+}
+
+/// Tag in the sealed header of 1:1 call datagrams (group media carries the sender's SSRC there).
+const DIRECT_CALL_MEDIA_TAG: u32 = 0x4F4D_3131; // "OM11"
+
+/// Sliding window over the counters of datagrams already opened: a datagram is opened at most
+/// once, and one older than the window is dropped. Media is reordered by a few packets at most.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MediaReplayWindow {
+    highest: Option<u64>,
+    seen: [u64; MEDIA_REPLAY_WINDOW_BITS / 64],
+}
+
+const MEDIA_REPLAY_WINDOW_BITS: usize = 1024;
+
+impl MediaReplayWindow {
+    /// Whether `seq` is new; records it if so.
+    pub(crate) fn accept(&mut self, seq: u64) -> bool {
+        let bits = MEDIA_REPLAY_WINDOW_BITS as u64;
+        match self.highest {
+            None => {
+                self.highest = Some(seq);
+                self.mark(seq);
+                true
+            }
+            Some(highest) if seq > highest => {
+                let advance = seq - highest;
+                if advance >= bits {
+                    self.seen = [0; MEDIA_REPLAY_WINDOW_BITS / 64];
+                } else {
+                    for clear in (highest + 1)..=seq {
+                        self.unmark(clear);
+                    }
+                }
+                self.highest = Some(seq);
+                self.mark(seq);
+                true
+            }
+            Some(highest) => {
+                if highest - seq >= bits || self.is_marked(seq) {
+                    return false;
+                }
+                self.mark(seq);
+                true
+            }
+        }
+    }
+
+    fn slot(seq: u64) -> (usize, u64) {
+        let bit = (seq % MEDIA_REPLAY_WINDOW_BITS as u64) as usize;
+        (bit / 64, 1u64 << (bit % 64))
+    }
+
+    fn mark(&mut self, seq: u64) {
+        let (word, mask) = Self::slot(seq);
+        self.seen[word] |= mask;
+    }
+
+    fn unmark(&mut self, seq: u64) {
+        let (word, mask) = Self::slot(seq);
+        self.seen[word] &= !mask;
+    }
+
+    fn is_marked(&self, seq: u64) -> bool {
+        let (word, mask) = Self::slot(seq);
+        self.seen[word] & mask != 0
+    }
+}
+
+fn decode_media_key_share(hex_share: &str) -> OmniResult<[u8; omni_crypto::DIRECT_CALL_MEDIA_SHARE_BYTES]> {
+    let bytes = hex::decode(hex_share)
+        .map_err(|_| OmniError::InvalidInput("call media key share is not hex".to_string()))?;
+    bytes
+        .try_into()
+        .map_err(|_| OmniError::InvalidInput("call media key share must be 32 bytes".to_string()))
+}
+
+/// Derive the call's media keys once the peer's share is known. `we_called` picks the direction.
+fn install_call_media_keys(runtime: &mut ActiveCallRuntime, peer_share_hex: &str, we_called: bool) -> OmniResult<()> {
+    // Once per call: both shares are fixed for it, so the keys come out the same — and set again
+    // they started the counter from 0, the nonces of the first datagrams sealed a second time under
+    // the same key. A contact's CallAccept sent again (sealed anew, so no replay) did that (blind
+    // audit 2026-11-12, pass 17).
+    if runtime.media.keys.is_some() {
+        return Ok(());
+    }
+    let peer_share = decode_media_key_share(peer_share_hex)?;
+    let own = runtime.media.own_share;
+    let (caller_share, callee_share) = if we_called { (own, peer_share) } else { (peer_share, own) };
+    let (caller_to_callee, callee_to_caller) =
+        omni_crypto::derive_direct_call_media_keys(&caller_share, &callee_share, &runtime.summary.call_id)?;
+    let (send, receive) =
+        if we_called { (caller_to_callee, callee_to_caller) } else { (callee_to_caller, caller_to_callee) };
+    runtime.media.keys = Some(CallMediaKeys { send, receive, next_seq: 0, replay: MediaReplayWindow::default() });
+    Ok(())
+}
+
+/// Seal one datagram of the current 1:1 call on `dialog_key`. Fails — nothing is sent — when the
+/// dialog is not the call's or its keys are not there yet.
+pub(crate) fn seal_direct_call_datagram(db_path: &str, dialog_key: &str, payload: &[u8]) -> OmniResult<Vec<u8>> {
+    let mut registry = lock_call_runtime_registry()?;
+    let runtime = registry
+        .get_mut(db_path)
+        .and_then(|state| state.current_call.as_mut())
+        .filter(|runtime| normalize_dialog_key(&runtime.summary.dialog_key) == normalize_dialog_key(dialog_key))
+        .ok_or_else(|| OmniError::InvalidInput("call media for a dialog that is not the current call".to_string()))?;
+    let keys = runtime
+        .media
+        .keys
+        .as_mut()
+        .ok_or_else(|| OmniError::InvalidInput("the call's media keys are not agreed yet".to_string()))?;
+    let seq = keys.next_seq;
+    keys.next_seq += 1;
+    omni_crypto::seal_group_call_media(&keys.send, DIRECT_CALL_MEDIA_TAG, seq, payload)
+}
+
+/// Open one datagram of the current 1:1 call that arrived on `dialog_key`. `None` — dropped — for a
+/// datagram that does not open with the peer's key (forged, altered, or from another call) or was
+/// opened before (a replay).
+pub(crate) fn open_direct_call_datagram(db_path: &str, dialog_key: &str, sealed: &[u8]) -> Option<Vec<u8>> {
+    let mut registry = lock_call_runtime_registry().ok()?;
+    let runtime = registry
+        .get_mut(db_path)
+        .and_then(|state| state.current_call.as_mut())
+        .filter(|runtime| normalize_dialog_key(&runtime.summary.dialog_key) == normalize_dialog_key(dialog_key))?;
+    let keys = runtime.media.keys.as_mut()?;
+    let (tag, seq) = omni_crypto::peek_group_call_media_header(sealed)?;
+    if tag != DIRECT_CALL_MEDIA_TAG {
+        return None;
+    }
+    let opened = omni_crypto::open_group_call_media(&keys.receive, sealed).ok()?;
+    keys.replay.accept(seq).then_some(opened)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +420,61 @@ pub fn wait_for_call_change(since: u64, timeout: std::time::Duration) -> u64 {
     }
 }
 
+/// [`OmniApp::end_call_with_account`] for a caller that holds the session lock — an inbound handler,
+/// a contact blocked or removed on another device of ours (A01, audit 2026-11-09 #6). The call ends
+/// here whatever happens to the word to the peer; with no transport (a passport recovered) it is
+/// not said at all.
+pub(crate) fn end_call_with_account_under_lock(
+    storage: &Storage,
+    transport: Option<&TransportManager>,
+    account: &AccountId,
+) -> OmniResult<()> {
+    let db_path = storage.db_path().to_string_lossy().to_string();
+    let Some(runtime) = current_call_runtime(&db_path)?.filter(|r| &r.remote_account_id == account) else {
+        return Ok(());
+    };
+    let now_unix_ms = current_unix_ms();
+    let call_id = runtime.summary.call_id.clone();
+    let answered = runtime.summary.connected_at_unix_ms.is_some();
+    let (outcome, reason, event, payload_kind) = if runtime.summary.direction == CallDirection::Incoming && !answered {
+        (
+            CallOutcome::Declined,
+            Some(CallDeclineReason::Declined),
+            omni_types::LogicalEventEnvelopeV1::call_decline(call_id.clone(), CallDeclineReason::Declined, now_unix_ms),
+            SecurityPayloadKind::CallDecline,
+        )
+    } else if answered {
+        (
+            CallOutcome::Completed,
+            None,
+            omni_types::LogicalEventEnvelopeV1::call_hangup(call_id.clone(), now_unix_ms),
+            SecurityPayloadKind::CallHangup,
+        )
+    } else {
+        (
+            CallOutcome::Cancelled,
+            None,
+            omni_types::LogicalEventEnvelopeV1::call_cancel(call_id.clone(), now_unix_ms),
+            SecurityPayloadKind::CallCancel,
+        )
+    };
+    let ended = end_runtime_call(storage, &db_path, outcome, reason, now_unix_ms)?;
+    let session_address = omni_crypto::SessionAddress {
+        remote_account_id: runtime.remote_account_id.clone(),
+        remote_device_id: runtime.remote_device_id.clone(),
+    };
+    let Some(transport) = transport else { return Ok(()) };
+    if let Err(error) =
+        send_call_event_for_session_address(storage, transport, &ended.dialog_key, &session_address, &event, payload_kind)
+    {
+        omni_app_trace_log("call/contact-left", &format!("{call_id}: the peer was not told: {error}"));
+    }
+    if runtime.summary.direction == CallDirection::Outgoing && !answered {
+        cancel_other_invited_devices(storage, transport, &runtime, &runtime.remote_device_id, now_unix_ms);
+    }
+    Ok(())
+}
+
 static CALL_RUNTIME_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, CallRuntimeState>>> =
     std::sync::OnceLock::new();
 
@@ -302,6 +524,16 @@ impl OmniApp {
             SecurityPayloadKind::CallDecline,
         )?;
         Ok(ended)
+    }
+
+    /// End the 1:1 call with `account`, ringing or going on: blocking, declining or forgetting a
+    /// contact leaves no call with them — its media keys go with it, so not a packet more goes
+    /// either way (F2, audit 2026-11-09 #5). Said to the peer while the session still stands; ended
+    /// here whatever it answers. Takes the session lock itself: not for a caller that holds it.
+    pub(crate) fn end_call_with_account(&self, account: &AccountId) -> OmniResult<()> {
+        let _session_guard = lock_app_session_guard(&self.session_lock)?;
+        tick_call_runtime(&self.storage, Some(&self.transport))?;
+        end_call_with_account_under_lock(&self.storage, Some(&self.transport), account)
     }
 
     pub fn hang_up_call(&self, call_id: impl AsRef<str>) -> OmniResult<CallSummary> {
@@ -382,6 +614,10 @@ impl OmniApp {
         let now_unix_ms = current_unix_ms();
         let db_path = self.storage.db_path().to_string_lossy().to_string();
 
+        if crate::app_group_calls::group_call_in_progress(&db_path).is_some() {
+            // One call per profile, a group call too (F5, audit 2026-11-09 #5).
+            return Err(OmniError::InvalidInput("another call is already in progress".to_string()));
+        }
         if let Some(existing) = current_call_runtime(&db_path)? {
             // One call per profile. Re-placing the same dialog is idempotent.
             if existing.summary.dialog_key == dialog_key
@@ -401,7 +637,9 @@ impl OmniApp {
             ));
         }
 
-        let call_id = format!("call-out-{now_unix_ms}");
+        // Not guessable: a call's id named by someone else no longer moves it (the sender is checked
+        // too, `call_event_is_from_its_peer`), and it no longer tells when we called either.
+        let call_id = format!("call-out-{}", hex::encode(random_bytes(12)?));
         let runtime = build_call_runtime_for_dialog(
             &self.storage,
             dialog_key,
@@ -426,6 +664,7 @@ impl OmniApp {
             account_id: runtime.remote_account_id.0.clone(),
             device_id: runtime.remote_device_id.0.clone(),
         }];
+        let media_key_share = hex::encode(runtime.media.own_share);
         let invite = if remote_control {
             omni_types::LogicalEventEnvelopeV1::remote_control_invite(
                 call_id,
@@ -433,6 +672,7 @@ impl OmniApp {
                 invite_participants,
                 now_unix_ms,
                 now_unix_ms + REMOTE_CONTROL_INVITE_TTL_MS,
+                media_key_share,
             )
         } else {
             omni_types::LogicalEventEnvelopeV1::call_invite(
@@ -441,6 +681,7 @@ impl OmniApp {
                 invite_participants,
                 now_unix_ms,
                 now_unix_ms + 60_000,
+                media_key_share,
             )
         };
         let devices = match runtime.summary.contact_id.as_deref() {
@@ -482,13 +723,17 @@ impl OmniApp {
                 Ok(this) => {
                     delivery.get_or_insert(this);
                 }
-                Err(error) if targets.len() == 1 => return Err(error),
+                Err(error) if targets.len() == 1 => {
+                    end_call_that_was_not_placed(&self.storage, &db_path);
+                    return Err(error);
+                }
                 Err(_) => {}
             }
         }
-        let delivery = delivery.ok_or_else(|| {
-            OmniError::Transport("the call invite reached none of the contact's devices".to_string())
-        })?;
+        let Some(delivery) = delivery else {
+            end_call_that_was_not_placed(&self.storage, &db_path);
+            return Err(OmniError::Transport("the call invite reached none of the contact's devices".to_string()));
+        };
         if !call_was_placed(delivery) {
             // Для СООБЩЕНИЯ «положили в durable до реконсиляции» — правильный успех: текст обязан
             // долежать. Для ЗВОНКА — нет. Звонок это realtime: приглашение, доставленное через
@@ -499,7 +744,7 @@ impl OmniApp {
             // later`, и больше про этот call_id в трассе НЕТ НИ ОДНОЙ строки — линк встал через
             // 84 секунды, приглашение так и не уехало, а человек всё это время видел «звоню».
             // Разбор: docs/bugs/a-call-nobody-could-hear-was-reported-as-placed.md.
-            set_current_call_runtime(&db_path, None)?;
+            end_call_that_was_not_placed(&self.storage, &db_path);
             // Причина названа, а не свёрнута в одну фразу: «пути нет вовсе» и «труба есть, но
             // пир перестал отвечать» человек чинит по-разному, а до этого оба показывались
             // одинаково — и, пока различия не было, второй случай вообще проходил как успех.
@@ -530,6 +775,9 @@ impl OmniApp {
                 "only an incoming call can be accepted".to_string(),
             ));
         }
+        if crate::app_group_calls::group_call_in_progress(&db_path).is_some() {
+            return Err(OmniError::InvalidInput("another call is already in progress".to_string()));
+        }
 
         let session_address = omni_crypto::SessionAddress {
             remote_account_id: runtime.remote_account_id.clone(),
@@ -538,6 +786,7 @@ impl OmniApp {
         let accept = omni_types::LogicalEventEnvelopeV1::call_accept(
             runtime.summary.call_id.clone(),
             now_unix_ms,
+            hex::encode(runtime.media.own_share),
         );
         let dialog_key = runtime.summary.dialog_key.clone();
 
@@ -831,6 +1080,12 @@ fn build_call_runtime_for_dialog(
         .ok_or_else(|| {
             OmniError::InvalidInput("a call requires a known contact for the dialog".to_string())
         })?;
+    // 1:1 calls are for approved contacts only, whichever side starts one (blind audit 2026-11-11,
+    // G1): the incoming invite was checked, the outgoing call was not — a session alone let one out
+    // to a pending contact, and its answer made the call active.
+    if card.contact.relationship_state != omni_identity::ContactRelationshipState::Approved {
+        return Err(OmniError::InvalidInput("a call is for an approved contact only".to_string()));
+    }
     let remote_account_id = card.contact.remote_account_id.clone().ok_or_else(|| {
         OmniError::InvalidInput("a call requires a contact with a remote account id".to_string())
     })?;
@@ -891,7 +1146,18 @@ fn build_call_runtime_for_dialog(
         remote_device_id,
         invite_expires_at_unix_ms: now_unix_ms + 60_000,
         invited_devices: Vec::new(),
+        media: CallMediaState::default(),
     })
+}
+
+/// A call whose invite did not go out ends here and now, as failed: its slot is free for the next
+/// call and its record does not stay «connecting». A send that failed outright returned before this
+/// and left both — the next call was refused as «another call is in progress» until the invite
+/// expired (blind audit 2026-11-10).
+fn end_call_that_was_not_placed(storage: &Storage, db_path: &str) {
+    if end_runtime_call(storage, db_path, CallOutcome::Failed, None, current_unix_ms()).is_err() {
+        let _ = set_current_call_runtime(db_path, None);
+    }
 }
 
 fn end_runtime_call(
@@ -1115,6 +1381,27 @@ fn tick_call_runtime(storage: &Storage, transport: Option<&TransportManager>) ->
     Ok(())
 }
 
+impl OmniApp {
+    /// The call a chat's header shows. One stored as going on while this process has no call is an
+    /// orphan of a process that ended mid-call: it is finalized here too, under the session lock the
+    /// calls take, as the call inbox does. Only the inbox did it, and a header read before it showed
+    /// a call that was over — and stood over the chat's later, finished calls (blind audit
+    /// 2026-11-13, pass 21).
+    pub(crate) fn chat_header_call_summary(&self, dialog_key: &str) -> OmniResult<Option<CallSummary>> {
+        let summary = current_or_persisted_call_summary_for_dialog(&self.storage, dialog_key)?;
+        if summary.as_ref().is_none_or(|call| call.state == CallState::Ended) {
+            return Ok(summary);
+        }
+        let db_path = self.storage.db_path().to_string_lossy().to_string();
+        let _session_guard = lock_app_session_guard(&self.session_lock)?;
+        if current_call_runtime(&db_path)?.is_some() {
+            return Ok(summary);
+        }
+        self.storage.finalize_orphaned_call_sessions(current_unix_ms())?;
+        current_or_persisted_call_summary_for_dialog(&self.storage, dialog_key)
+    }
+}
+
 fn current_or_persisted_call_summary_for_dialog(
     storage: &Storage,
     dialog_key: &str,
@@ -1177,6 +1464,20 @@ fn handle_incoming_call_invite(
 
     // Busy: one call per profile. If we are already on a different call, decline.
     let db_path = storage.db_path().to_string_lossy().to_string();
+    if let Some(group_id) = crate::app_group_calls::group_call_in_progress(&db_path) {
+        // In a group call: that is one call too (F5, audit 2026-11-09 #5).
+        trace_call_in("invite", &invite.call_id, &format!("declined: busy in the call of group {group_id}"));
+        let decline = omni_types::LogicalEventEnvelopeV1::call_decline(invite.call_id.clone(), CallDeclineReason::Busy, now_unix_ms);
+        return send_call_event_for_session_address(
+            storage,
+            transport,
+            &receive_context.dialog_key,
+            &session.session_address,
+            &decline,
+            SecurityPayloadKind::CallDecline,
+        )
+        .map(|_delivery| ());
+    }
     if let Some(existing) = current_call_runtime(&db_path)? {
         if existing.summary.call_id == invite.call_id {
             // Already ringing this exact call — idempotent.
@@ -1261,6 +1562,9 @@ fn handle_incoming_call_invite(
         });
         runtime.invite_expires_at_unix_ms = deadline;
     }
+    // Both shares are known now (the caller's came in the invite): the keys are ready before any
+    // media can flow, which starts only once we accept.
+    install_call_media_keys(&mut runtime, &invite.media_key_share, false)?;
     upsert_call_and_wake_shell(storage, &runtime.summary)?;
     set_current_call_runtime(&db_path, Some(runtime))?;
     trace_call_in("invite", &invite.call_id, "applied: ringing");
@@ -1284,12 +1588,17 @@ fn handle_incoming_call_invite(
 fn handle_incoming_call_ringing(
     storage: &Storage,
     ringing: &omni_types::CallRingingV1,
+    from: &omni_crypto::SessionAddress,
 ) -> OmniResult<()> {
     let db_path = storage.db_path().to_string_lossy().to_string();
     let Some(mut runtime) = current_call_runtime(&db_path)? else {
         return Ok(());
     };
     if runtime.summary.call_id != ringing.call_id || runtime.summary.direction != CallDirection::Outgoing {
+        return Ok(());
+    }
+    if !call_event_is_from_its_peer(&runtime, from) {
+        trace_call_in("ringing", &ringing.call_id, "ignored: from someone not on this call");
         return Ok(());
     }
     // «Ringing» only moves a call that is still calling. A contact with several devices rings on each,
@@ -1344,6 +1653,28 @@ fn cancel_other_invited_devices(
     }
 }
 
+/// Whether a call event came from the call's own peer: its account, and its device — one of those
+/// invited, until one answers. The call id alone let any contact with a session end our call or
+/// answer it in the callee's place (blind audit 2026-11-10).
+fn call_event_is_from_its_peer(runtime: &ActiveCallRuntime, from: &omni_crypto::SessionAddress) -> bool {
+    from.remote_account_id == runtime.remote_account_id
+        && (from.remote_device_id == runtime.remote_device_id
+            || runtime.invited_devices.iter().any(|device| device.device_id == from.remote_device_id))
+}
+
+/// The same for whoever handles a call event outside this file (screen control): the current call is
+/// `call_id`, and `from` is its peer.
+pub(crate) fn current_call_event_is_from_its_peer(
+    db_path: &str,
+    call_id: &str,
+    from: &omni_crypto::SessionAddress,
+) -> bool {
+    current_call_runtime(db_path)
+        .ok()
+        .flatten()
+        .is_some_and(|runtime| runtime.summary.call_id == call_id && call_event_is_from_its_peer(&runtime, from))
+}
+
 fn handle_incoming_call_accept(
     storage: &Storage,
     transport: &TransportManager,
@@ -1367,6 +1698,10 @@ fn handle_incoming_call_accept(
         );
         return Ok(());
     }
+    if !call_event_is_from_its_peer(&runtime, &session.session_address) {
+        trace_call_in("accept", &accept.call_id, "ignored: from someone not on this call");
+        return Ok(());
+    }
     trace_call_in("accept", &accept.call_id, "applied: call is active");
     if !runtime.invited_devices.is_empty() {
         // The device that answered is the call's device: its dialog carries the media from now on.
@@ -1381,6 +1716,7 @@ fn handle_incoming_call_accept(
         cancel_other_invited_devices(storage, transport, &runtime, &answering_device, current_unix_ms());
         runtime.invited_devices.clear();
     }
+    install_call_media_keys(&mut runtime, &accept.media_key_share, true)?;
     runtime.summary.state = CallState::Active;
     approve_remote_control(storage, &mut runtime.summary, current_unix_ms());
     runtime.summary.connected_at_unix_ms = Some(accept.accepted_at_unix_ms);
@@ -1397,6 +1733,7 @@ fn handle_incoming_call_decline_or_busy(
     outcome: CallOutcome,
     decline_reason: Option<CallDeclineReason>,
     ended_at_unix_ms: i64,
+    from: &omni_crypto::SessionAddress,
 ) -> OmniResult<()> {
     let db_path = storage.db_path().to_string_lossy().to_string();
     let Some(runtime) = current_call_runtime(&db_path)? else {
@@ -1411,6 +1748,10 @@ fn handle_incoming_call_decline_or_busy(
         );
         return Ok(());
     }
+    if !call_event_is_from_its_peer(&runtime, from) {
+        trace_call_in("end", call_id, "ignored: from someone not on this call");
+        return Ok(());
+    }
     let _ = end_runtime_call(storage, &db_path, outcome, decline_reason, ended_at_unix_ms)?;
     trace_call_in("end", call_id, &format!("applied: {outcome:?}"));
     Ok(())
@@ -1421,19 +1762,21 @@ fn handle_incoming_call_cancel_or_hangup_or_timeout(
     call_id: &str,
     outcome: CallOutcome,
     ended_at_unix_ms: i64,
+    from: &omni_crypto::SessionAddress,
 ) -> OmniResult<()> {
-    handle_incoming_call_decline_or_busy(storage, call_id, outcome, None, ended_at_unix_ms)
+    handle_incoming_call_decline_or_busy(storage, call_id, outcome, None, ended_at_unix_ms, from)
 }
 
 fn handle_incoming_call_reconnect(
     storage: &Storage,
     reconnect: &omni_types::CallReconnectV1,
+    from: &omni_crypto::SessionAddress,
 ) -> OmniResult<()> {
     let db_path = storage.db_path().to_string_lossy().to_string();
     let Some(mut runtime) = current_call_runtime(&db_path)? else {
         return Ok(());
     };
-    if runtime.summary.call_id != reconnect.call_id {
+    if runtime.summary.call_id != reconnect.call_id || !call_event_is_from_its_peer(&runtime, from) {
         return Ok(());
     }
     runtime.summary.state = CallState::Reconnecting;
@@ -1549,7 +1892,12 @@ fn start_unattended_remote_control(
         phase: omni_types::RemoteControlPhase::AwaitingOwner,
         answer_deadline_unix_ms: None,
     });
-    let accept = omni_types::LogicalEventEnvelopeV1::call_accept(invite.call_id.clone(), now_unix_ms);
+    install_call_media_keys(&mut runtime, &invite.media_key_share, false)?;
+    let accept = omni_types::LogicalEventEnvelopeV1::call_accept(
+        invite.call_id.clone(),
+        now_unix_ms,
+        hex::encode(runtime.media.own_share),
+    );
     let delivery = send_call_event_for_session_address(
         storage,
         transport,

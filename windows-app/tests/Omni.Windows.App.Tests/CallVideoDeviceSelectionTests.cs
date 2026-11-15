@@ -139,6 +139,78 @@ public sealed class CallVideoDeviceSelectionTests
         Assert.Equal(CallVideoDeviceSelection.AutoKey, options[0].Key);
     }
 
+    // Today's laptop: both cards encode H.264, but HEVC and AV1 were proven on the NVIDIA only.
+    private static readonly NativeVideoDevice IntelUhd = new(
+        "Intel(R) UHD Graphics", 0x8086, Integrated: true, CanEncodeH264: true, CanDecodeH264: true);
+
+    private static readonly Dictionary<string, uint> VerifiedOnNvidia = new()
+    {
+        ["h264"] = 0x10DE,
+        ["h265"] = 0x10DE,
+        ["av1"] = 0x10DE,
+    };
+
+    [Fact]
+    public void ExplicitIntel_IsMarkedExplicit_AndEncodesOnlyH264()
+    {
+        ResolvedVideoDevice resolved = CallVideoDeviceSelection.Resolve(
+            CallVideoMediaDirection.Encode, IntelUhd.Description, [Nvidia, IntelUhd]);
+
+        Assert.True(resolved.Explicit);
+        Assert.Equal(0x8086u, resolved.VendorId);
+        Assert.Equal(
+            [CallVideoCodecKind.H264],
+            CallVideoDeviceSelection.HardwareEncodeCodecs(resolved.VendorId, canEncodeH264: true, VerifiedOnNvidia));
+        Assert.Equal(
+            [CallVideoCodecKind.H264, CallVideoCodecKind.H265, CallVideoCodecKind.Av1],
+            CallVideoDeviceSelection.HardwareEncodeCodecs(0x10DE, canEncodeH264: true, VerifiedOnNvidia));
+    }
+
+    [Fact]
+    public void Auto_IsNotExplicit_SoNothingNarrowsThePassport()
+    {
+        ResolvedVideoDevice resolved = CallVideoDeviceSelection.Resolve(
+            CallVideoMediaDirection.Encode, CallVideoDeviceSelection.AutoKey, [Nvidia, IntelUhd]);
+
+        Assert.False(resolved.Explicit);
+        Assert.Equal(0x8086u, resolved.VendorId); // energy-first for H.264
+    }
+
+    [Fact]
+    public void BuildOptions_Encode_NamesTheCodecsEachCardEncodes()
+    {
+        IReadOnlyList<CallVideoDeviceOption> options = CallVideoDeviceSelection.BuildOptions(
+            CallVideoMediaDirection.Encode, [Nvidia, IntelUhd], VerifiedOnNvidia);
+
+        Assert.Equal(
+            "NVIDIA GeForce RTX 4060 Laptop GPU · дискретная · H.264, HEVC, AV1",
+            options.Single(option => option.Key == Nvidia.Description).DisplayName);
+        Assert.Equal(
+            "Intel(R) UHD Graphics · встроенная · H.264",
+            options.Single(option => option.Key == IntelUhd.Description).DisplayName);
+    }
+
+    [Fact]
+    public void ExplicitCard_PassportDropsAnotherCardsCodecs()
+    {
+        IReadOnlyList<CallVideoCodecSupport> all =
+        [
+            new CallVideoCodecSupport(CallVideoCodecKind.Av1, CallVideoRtpConstants.Av1PayloadType, true, true, "av1"),
+            new CallVideoCodecSupport(CallVideoCodecKind.H265, CallVideoRtpConstants.H265PayloadType, true, true, "h265"),
+            new CallVideoCodecSupport(CallVideoCodecKind.H264, CallVideoRtpConstants.H264PayloadType, true, true, "h264"),
+        ];
+
+        IReadOnlyList<CallVideoCodecSupport> onIntel = CallVideoCodecFactory.RestrictToDevices(
+            all, encodeSoftwareOnly: false, decodeSoftwareOnly: false, [CallVideoCodecKind.H264]);
+
+        // H.264 stays hardware on the chosen card; HEVC is not encoded at all (receive only); AV1
+        // falls to software, which the core takes only when no hardware path exists (H.264 is one).
+        Assert.Equal(true, onIntel.Single(c => c.Kind == CallVideoCodecKind.H264).EncodeHardware);
+        Assert.Null(onIntel.Single(c => c.Kind == CallVideoCodecKind.H265).EncodeHardware);
+        Assert.Equal(true, onIntel.Single(c => c.Kind == CallVideoCodecKind.H265).DecodeHardware);
+        Assert.Equal(false, onIntel.Single(c => c.Kind == CallVideoCodecKind.Av1).EncodeHardware);
+    }
+
     [Fact]
     public void BuildOptions_Decode_NoDevices_IsAutoAndSoftwareOnly()
     {

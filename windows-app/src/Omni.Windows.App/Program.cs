@@ -7,14 +7,14 @@ namespace Omni.Windows.App
     //
     // WinUI 3 UNPACKAGED resolves Window/Page XAML (`ms-appx:///MainWindow.xaml`) through MRT, whose
     // root resource-map name is derived from the EXECUTABLE's base name. So a renamed exe — e.g. the
-    // "Omni.Windows.App (1).exe" a browser/copy produces — can't find MainWindow.xaml and dies with
+    // "Omni (1).exe" a browser/copy produces — can't find MainWindow.xaml and dies with
     // `XamlParseException: XAML parsing failed` on the first InitializeComponent (confirmed live
     // 2026-07-25). If we were launched under a non-canonical name, re-launch a canonically-named
     // hardlink of ourselves (no byte copy) so the app just works regardless of the file name.
     // See docs/bugs/renamed-exe-xamlparse.md.
     public static class Program
     {
-        private const string CanonicalName = "Omni.Windows.App";
+        private const string CanonicalName = "Omni"; // = AssemblyName in the .csproj
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

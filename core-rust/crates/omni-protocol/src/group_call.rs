@@ -9,8 +9,9 @@
 //     participant builds the SAME tree from the same member list, so each knows
 //     its parent (uplink) and children (fan-out). Media floods the tree — forward
 //     to every tree-neighbour EXCEPT the one it arrived from — so each frame
-//     reaches everyone exactly once (tree ⇒ loop-free). Forwarders are keyless
-//     mesh nodes (they read only routing tags) → E2E holds on every hop.
+//     reaches everyone exactly once (tree ⇒ loop-free). A forwarder routes by the
+//     plaintext tags without decrypting, but it is a participant and holds every
+//     sender's key: the media is end to end against everyone OUTSIDE the call.
 //
 // The tree is a deterministic function of the live participant set, so there is
 // no coordinator and no forwarder-election signal: on join/leave everyone
@@ -233,8 +234,23 @@ const MEDIA_META_VIDEO_FLAG: u8 = 0x80;
 pub const MEDIA_ACTIVITY_MAX: u8 = 0x7F;
 /// How many most-active AUDIO senders a forwarder relays (others dropped). Hear a few people at once.
 pub const ACTIVE_AUDIO_K: usize = 4;
-/// How many most-active senders' VIDEO a forwarder relays (others dropped). See mainly the speaker.
-pub const ACTIVE_VIDEO_K: usize = 1;
+/// How many most-active senders' VIDEO a forwarder relays (others dropped). Four, not one (owner
+/// decision 2026-10-27): with one, every tile but the speaker's froze; four keep a friends-size call
+/// whole and bound the downlink of a bigger one.
+pub const ACTIVE_VIDEO_K: usize = 4;
+
+/// The `media_meta` activity of a microphone level — the smoothed RMS (0..1) the capture reports for
+/// the "speaking" ring. Below [`SILENT_LEVEL`] it is silence (0, not ranked); above, the square root
+/// spreads speech (RMS ~0.02–0.3) over the byte instead of crowding it at the bottom.
+pub fn activity_from_level(level: f32) -> u8 {
+    if !level.is_finite() || level < SILENT_LEVEL {
+        return 0;
+    }
+    ((level.min(1.0).sqrt() * f32::from(MEDIA_ACTIVITY_MAX)).round() as u8).clamp(1, MEDIA_ACTIVITY_MAX)
+}
+
+/// A level under this is not speech: the shell lights its "speaking" ring from 0.02.
+const SILENT_LEVEL: f32 = 0.01;
 
 /// Pack `is_video` + a coarse audio-activity level (clamped to 0..=127) into the cleartext `media_meta`
 /// byte. `activity` is the sender's own current audio level, quantised — 0 means silent/unknown.
@@ -725,17 +741,17 @@ mod group_call_tests {
     }
 
     #[test]
-    fn active_speaker_gating_forwards_top_k_audio_and_only_speaker_video() {
+    fn active_speaker_gating_forwards_the_top_four_of_audio_and_of_video() {
         // Ranked most-active first: a, b, c, d, e.
         let ranked: Vec<String> = ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
         // Audio (K=4): a..d relayed, e dropped.
         assert!(active_speaker_should_forward(false, "a", &ranked));
         assert!(active_speaker_should_forward(false, "d", &ranked));
         assert!(!active_speaker_should_forward(false, "e", &ranked), "5th-loudest audio dropped");
-        // Video (K=1): only the active speaker "a"; everyone else's video dropped.
+        // Video (K=4) the same: the four most active are seen, the fifth's video dropped.
         assert!(active_speaker_should_forward(true, "a", &ranked));
-        assert!(!active_speaker_should_forward(true, "b", &ranked), "non-speaker video dropped");
-        assert!(!active_speaker_should_forward(true, "e", &ranked));
+        assert!(active_speaker_should_forward(true, "d", &ranked), "four tiles stay live");
+        assert!(!active_speaker_should_forward(true, "e", &ranked), "5th-most-active video dropped");
     }
 
     #[test]
@@ -747,12 +763,28 @@ mod group_call_tests {
         // Fewer ACTIVE senders than K → nothing to gate: forward all.
         let few: Vec<String> = vec!["a".into()];
         assert!(active_speaker_should_forward(false, "a", &few)); // audio K=4, len<=4
-        assert!(active_speaker_should_forward(true, "a", &few)); // video K=1, len<=1
+        assert!(active_speaker_should_forward(true, "a", &few)); // video K=4, len<=4
         // But once > K senders are active, a sender NOT among them (silent) is dropped — the gate
         // engaging is the whole point, so this must NOT fail open.
         let ranked: Vec<String> = ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
         assert!(!active_speaker_should_forward(false, "silent", &ranked), "silent audio dropped when 5 loud");
         assert!(!active_speaker_should_forward(true, "silent", &ranked), "silent video dropped when 5 loud");
+    }
+
+    /// The microphone level maps to the activity byte: silence is 0 (not ranked), speech spreads
+    /// over the byte in order, and nothing out of range escapes it.
+    #[test]
+    fn a_microphone_level_maps_to_an_ordered_activity_byte() {
+        assert_eq!(activity_from_level(0.0), 0);
+        assert_eq!(activity_from_level(0.005), 0, "below the speaking ring's threshold is silence");
+        assert_eq!(activity_from_level(f32::NAN), 0);
+        let quiet = activity_from_level(0.02);
+        let loud = activity_from_level(0.3);
+        assert!(quiet > 0 && loud > quiet, "speech is ranked, louder above: {quiet} < {loud}");
+        assert_eq!(activity_from_level(5.0), MEDIA_ACTIVITY_MAX);
+        let (is_video, level) = unpack_media_meta(pack_media_meta(true, loud));
+        assert!(is_video);
+        assert_eq!(level, loud);
     }
 
     // --- Cascade tree ---

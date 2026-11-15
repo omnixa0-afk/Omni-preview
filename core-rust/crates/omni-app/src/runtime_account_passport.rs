@@ -200,13 +200,13 @@ struct AccountRecoveryStateV1 {
 }
 
 fn load_account_recovery(storage: &Storage) -> Option<AccountRecoveryStateV1> {
-    let raw = storage.get_app_meta(ACCOUNT_RECOVERY_META_KEY).ok()??;
+    let raw = storage.get_profile_meta(ACCOUNT_RECOVERY_META_KEY).ok()??;
     serde_json::from_str(&raw).ok()
 }
 
 fn save_account_recovery(storage: &Storage, state: &AccountRecoveryStateV1) {
     if let Ok(raw) = serde_json::to_string(state) {
-        let _ = storage.upsert_app_meta(ACCOUNT_RECOVERY_META_KEY, &raw);
+        let _ = storage.upsert_profile_meta(ACCOUNT_RECOVERY_META_KEY, &raw);
     }
 }
 
@@ -632,7 +632,16 @@ fn handle_incoming_account_passport(
     let from_approved_contact = storage
         .find_contact_by_remote_account_id(&from.remote_account_id)?
         .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved && !contact.is_blocked);
-    if !from_approved_contact {
+    // A holder found by its mark while this device is restored is not approved until the passport
+    // comes; what it hands back — the passport — passes all the same, and nothing else from it.
+    let a_holder_handing_back = matches!(message, omni_types::AccountPassportMessageV1::Blob { .. })
+        && load_account_recovery(storage).is_some_and(|recovery| {
+            account_recovery_active(&recovery, now_unix_ms) && recovery.holders.contains(&from.remote_account_id.0)
+        })
+        && storage
+            .find_contact_by_remote_account_id(&from.remote_account_id)?
+            .is_none_or(|contact| !contact.is_blocked && contact.relationship_state != ContactRelationshipState::Declined);
+    if !from_approved_contact && !a_holder_handing_back {
         omni_app_trace_log("passport/in", &format!("dropped: {} is not an approved contact", from.remote_account_id.0));
         return Ok(());
     }
@@ -820,7 +829,9 @@ fn apply_recovered_passport(
             }
         }
     }
+    removed.extend(drop_holders_the_passport_does_not_name(storage, recovery, now_unix_ms));
     forget_runtime_state_of_removed_contacts(storage, &removed);
+    end_calls_with_contacts_no_longer_approved(storage, None, &passport.contacts);
 
     let mut profile = "kept";
     if let (Some(incoming), Ok(local)) = (&passport.profile, storage.get_local_public_profile_state()) {
@@ -865,6 +876,62 @@ fn apply_recovered_passport(
         }
     }
     format!("contacts={contacts} removed={} failed={failed} profile={profile} groups={groups}", removed.len())
+}
+
+/// A holder found by its mark is taken as an approved contact before the passport is in hand: it
+/// keeps the passport, and a restored device has no other contact to ask. The passport, signed by
+/// the account, then says who the contacts are. A holder it does not name kept only the mark's
+/// placeholder record (version 0) — any holder could post a mark for another account of its own,
+/// and it stayed an approved contact nobody chose (blind audit 2026-11-10). It goes again.
+fn drop_holders_the_passport_does_not_name(
+    storage: &Storage,
+    recovery: &AccountRecoveryStateV1,
+    now_unix_ms: i64,
+) -> Vec<ContactSnapshot> {
+    let mut dropped = Vec::new();
+    for holder in &recovery.holders {
+        let account_id = AccountId(holder.clone());
+        // Named by the passport, it is approved by now; a holder still pending was not named — it
+        // was approved by its mark alone before (maintainers' decision 2026-11-11), and goes.
+        let not_named = storage
+            .find_contact_by_remote_account_id(&account_id)
+            .ok()
+            .flatten()
+            .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Pending);
+        if !not_named {
+            continue;
+        }
+        let removal = omni_storage::ContactSyncRecord {
+            account_id: account_id.clone(),
+            state: omni_storage::ContactSyncState::Removed,
+            state_version: 1,
+            state_writer: String::new(),
+            petname: holder.clone(),
+            petname_version: 0,
+            petname_writer: String::new(),
+            display_name: None,
+            seq: 0,
+        };
+        let forgotten = storage.merge_contact_sync_record(&removal, now_unix_ms).and_then(|_| {
+            match storage.find_contact_by_remote_account_id(&account_id)? {
+                Some(contact) => {
+                    let forgotten = storage.forget_contact(&contact.contact_id, now_unix_ms)?;
+                    storage.delete_session_state_for_remote_account(&account_id)?;
+                    Ok(Some(forgotten))
+                }
+                None => Ok(None),
+            }
+        });
+        match forgotten {
+            Ok(Some(contact)) => {
+                omni_app_trace_log("passport/recover", &format!("holder {holder} not in the passport: dropped"));
+                dropped.push(contact);
+            }
+            Ok(None) => {}
+            Err(error) => omni_app_trace_log("passport/recover", &format!("holder {holder} not dropped: {error}")),
+        }
+    }
+    dropped
 }
 
 // --- restored device -----------------------------------------------------------------------------
@@ -1012,31 +1079,14 @@ fn adopt_passport_holder_mark(
     }
     storage.record_remote_prekey_bundle(&bundle, None, Some(&bundle_v1.device.device_label), now_unix_ms)?;
     let existing = storage.find_contact_by_remote_account_id(&account_id)?;
-    if let Some(contact) = existing.as_ref().filter(|contact| contact.relationship_state == ContactRelationshipState::Pending) {
-        // The holder reached us first and we took it for a stranger's request: it keeps our
-        // passport, so it was our contact.
-        storage.approve_contact(&contact.contact_id, now_unix_ms)?;
-    }
+    // A holder by its mark alone is NOT approved (maintainers' decision 2026-11-11, closing E2): it was,
+    // until the passport came, and a hostile holder had a stranger's account approved for that time.
+    // It stays a pending contact; only the passport's messages pass from it meanwhile
+    // (`handle_incoming_account_passport`), and the passport, naming it, approves it.
     if existing.is_none() {
-        // Its name comes with the passport (or its profile, once a session is up). The record at
-        // version 0 makes sure the passport's entry for it — any version — wins the merge.
-        // The account id itself: the placeholder the shell knows to show the public name over.
+        // A pending contact, ours to ask: the passport, naming it, approves it.
         let placeholder = account_id.0.clone();
-        storage.merge_contact_sync_record(
-            &omni_storage::ContactSyncRecord {
-                account_id: account_id.clone(),
-                state: omni_storage::ContactSyncState::Approved,
-                state_version: 0,
-                state_writer: String::new(),
-                petname: placeholder.clone(),
-                petname_version: 0,
-                petname_writer: String::new(),
-                display_name: None,
-                seq: 0,
-            },
-            now_unix_ms,
-        )?;
-        storage.add_contact(
+        storage.add_outgoing_pending_contact(
             &AddContactInput {
                 petname: placeholder,
                 remote_account_id: Some(account_id.clone()),

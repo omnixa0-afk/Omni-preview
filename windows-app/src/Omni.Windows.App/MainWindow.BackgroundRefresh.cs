@@ -614,7 +614,7 @@ public sealed partial class MainWindow
             {
                 report(new BackgroundRefreshResult(request.Generation)
                 {
-                    Transport = new TransportRefreshPayload(transportDiscovery.TransportSnapshot),
+                    Transport = new TransportRefreshPayload(transportDiscovery.TransportSnapshot, ReadMeshConnectionState()),
                     QueueDiagnostics = new QueueDiagnosticsRefreshPayload(
                         transportDiscovery.QueueDiagnosticsSnapshot,
                         request.DialogKey),
@@ -653,6 +653,7 @@ public sealed partial class MainWindow
             : null;
         if (chatHeader is not null)
         {
+            ReadMeshConnectionState();
             report(new BackgroundRefreshResult(request.Generation)
             {
                 ChatHeader = chatHeader,
@@ -670,6 +671,7 @@ public sealed partial class MainWindow
             : null;
         if (chatThreads is not null)
         {
+            ReadMeshConnectionState();
             report(new BackgroundRefreshResult(request.Generation)
             {
                 ChatThreads = chatThreads,
@@ -707,6 +709,7 @@ public sealed partial class MainWindow
             : null;
         if (contacts is not null)
         {
+            ReadMeshConnectionState();
             report(new BackgroundRefreshResult(request.Generation)
             {
                 Contacts = contacts,
@@ -789,6 +792,37 @@ public sealed partial class MainWindow
             return;
         }
 
+        long applyStarted = Stopwatch.GetTimestamp();
+        ApplyBackgroundRefreshParts(result);
+        BridgeCost.Record(ApplyCostName(result), AppTrace.IsEnabled ? applyStarted : 0);
+        double applied = Stopwatch.GetElapsedTime(applyStarted).TotalMilliseconds;
+        if (applied >= 30)
+        {
+            string parts = string.Join('+', new (object? Part, string Name)[]
+            {
+                (result.Lifecycle, "lifecycle"), (result.Footprint, "footprint"), (result.Transport, "transport"),
+                (result.CallInbox, "call"), (result.ChatThreads, "threads"), (result.ChatHeader, "header"),
+                (result.Messages, "messages"), (result.QueueDiagnostics, "queue"), (result.Contacts, "contacts"),
+                (result.SelectedContact, "contact"), (result.PasswordProtection, "password"),
+            }.Where(p => p.Part is not null).Select(p => p.Name));
+            AppTrace.Write("ui/apply", $"{applied:F0}ms {parts}");
+        }
+    }
+
+    private static string ApplyCostName(BackgroundRefreshResult result) =>
+        result.Lifecycle is not null ? "apply:lifecycle"
+        : result.Footprint is not null ? "apply:footprint"
+        : result.Transport is not null ? "apply:transport"
+        : result.CallInbox is not null ? "apply:call"
+        : result.ChatThreads is not null ? "apply:threads"
+        : result.ChatHeader is not null ? "apply:header"
+        : result.Messages is not null ? "apply:messages"
+        : result.QueueDiagnostics is not null ? "apply:queue"
+        : result.Contacts is not null ? "apply:contacts"
+        : "apply:other";
+
+    private void ApplyBackgroundRefreshParts(BackgroundRefreshResult result)
+    {
         if (result.Lifecycle is not null)
         {
             ApplyLifecycleRefreshPayload(result.Lifecycle);
@@ -823,6 +857,8 @@ public sealed partial class MainWindow
                 result.ChatThreads.Projections,
                 refreshQueueDiagnostics: false,
                 groupRows: result.ChatThreads.Groups);
+            // A deletion or a pin from the other side moves this summary and no line of the feed.
+            RefreshMessageActions();
         }
 
         if (result.ChatHeader is not null &&

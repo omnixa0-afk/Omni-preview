@@ -110,6 +110,8 @@ pub fn prepare_photo(source_path: &Path) -> OmniResult<PreparedPhoto> {
             width: sent.width(),
             height: sent.height(),
             preview_jpeg_b64: (preview.len() <= PHOTO_PREVIEW_MAX_BYTES).then(|| B64.encode(&preview)),
+            duration_ms: None,
+            waveform_b64: None,
         },
         jpeg,
     })
@@ -124,14 +126,37 @@ fn jpeg_dimensions(reader: ImageReader<impl std::io::BufRead + std::io::Seek>) -
     reader.into_dimensions().ok()
 }
 
-/// What a received offer may be shown as. `None` = a plain file (the offer itself still stands).
-pub fn accept_received_photo_presentation(
+/// What a received offer may be shown as, whatever it claims to be. `None` = a plain file (the offer
+/// itself still stands).
+pub fn accept_received_presentation(
     presentation: Option<&AttachmentPresentationV1>,
     file_size_bytes: i64,
 ) -> Option<AttachmentPresentationV1> {
     let presentation = presentation?;
     match presentation.kind {
-        AttachmentPresentationKindV1::Photo => {}
+        AttachmentPresentationKindV1::Photo => accept_received_photo_presentation(Some(presentation), file_size_bytes),
+        AttachmentPresentationKindV1::Voice => crate::voice::accept_received_voice_presentation(presentation, file_size_bytes),
+        AttachmentPresentationKindV1::VideoNote => crate::video_note::accept_received_video_note_presentation(presentation, file_size_bytes),
+    }
+}
+
+/// Whether a downloaded file (its plaintext bytes) is what its offer said it is.
+pub fn downloaded_file_matches(bytes: &[u8], presentation: &AttachmentPresentationV1) -> bool {
+    match presentation.kind {
+        AttachmentPresentationKindV1::Photo => downloaded_photo_matches(bytes, presentation),
+        AttachmentPresentationKindV1::Voice => crate::voice::downloaded_voice_matches(bytes, presentation),
+        AttachmentPresentationKindV1::VideoNote => crate::video_note::downloaded_video_note_matches(bytes, presentation),
+    }
+}
+
+/// What a received photo offer may be shown as. `None` = a plain file.
+pub fn accept_received_photo_presentation(
+    presentation: Option<&AttachmentPresentationV1>,
+    file_size_bytes: i64,
+) -> Option<AttachmentPresentationV1> {
+    let presentation = presentation?;
+    if presentation.kind != AttachmentPresentationKindV1::Photo {
+        return None;
     }
     let sides_ok = |w: u32, h: u32, max: u32| w > 0 && h > 0 && w <= max && h <= max;
     if !sides_ok(presentation.width, presentation.height, PHOTO_RECEIVED_MAX_SIDE)
@@ -140,21 +165,27 @@ pub fn accept_received_photo_presentation(
     {
         return None;
     }
-    // The preview must be the small JPEG it claims to be; a bad one is dropped, the photo stays.
-    let preview_jpeg_b64 = presentation.preview_jpeg_b64.as_deref().and_then(|b64| {
-        if b64.len() > PHOTO_PREVIEW_MAX_BYTES * 4 / 3 + 4 {
-            return None;
-        }
-        let bytes = B64.decode(b64).ok()?;
-        let (w, h) = jpeg_dimensions(ImageReader::new(Cursor::new(&bytes)))?;
-        sides_ok(w, h, PHOTO_PREVIEW_MAX_SIDE).then(|| b64.to_string())
-    });
+    // A bad preview is dropped, the photo stays.
+    let preview_jpeg_b64 = accepted_preview_b64(presentation.preview_jpeg_b64.as_deref());
     Some(AttachmentPresentationV1 {
         kind: AttachmentPresentationKindV1::Photo,
         width: presentation.width,
         height: presentation.height,
         preview_jpeg_b64,
+        duration_ms: None,
+        waveform_b64: None,
     })
+}
+
+/// The preview, if it is the small JPEG it claims to be.
+pub(crate) fn accepted_preview_b64(preview: Option<&str>) -> Option<String> {
+    let b64 = preview?;
+    if b64.len() > PHOTO_PREVIEW_MAX_BYTES * 4 / 3 + 4 {
+        return None;
+    }
+    let bytes = B64.decode(b64).ok()?;
+    let (w, h) = jpeg_dimensions(ImageReader::new(Cursor::new(&bytes)))?;
+    (w > 0 && h > 0 && w <= PHOTO_PREVIEW_MAX_SIDE && h <= PHOTO_PREVIEW_MAX_SIDE).then(|| b64.to_string())
 }
 
 /// Whether a downloaded photo (its plaintext bytes — the file may be encrypted at rest) is what its
@@ -198,6 +229,8 @@ mod tests {
             width: 1000,
             height: 800,
             preview_jpeg_b64: None,
+            duration_ms: None,
+            waveform_b64: None,
         };
         // Over the side limit, or a file too big for a photo: a plain file.
         let huge = AttachmentPresentationV1 { width: PHOTO_RECEIVED_MAX_SIDE + 1, ..honest.clone() };

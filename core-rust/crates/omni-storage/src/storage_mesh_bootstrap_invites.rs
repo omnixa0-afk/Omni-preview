@@ -17,6 +17,9 @@ pub struct BootstrapInviteRecord {
     pub nonce_hex: String,
     /// The 20-byte mesh node to dial (importer side); `None` on the inviter side.
     pub inviter_node: Option<[u8; 20]>,
+    /// The inviter's X25519 key for answers to this invite (importer side): our beacon on the invite's
+    /// topic is sealed to it. Public; the inviter re-derives its secret half from the nonce.
+    pub inviter_reply_key: Option<[u8; 32]>,
     /// Absolute UNIX-ms deadline after which the entry is stale (min of the bootstrap window + invite TTL).
     pub expires_at_ms: i64,
 }
@@ -28,15 +31,17 @@ impl Storage {
         &self,
         nonce_hex: &str,
         inviter_node: Option<[u8; 20]>,
+        inviter_reply_key: Option<[u8; 32]>,
         expires_at_ms: i64,
     ) -> OmniResult<()> {
         let node_blob: Option<&[u8]> = inviter_node.as_ref().map(|n| n.as_slice());
+        let key_blob: Option<&[u8]> = inviter_reply_key.as_ref().map(|k| k.as_slice());
         self.connection
             .execute(
-                "INSERT INTO mesh_bootstrap_invites (nonce_hex, inviter_node, expires_at_ms) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(nonce_hex) DO UPDATE SET inviter_node = ?2, expires_at_ms = ?3",
-                params![nonce_hex, node_blob, expires_at_ms],
+                "INSERT INTO mesh_bootstrap_invites (nonce_hex, inviter_node, inviter_reply_key, expires_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(nonce_hex) DO UPDATE SET inviter_node = ?2, inviter_reply_key = ?3, expires_at_ms = ?4",
+                params![nonce_hex, node_blob, key_blob, expires_at_ms],
             )
             .map(|_| ())
             .map_err(map_sqlite_error)
@@ -51,17 +56,19 @@ impl Storage {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT nonce_hex, inviter_node, expires_at_ms FROM mesh_bootstrap_invites \
+                "SELECT nonce_hex, inviter_node, inviter_reply_key, expires_at_ms FROM mesh_bootstrap_invites \
                  WHERE expires_at_ms > ?1 ORDER BY expires_at_ms ASC",
             )
             .map_err(map_sqlite_error)?;
         let rows = statement
             .query_map(params![now_ms], |row| {
                 let node: Option<Vec<u8>> = row.get(1)?;
+                let key: Option<Vec<u8>> = row.get(2)?;
                 Ok(BootstrapInviteRecord {
                     nonce_hex: row.get(0)?,
                     inviter_node: node.and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok()),
-                    expires_at_ms: row.get(2)?,
+                    inviter_reply_key: key.and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()),
+                    expires_at_ms: row.get(3)?,
                 })
             })
             .map_err(map_sqlite_error)?;

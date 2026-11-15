@@ -29,22 +29,77 @@ internal sealed partial class RustBridge
     public IReadOnlyList<NetworkInterfaceSnapshot> GetLocalNetworkInventory()
         => GetCachedNetworkInventory();
 
-    public ChatMessageRecord SendText(string peerSelector, string body)
+    public ChatMessageRecord SendText(string peerSelector, string body, string? replyTo = null)
         => CallJson(
             () => NativeMethods.omni_chat_send_text(
                 handle,
                 JsonSerializer.Serialize(
-                    new SendTextRequest(peerSelector, body),
+                    new SendTextRequest(peerSelector, body, replyTo),
                     OmniJsonSerializerContext.Default.SendTextRequest)),
             OmniJsonSerializerContext.Default.ChatMessageRecord,
             "send_text");
+
+    /// Takes a message away here; `forEveryone` also from the others, if it is ours.
+    public void DeleteMessage(string messageId, bool forEveryone)
+    {
+        const string operation = "message_delete";
+        string payload = CallRaw(
+            () => NativeMethods.omni_message_delete(
+                handle,
+                JsonSerializer.Serialize(
+                    new MessageDeleteRequest(messageId, forEveryone),
+                    OmniJsonSerializerContext.Default.MessageDeleteRequest)),
+            operation);
+        ThrowIfRustError(payload, operation);
+    }
+
+    /// Pins or unpins a message for its whole conversation.
+    public void PinMessage(string messageId, bool pinned)
+    {
+        const string operation = "message_pin";
+        string payload = CallRaw(
+            () => NativeMethods.omni_message_pin(
+                handle,
+                JsonSerializer.Serialize(
+                    new MessagePinRequest(messageId, pinned),
+                    OmniJsonSerializerContext.Default.MessagePinRequest)),
+            operation);
+        ThrowIfRustError(payload, operation);
+    }
+
+    internal MessageActionsView GetMessageActions(string dialogKey)
+        => CallJson(
+            () => NativeMethods.omni_message_actions(
+                handle,
+                JsonSerializer.Serialize(
+                    new MessageActionsRequest(dialogKey),
+                    OmniJsonSerializerContext.Default.MessageActionsRequest)),
+            OmniJsonSerializerContext.Default.MessageActionsView,
+            "message_actions");
+
+    /// Our emoji on a message of any conversation; empty takes it away.
+    public void ReactToMessage(string messageId, string emoji)
+    {
+        const string operation = "message_react";
+        string payload = CallRaw(
+            () => NativeMethods.omni_message_react(
+                handle,
+                JsonSerializer.Serialize(
+                    new MessageReactRequest(messageId, emoji),
+                    OmniJsonSerializerContext.Default.MessageReactRequest)),
+            operation);
+        ThrowIfRustError(payload, operation);
+    }
 
     public ChatMessageRecord SendAttachment(
         string peerSelector,
         string body,
         string sourceFilePath,
         string? displayFileName,
-        bool asPhoto)
+        bool asPhoto,
+        string? replyTo = null,
+        bool asVoice = false,
+        bool asVideoNote = false)
         => CallJson(
             () => NativeMethods.omni_chat_send_attachment(
                 handle,
@@ -58,7 +113,10 @@ internal sealed partial class RustBridge
                         // gone from the app (owner's «free protection only»; it made the user pick
                         // a cipher per file), and from the core since 2026-10-12.
                         "e2ee_media",
-                        asPhoto),
+                        asPhoto,
+                        replyTo,
+                        asVoice,
+                        asVideoNote),
                     OmniJsonSerializerContext.Default.SendAttachmentRequest)),
             OmniJsonSerializerContext.Default.ChatMessageRecord,
             "send_attachment");

@@ -6,7 +6,7 @@
 // notices the flag before any UI comes up, and routes here. The courier bodies live in the helper
 // crates' libs, linked into this DLL, so the file count on disk stays exactly one.
 
-/// Run helper `kind` ("rendezvous" | "dht") with `args_json` (a JSON array of the arguments AFTER
+/// Run helper `kind` ("rendezvous" | "dht" | "git") with `args_json` (a JSON array of the arguments AFTER
 /// the flag, e.g. `["--listen","127.0.0.1:0"]`) and return the process exit code for the caller to
 /// exit with. BLOCKS for the child's lifetime — this thread IS the helper. No `OmniAppHandle`: a
 /// helper holds no keys and never touches the app.

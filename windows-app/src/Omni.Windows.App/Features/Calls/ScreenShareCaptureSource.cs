@@ -160,6 +160,10 @@ internal sealed class ScreenShareCaptureSource : IDisposable
             monitors.Add((monitor, rect));
             return true;
         }, IntPtr.Zero);
+        // Two monitors of one model and size look the same to this match: the first wins, and the
+        // pointer would land on the other screen. Counted, so the call diagnostics say so.
+        SharedMonitor? found = null;
+        LastMatches = 0;
         foreach ((IntPtr handle, NativeRect rect) in monitors)
         {
             GraphicsCaptureItem candidate;
@@ -176,11 +180,33 @@ internal sealed class ScreenShareCaptureSource : IDisposable
                 candidate.Size.Width == item.Size.Width &&
                 candidate.Size.Height == item.Size.Height)
             {
-                return new SharedMonitor(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
+                LastMatches++;
+                found ??= new SharedMonitor(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
             }
         }
 
-        return null;
+        return found;
+    }
+
+    /// How many monitors looked like the picked one at the last <see cref="FindMonitorOf"/> (1 is sure).
+    internal static int LastMatches { get; private set; }
+
+    /// The whole desktop the monitors make, and how many there are: the union of the same rectangles
+    /// <see cref="FindMonitorOf"/> gives the shared one, so the two are in one coordinate space whatever
+    /// the monitors' scaling (GetSystemMetrics was the second source the pointer was mapped with).
+    internal static (SharedMonitor Desktop, int Monitors) VirtualDesktop()
+    {
+        int left = int.MaxValue, top = int.MaxValue, right = int.MinValue, bottom = int.MinValue, count = 0;
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr _, IntPtr _, ref NativeRect rect, IntPtr _) =>
+        {
+            left = Math.Min(left, rect.Left);
+            top = Math.Min(top, rect.Top);
+            right = Math.Max(right, rect.Right);
+            bottom = Math.Max(bottom, rect.Bottom);
+            count++;
+            return true;
+        }, IntPtr.Zero);
+        return count == 0 ? (new SharedMonitor(0, 0, 0, 0), 0) : (new SharedMonitor(left, top, right - left, bottom - top), count);
     }
 
     [StructLayout(LayoutKind.Sequential)]

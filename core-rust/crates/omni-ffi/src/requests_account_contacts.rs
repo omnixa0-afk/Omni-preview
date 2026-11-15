@@ -3,17 +3,8 @@ use omni_protocol::{ContactVerificationPayloadV1, ImportableContactPayloadV1};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct AddContactByIdentifierRequest {
-    pub(crate) account_id: String,
-    pub(crate) petname: String,
-    pub(crate) public_display_name: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct RequestContactByIdentifierRequest {
-    pub(crate) account_id: String,
-    pub(crate) petname: String,
-    pub(crate) public_display_name: Option<String>,
+pub(crate) struct AllowContactCourierRequest {
+    pub(crate) url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -12,6 +12,15 @@ public sealed partial class MainWindow
 {
     private void RenderRemoteAccessSettings()
     {
+        (List<ContactRemoteAccessRecord>? granted, Dictionary<string, string>? names) = ReadRemoteAccess();
+        if (granted is not null && names is not null)
+        {
+            ShowRemoteAccess(granted, names);
+        }
+    }
+
+    private (List<ContactRemoteAccessRecord>? Granted, Dictionary<string, string>? Names) ReadRemoteAccess()
+    {
         List<ContactRemoteAccessRecord> granted;
         Dictionary<string, string> names;
         try
@@ -26,9 +35,14 @@ public sealed partial class MainWindow
         catch (Exception)
         {
             // Profile not ready — leave the last rendered state; the next settings render retries.
-            return;
+            return (null, null);
         }
 
+        return (granted, names);
+    }
+
+    private void ShowRemoteAccess(List<ContactRemoteAccessRecord> granted, Dictionary<string, string> names)
+    {
         SettingsRemoteAccessList.ItemsSource = granted
             .Select(record =>
             {

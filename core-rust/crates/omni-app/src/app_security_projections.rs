@@ -15,6 +15,7 @@ impl OmniApp {
         &self,
         dialog_key_or_selector: impl Into<String>,
     ) -> OmniResult<ChatSecuritySummary> {
+        let _ = self.ensure_runtime_profile_active("get_chat_security_summary")?;
         let dialog_key = resolve_canonical_dialog_key_for_selector(
             &self.storage,
             dialog_key_or_selector.into().trim(),
@@ -80,6 +81,7 @@ impl OmniApp {
         &self,
         message_id: &str,
     ) -> OmniResult<Option<MessageSecurityDetails>> {
+        let _ = self.ensure_runtime_profile_active("get_message_security_details")?;
         self.storage.get_message_security_details(message_id)
     }
 
@@ -87,6 +89,7 @@ impl OmniApp {
         &self,
         message_ids: &[String],
     ) -> OmniResult<Vec<MessageSecurityDetails>> {
+        let _ = self.ensure_runtime_profile_active("get_message_security_details_batch")?;
         self.storage.get_message_security_details_batch(message_ids)
     }
 

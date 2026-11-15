@@ -1,0 +1,24 @@
+[package]
+name = "omni-mcp"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# An agent's way into Omni (docs/decisions/omni-workspace-git.md section 5): an MCP server over stdio
+# that runs the agent's own Omni profile (a headless node with its own folder) and gives the agent
+# tools — read and write the workspace's thread, its tasks, files and code projects, ask its owner.
+# What the agent may do and how much it may talk is held by the core, not by the agent. In a
+# single-file host it is the host re-run with `--run-helper mcp`.
+
+[dependencies]
+omni-app = { path = "../omni-app" }
+omni-types = { path = "../omni-types" }
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "omni-mcp"
+path = "src/main.rs"
+
+[lints]
+workspace = true

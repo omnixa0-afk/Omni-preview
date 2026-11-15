@@ -11,66 +11,6 @@ namespace Omni.Windows.App;
 
 public sealed partial class MainWindow
 {
-    private void OnAddContactByIdentifierClicked(object sender, RoutedEventArgs e)
-    {
-        string accountId = AddContactIdentifierTextBox.Text.Trim();
-        string petname = AddContactPetnameTextBox.Text.Trim();
-        string? publicDisplayName = string.IsNullOrWhiteSpace(AddContactDisplayNameTextBox.Text)
-            ? null
-            : AddContactDisplayNameTextBox.Text.Trim();
-
-        if (string.IsNullOrWhiteSpace(accountId) || string.IsNullOrWhiteSpace(petname))
-        {
-            ContactsStatusTextBlock.Text = "Введите идентификатор профиля и локальное имя.";
-            return;
-        }
-
-        try
-        {
-            ContactSnapshot? existingContact = TryFindExistingContactByRemoteAccountId(accountId);
-            if (existingContact is not null)
-            {
-                ContactSnapshot existingMatch = existingContact;
-                string relationshipState = existingMatch.RelationshipState?.Trim().ToLowerInvariant() ?? "unknown";
-                ContactsStatusTextBlock.Text = relationshipState switch
-                {
-                    "approved" => $"Контакт {existingMatch.Petname} уже в списке контактов.",
-                    "pending" => $"Запрос для {existingMatch.Petname} уже сохранён в списке запросов и ждёт решения.",
-                    "declined" => $"Контакт {existingMatch.Petname} уже отклонён.",
-                    _ => $"Контакт {existingMatch.Petname} уже есть в списке.",
-                };
-                AddContactIdentifierTextBox.Text = string.Empty;
-                AddContactPetnameTextBox.Text = string.Empty;
-                AddContactDisplayNameTextBox.Text = string.Empty;
-                windowState.SelectedContactRevision = null;
-                windowState.SelectedContactId = existingMatch.ContactId;
-                ApplyContactsWorkspaceMode(ContactsWorkspaceMode.Directory);
-                RefreshContactsList(true, existingMatch.ContactId);
-                RefreshSelectedContactCard();
-                SaveUiState();
-                UpdateControlStates();
-                return;
-            }
-
-            ContactSnapshot contact = rustBridge.AddContactByIdentifier(accountId, petname, publicDisplayName);
-            ContactsStatusTextBlock.Text = $"Контакт {contact.Petname} сохранён. Пока нет живой встречи, он отмечен как «Ещё не встречались».";
-            AddContactIdentifierTextBox.Text = string.Empty;
-            AddContactPetnameTextBox.Text = string.Empty;
-            AddContactDisplayNameTextBox.Text = string.Empty;
-            windowState.SelectedContactRevision = null;
-            windowState.SelectedContactId = contact.ContactId;
-            ApplyContactsWorkspaceMode(ContactsWorkspaceMode.Directory);
-            RefreshContactsList(true, contact.ContactId);
-            RefreshSelectedContactCard();
-            SaveUiState();
-            UpdateControlStates();
-        }
-        catch (Exception ex)
-        {
-            ContactsStatusTextBlock.Text = ex.Message;
-        }
-    }
-
     private void OnAddContactFromPayloadClicked(object sender, RoutedEventArgs e)
     {
         string payloadText = AddContactPayloadTextBox.Text.Trim();
@@ -245,7 +185,6 @@ public sealed partial class MainWindow
 
         ContactsFilterMode? mode = tag switch
         {
-            "all" => ContactsFilterMode.All,
             "pending" => ContactsFilterMode.Pending,
             "approved" => ContactsFilterMode.Approved,
             "declined" => ContactsFilterMode.Declined,
@@ -498,6 +437,7 @@ public sealed partial class MainWindow
             CloseButtonText = "Отмена",
             DefaultButton = ContentDialogButton.Close,
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
         try
         {
@@ -551,7 +491,6 @@ public sealed partial class MainWindow
             ContactsSectionRoot.Visibility = Visibility.Collapsed;
             SettingsSectionRoot.Visibility = Visibility.Collapsed;
             DiagnosticsSectionRoot.Visibility = Visibility.Collapsed;
-            SetActionStatus($"Диалог для контакта {target.Title} открыт.");
         }
         catch (Exception ex)
         {

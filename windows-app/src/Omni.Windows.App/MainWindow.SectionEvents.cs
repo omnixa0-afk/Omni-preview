@@ -65,6 +65,12 @@ public sealed partial class MainWindow
         ReconnectContactButton.Click += OnReconnectContactClicked;
         DeleteChatContactButton.Click += OnChatHeaderMenuClicked;
         ChatHeaderGrid.IdentityClicked += (_, _) => OpenCurrentChatContactProfile();
+        if (Content is FrameworkElement windowRoot)
+        {
+            windowRoot.SizeChanged += (_, e) => Features.Shared.VideoNoteSizing.Instance.WindowHeightChanged(e.NewSize.Height);
+        }
+
+        Features.Shared.MessageActions.LinkedAccounts = CurrentlyLinkedAccountIds;
         // Every avatar showing a picture opens it as a photo, wherever it is (AvatarView).
         Features.Shared.AvatarView.PictureRequested += (path, title) => OpenAvatarViewer(path, title);
         ChatContactInfoCloseButton.Click += (_, _) => CloseChatContactInfo();
@@ -87,8 +93,16 @@ public sealed partial class MainWindow
         MessagesHostBorder.DragOver += OnChatMessagesDragOver;
         MessagesHostBorder.DragLeave += OnChatMessagesDragLeave;
         MessagesHostBorder.Drop += OnChatMessagesDrop;
+        WireDragDrop();
         ChatComposerBorder.DraftRemoveRequested += (_, _) => OnRemoveDraftAttachmentClicked(ChatComposerBorder, new RoutedEventArgs());
         ChatComposerBorder.DraftAsPhotoChanged += (_, asPhoto) => pendingAttachmentAsPhoto = asPhoto;
+        ChatComposerBorder.VoiceRecorded += OnChatVoiceRecorded;
+        ChatComposerBorder.VideoNoteRecorded += OnChatVideoNoteRecorded;
+        Features.Shared.VideoNoteRecorder.CameraId = () => callVideoService.PreferredCameraId;
+        WireRecordKindPreference();
+        ChatComposerBorder.VoiceFailed += (_, why) => SetActionStatus(why);
+        Features.Shared.VoiceRecorder.CallIsOn = () => currentCallInboxSnapshot?.CurrentCall is { } call && Presentation.CallOverlayPresenter.IsLiveCallState(call);
+        Features.Shared.VoiceRecorder.MicrophoneId = () => callVideoService.PreferredMicrophoneId;
         ChatsSectionHost.AttachmentPhotoClicked += OnAttachmentPhotoClicked;
         ChatsSectionHost.AttachmentPhotoSaveClicked += (sender, _) =>
         {
@@ -110,6 +124,15 @@ public sealed partial class MainWindow
         RemotePrekeyBundleTextBox.TextChanged += OnRemotePrekeyBundleTextChanged;
         ImportRemotePrekeyBundleButton.Click += OnImportRemotePrekeyBundleClicked;
         ChatsSectionHost.AttachmentCardClicked += OnAttachmentCardClicked;
+        ChatsSectionHost.MessageReplyRequested += OnMessageReplyRequested;
+        ChatsSectionHost.MessageQuoteOpened += OnMessageQuoteOpened;
+        ChatsSectionHost.MessageReactionChosen += OnMessageReactionChosen;
+        ChatsSectionHost.MessagePinRequested += OnMessagePinRequested;
+        ChatsSectionHost.MessageForwardRequested += OnMessageForwardRequested;
+        ChatsSectionHost.MessageSelectRequested += OnMessageSelectRequested;
+        ChatsSectionHost.MessageSelectionToggled += OnMessageSelectionToggled;
+        ChatsSectionHost.MessageDeleteRequested += OnMessageDeleteRequested;
+        HookChatMessageActions();
         ChatsSectionHost.BackToListRequested += OnChatBackToListRequested;
         WireGroupConversation();
     }
@@ -129,7 +152,6 @@ public sealed partial class MainWindow
     private void WireContactsSectionEvents()
     {
         ContactsAddToggleButton.Click += OnContactsAddToggleClicked;
-        ContactsFilterAllButton.Click += OnContactsFilterModeClicked;
         ContactsFilterPendingButton.Click += OnContactsFilterModeClicked;
         ContactsFilterApprovedButton.Click += OnContactsFilterModeClicked;
         ContactsFilterDeclinedButton.Click += OnContactsFilterModeClicked;
@@ -142,7 +164,9 @@ public sealed partial class MainWindow
         CopyReachTokenButton.Click += OnCopyReachTokenClicked;
         QuickAddContactPetnameTextBox.TextChanged += OnMessageInputTextChanged;
         QuickAddContactButton.Click += OnQuickAddContactClicked;
-        AddContactByIdentifierButton.Click += OnAddContactByIdentifierClicked;
+        SelectedContactAllowCourierButton.Click += OnAllowContactCourierClicked;
+        AddContactPayloadTextBox.TextChanged += OnMessageInputTextChanged;
+        AddContactPetnameTextBox.TextChanged += OnMessageInputTextChanged;
         AddContactFromPayloadButton.Click += OnAddContactFromPayloadClicked;
         AddByOmniIdButton.Click += OnAddByOmniIdClicked;
         FindPeopleMoreButton.Click += OnFindPeopleMoreClicked;
@@ -193,6 +217,7 @@ public sealed partial class MainWindow
         SettingsHideAllRevokedDevicesButton.Click += OnHideAllRevokedDevicesClicked;
         SettingsSectionHost.HideRevokedDeviceRequested += OnHideRevokedDeviceRequested;
         SettingsRunInBackgroundToggle.Toggled += OnRunInBackgroundToggled;
+        SettingsTraceLogToggle.Toggled += OnTraceLogToggled;
         SettingsSetPasswordButton.Click += OnSettingsSetPasswordClicked;
         SettingsChangePasswordButton.Click += OnSettingsChangePasswordClicked;
         SettingsRemovePasswordButton.Click += OnSettingsRemovePasswordClicked;
@@ -205,5 +230,6 @@ public sealed partial class MainWindow
     {
         DiagnosticsOpenIsolatedWindowButton.Click += OnOpenIsolatedWindowClicked;
         DiagnosticsPingButton.Click += OnPingClicked;
+        WireHelpPage();
     }
 }

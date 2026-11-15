@@ -581,37 +581,11 @@ fn contacts_get_screen_snapshot_impl(handle: *mut OmniAppHandle) -> *mut c_char 
     )
 }
 
-fn contacts_add_by_identifier_impl(
-    handle: *mut OmniAppHandle,
-    request_json: *const c_char,
-) -> *mut c_char {
+fn contacts_allow_courier_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
     let result = (|| -> OmniResult<_> {
-        let request: AddContactByIdentifierRequest =
-            parse_json_request(request_json, "add_contact_by_identifier request")?;
-        require_handle(handle)?.inner.add_contact_by_identifier(
-            request.account_id,
-            request.petname,
-            request.public_display_name,
-        )
+        let request: AllowContactCourierRequest = parse_json_request(request_json, "allow_contact_courier request")?;
+        require_handle(handle)?.inner.allow_contact_courier(&request.url)
     })();
-
-    to_result_payload(result)
-}
-
-fn contacts_request_by_identifier_impl(
-    handle: *mut OmniAppHandle,
-    request_json: *const c_char,
-) -> *mut c_char {
-    let result = (|| -> OmniResult<_> {
-        let request: RequestContactByIdentifierRequest =
-            parse_json_request(request_json, "request_contact_by_identifier request")?;
-        require_handle(handle)?.inner.request_contact_by_identifier(
-            request.account_id,
-            request.petname,
-            request.public_display_name,
-        )
-    })();
-
     to_result_payload(result)
 }
 

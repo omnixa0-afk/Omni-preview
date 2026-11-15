@@ -26,6 +26,20 @@ fn groups_list_members_impl(
     to_result_payload(result)
 }
 
+/// What leaving the group takes from this computer (its projects' history; those we alone keep).
+fn groups_leave_notice_impl(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: GroupIdRequest = parse_json_request(request_json, "group leave notice request")?;
+        require_handle(handle)?
+            .inner
+            .workspace_leave_notice(&request.group_id)
+    })();
+    to_result_payload(result)
+}
+
 fn groups_send_text_impl(
     handle: *mut OmniAppHandle,
     request_json: *const c_char,
@@ -35,7 +49,7 @@ fn groups_send_text_impl(
             parse_json_request(request_json, "send_group_text request")?;
         require_handle(handle)?
             .inner
-            .send_group_text(&request.group_id, &request.body)
+            .send_group_line(&request.group_id, &request.body, request.reply_to.as_deref(), &request.mentions.unwrap_or_default())
     })();
     to_result_payload(result)
 }
@@ -53,6 +67,14 @@ fn groups_send_attachment_impl(
             &request.source_file_path,
             request.display_file_name.as_deref(),
             request.as_photo,
+            if request.as_voice {
+                Some(omni_types::AttachmentPresentationKindV1::Voice)
+            } else if request.as_video_note {
+                Some(omni_types::AttachmentPresentationKindV1::VideoNote)
+            } else {
+                None
+            },
+            request.reply_to.as_deref(),
         )
     })();
     to_result_payload(result)
@@ -124,6 +146,18 @@ fn groups_set_call_media_state_impl(
             request.camera_off,
             request.screen_sharing,
         )
+    })();
+    to_result_payload(result)
+}
+
+fn groups_set_call_audio_level_impl(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: SetGroupCallAudioLevelRequest =
+            parse_json_request(request_json, "set_group_call_audio_level request")?;
+        require_handle(handle)?.inner.set_group_call_audio_level(&request.group_id, request.level)
     })();
     to_result_payload(result)
 }

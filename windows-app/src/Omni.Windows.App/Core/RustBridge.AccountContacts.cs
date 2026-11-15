@@ -72,25 +72,19 @@ internal sealed partial class RustBridge
             OmniJsonSerializerContext.Default.ContactsScreenSnapshot,
             "contacts_get_screen_snapshot");
 
-    public ContactSnapshot AddContactByIdentifier(string accountId, string petname, string? publicDisplayName = null)
-        => CallJson(
-            () => NativeMethods.omni_contacts_add_by_identifier(
+    // Meet contacts through a server one of their devices named — the user's yes on the contact card (V-13).
+    public void AllowContactCourier(string url)
+    {
+        const string operation = "contacts_allow_courier";
+        string payload = CallRaw(
+            () => NativeMethods.omni_contacts_allow_courier(
                 handle,
                 JsonSerializer.Serialize(
-                    new AddContactByIdentifierRequest(accountId, petname, publicDisplayName),
-                    OmniJsonSerializerContext.Default.AddContactByIdentifierRequest)),
-            OmniJsonSerializerContext.Default.ContactSnapshot,
-            "contacts_add_by_identifier");
-
-    public ContactSnapshot RequestContactByIdentifier(string accountId, string petname, string? publicDisplayName = null)
-        => CallJson(
-            () => NativeMethods.omni_contacts_request_by_identifier(
-                handle,
-                JsonSerializer.Serialize(
-                    new RequestContactByIdentifierRequest(accountId, petname, publicDisplayName),
-                    OmniJsonSerializerContext.Default.RequestContactByIdentifierRequest)),
-            OmniJsonSerializerContext.Default.ContactSnapshot,
-            "contacts_request_by_identifier");
+                    new AllowContactCourierRequest(url),
+                    OmniJsonSerializerContext.Default.AllowContactCourierRequest)),
+            operation);
+        ThrowIfRustError(payload, operation);
+    }
 
     public ContactSnapshot AddContactFromPayload(ImportableContactPayloadV1 payload, string petname)
         => CallJson(

@@ -70,6 +70,7 @@ impl OmniApp {
         &self,
         dialog_key_or_selector: impl Into<String>,
     ) -> OmniResult<Option<ContactCardSnapshot>> {
+        let _ = self.ensure_runtime_profile_active("resolve_contact_for_dialog")?;
         let dialog_key = resolve_canonical_dialog_key_for_selector(
             &self.storage,
             dialog_key_or_selector.into().trim(),
@@ -81,6 +82,7 @@ impl OmniApp {
         &self,
         dialog_key_or_selector: impl Into<String>,
     ) -> OmniResult<ChatHeaderContactSummary> {
+        let _ = self.ensure_runtime_profile_active("get_chat_header_contact_summary")?;
         let selector = dialog_key_or_selector.into();
         let dialog_key = resolve_canonical_dialog_key_for_selector(&self.storage, selector.trim())?;
         let contact_card = self.storage.resolve_contact_card_for_dialog(&dialog_key)?;
@@ -137,6 +139,17 @@ impl OmniApp {
                         omni_storage::ChatHistoryCheck::Incomplete => Some("история восстановлена не полностью"),
                         omni_storage::ChatHistoryCheck::Mismatch => Some("история не сходится с сохранённой"),
                     });
+                // A message held until the contact's revocations are read (up to 15 s after a start,
+                // longer with no courier answering) says so, rather than looking stuck (owner's
+                // decision 2026-11-11).
+                let chat_key = self.storage.chat_dialog_key_for(&dialog_key).unwrap_or_else(|_| dialog_key.clone());
+                let waiting = self.storage.outbound_queue_snapshot().is_ok_and(|queue| {
+                    queue.items.iter().any(|item| {
+                        (item.dialog_key == chat_key || item.dialog_key == dialog_key)
+                            && item.last_failure_message.as_deref() == Some(crate::WAITING_FOR_REVOCATIONS)
+                    })
+                });
+                let note = if waiting { Some("проверяем устройства собеседника…") } else { note };
                 match note {
                     Some(note) if base.is_empty() => note.to_string(),
                     Some(note) => format!("{base} • {note}"),
@@ -171,8 +184,13 @@ impl OmniApp {
         &self,
         dialog_key_or_selector: impl Into<String>,
     ) -> OmniResult<ChatHeaderScreenSnapshot> {
+        let _ = self.ensure_runtime_profile_active("get_chat_header_screen_snapshot")?;
+        // Each part timed: the whole read held a chat's opening for ~350 ms and nothing said which part.
+        let started = std::time::Instant::now();
         let header_summary = self.get_chat_header_contact_summary(dialog_key_or_selector.into())?;
+        let header_ms = started.elapsed().as_millis();
         let security_summary = self.get_chat_security_summary(&header_summary.dialog_key)?;
+        let security_ms = started.elapsed().as_millis() - header_ms;
         let session_summary =
             build_chat_session_summary(
                 &self.storage,
@@ -180,8 +198,15 @@ impl OmniApp {
                 &header_summary.dialog_key,
                 self.peer_link_facts_for_dialog(&header_summary.dialog_key),
             )?;
-        let call_summary =
-            current_or_persisted_call_summary_for_dialog(&self.storage, &header_summary.dialog_key)?;
+        let session_ms = started.elapsed().as_millis() - header_ms - security_ms;
+        let call_summary = self.chat_header_call_summary(&header_summary.dialog_key)?;
+        let total_ms = started.elapsed().as_millis();
+        if total_ms >= 100 {
+            crate::omni_app_trace_log(
+                "chat/header-slow",
+                &format!("total={total_ms}ms header={header_ms} security={security_ms} session={session_ms} call={}", total_ms - header_ms - security_ms - session_ms),
+            );
+        }
 
         Ok(ChatHeaderScreenSnapshot {
             header_summary,

@@ -33,6 +33,10 @@ pub(crate) fn peer_key(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Redials a punched tunnel gets before it gives up. A redial reaches the peer only while its pinhole
+/// lasts; a few seconds of backoff and a second try cover a blip, anything longer is a new punch's job.
+const PUNCHED_TUNNEL_GIVE_UP_AFTER_FAILURES: u32 = 2;
+
 /// A per-peer door tunnel currently carrying that peer's packets (a `TcpQuicSocket` to the peer's
 /// front-door bridge). Present in [`MuxRouter::doors`] iff the peer is routed over its door.
 #[derive(Debug)]
@@ -60,7 +64,7 @@ pub struct MuxRouter {
 }
 
 impl MuxRouter {
-    /// Wrap a UDP base socket (already `quinn::Runtime::wrap_udp_socket`-ed, possibly STUN-wrapped).
+    /// Wrap a UDP base socket (already `quinn::Runtime::wrap_udp_socket`-ed, under the STUN wrapper).
     pub fn new(udp: Arc<dyn AsyncUdpSocket>) -> io::Result<Arc<Self>> {
         let local = udp.local_addr()?;
         Ok(Arc::new(Self {
@@ -116,6 +120,32 @@ impl MuxRouter {
         )
         .await?;
         self.doors.lock().insert(peer_key(peer_quic), DoorTunnel { tcp, door: door_tcp });
+        if let Some(waker) = self.recv_waker.lock().take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    /// Route `peer` over a TCP connection already made to it by the TCP hole punch (from our door's
+    /// `door_port` to its punch address, which is also how quinn addresses it). Replaces whatever
+    /// tunnel `peer` had. The tunnel redials from the same port and gives up after a couple of
+    /// failures: past the peer's pinhole nothing gets through, and the next punch makes a new one.
+    /// See docs/decisions/tcp-hole-punch.md.
+    pub fn route_over_punched(
+        &self,
+        peer: SocketAddr,
+        stream: tokio::net::TcpStream,
+        sni: &str,
+        door_port: u16,
+    ) -> io::Result<()> {
+        let tcp = TcpQuicSocket::over_punched_stream(
+            peer,
+            stream,
+            sni,
+            crate::tcp_transport::TcpReconnectPolicy::GiveUpAfter(PUNCHED_TUNNEL_GIVE_UP_AFTER_FAILURES),
+            door_port,
+        )?;
+        self.doors.lock().insert(peer_key(peer), DoorTunnel { tcp, door: peer });
         if let Some(waker) = self.recv_waker.lock().take() {
             waker.wake();
         }
@@ -200,8 +230,7 @@ impl AsyncUdpSocket for MuxRouter {
     // packet), pinning an attachment transfer at ~265 Mbit/s while plain scp did ~695 Mbit/s over the
     // same link. Neither congestion control (cwnd 162 MB, loss 0) nor flow-control windows were
     // limiting: the cost was one send syscall per packet. Delegating restores batching on the UDP
-    // base, and naturally still reports 1 when the base is the STUN-wrapped socket (which genuinely
-    // is per-datagram). Door tunnels are handled in `try_send`, which splits a batch back apart.
+    // base. Door tunnels are handled in `try_send`, which splits a batch back apart.
     fn max_transmit_segments(&self) -> usize {
         self.udp.max_transmit_segments()
     }

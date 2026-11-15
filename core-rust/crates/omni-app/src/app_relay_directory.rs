@@ -449,7 +449,8 @@ fn read_mainline_shelves(mainline: &dyn MainlineShelves, now_ms: u64) -> (Vec<St
     for (_, dht_key) in relay_read_topics(RelayShelfKind::Mainline, now_ms) {
         if let Some(found) = mainline.peers(&mainline_info_hash(&dht_key)) {
             reached = true;
-            for addr in found {
+            // A shelf is anyone's to write: an address into our own network or host is not dialed (V-22).
+            for addr in found.into_iter().filter(|addr| addr.port() != 0 && omni_rendezvous::is_public_ip(addr.ip())) {
                 if !addresses.contains(&addr) {
                     addresses.push(addr);
                 }
@@ -735,6 +736,23 @@ mod tests {
         assert_eq!(found.relays.len(), 1, "only the honest one: {:?}", found.relays);
         assert_eq!(found.relays[0].node_id, hex::encode(node_of(honest_key)));
         assert_eq!(found.relays[0].found_on, ["dht"]);
+    }
+
+    /// V-22: an address on a Mainline shelf that points into the reader's own network — a private
+    /// IPv4, or an IPv6 form of one — is never dialed, even with a card that would check out.
+    #[test]
+    fn a_mainline_shelf_address_into_the_local_network_is_not_dialed() {
+        let shelves = Shelves::default();
+        let (_, inner_key) = key(7);
+        let shelf = mainline_info_hash(&relay_publish_topic(RelayShelfKind::Mainline, &inner_key, NOW).1);
+        for at in ["192.168.1.1:4433", "[::ffff:10.0.0.1]:4433", "127.0.0.1:4433", "[2002:c0a8:101::1]:4433"] {
+            let at: std::net::SocketAddr = at.parse().unwrap();
+            shelves.announced.lock().unwrap().entry(shelf).or_default().push(at);
+            shelves.answers.lock().unwrap().insert(at, (node_of(inner_key), relay(7, NOW - DAY_MS, NOW, RelayLoad::Free).to_wire()));
+        }
+        let mut sightings = HashMap::new();
+        let found = search_public_relays_via(&Courier::default(), Some(&shelves), None, &mut sightings, NOW);
+        assert!(found.relays.is_empty(), "nothing dialed into the LAN: {:?}", found.relays);
     }
 
     /// The plan's «dht» block announces the relay's UDP port on its Mainline shelf.

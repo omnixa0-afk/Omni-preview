@@ -7,22 +7,30 @@
 //! clients. Modes:
 //!   * default — stdin/stdout (the Phase 1 harness path, single-threaded);
 //!   * `--listen <endpoint>` — a daemon. `<endpoint>` is a Windows named pipe (`\\.\pipe\…`,
-//!     OS-ACL secured) or `host:port` (localhost TCP). The `OmniApp` + its mesh persist across
+//!     OS-ACL secured) or `host:port` (TCP). The `OmniApp` + its mesh persist across
 //!     client connections; each connection is served on its own thread. `shutdown` stops the
-//!     daemon (snapshot + exit); `quit` ends one connection.
+//!     daemon (snapshot + exit); `quit` ends one connection. TCP takes a token (V-11): from
+//!     `OMNI_DAEMON_TOKEN`, else a random one, written to `<app-dir>/daemon.token`; it binds
+//!     loopback only unless `--allow-remote` is given (a stand driven from another host).
+//!     `send-file` / `recv-file` read and write only inside `--files-dir` (default
+//!     `<app-dir>/files`; V-11).
 //!   * `--connect[-framed] <endpoint> <command>` / `--connect-framed-watch <endpoint>` — clients.
+//!     Over TCP they send `auth <token>` first: the token from `OMNI_DAEMON_TOKEN`, else from
+//!     `<app-dir>/daemon.token` when `--app-dir` comes before `--connect`.
 //!
 //! It drives the same core the WinUI shell drives, but scriptably and with explicit topology
 //! control (`mesh-start` skips auto-connect; `dial` builds links by hand). It is also the seed of
 //! a P3 volunteer relay node. See docs/decisions/headless-omni-node.md +
 //! docs/decisions/daemon-ipc-phase2.md + docs/decisions/embedded-daemon-in-shell.md.
 
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 use omni_app::{AppInitRequest, OmniApp};
 use omni_daemon::{frame, AppAccess, Subscribers};
+
+mod client;
+use client::Client;
 
 /// Adapts an `OmniApp` this process OWNS to the daemon lib's `AsOmniApp`.
 struct OwnedApp(OmniApp);
@@ -45,11 +53,22 @@ fn main() {
     let mut connect_cmd = String::new();
     let mut connect_framed = false;
     let mut connect_watch = false;
+    let mut allow_remote = false;
+    let mut files_dir: Option<String> = None;
+    let mut restore: Option<(String, String)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--app-dir" => app_dir = args.next().unwrap_or_default(),
             "--listen" => listen = args.next(),
+            "--allow-remote" => allow_remote = true,
+            "--files-dir" => files_dir = args.next(),
+            // `--restore-backup <backup> <phrase-file>` — before opening, put the profile back from a
+            // backup, the way the shell's restore does (inspection by the phrase, then import). For a
+            // stand checking what a restored device does.
+            "--restore-backup" => {
+                restore = args.next().zip(args.next());
+            }
             // `--connect` uses the line protocol; `--connect-framed` does the `frame`
             // handshake then one length-prefixed JSON request (proves the framed path).
             "--connect" | "--connect-framed" => {
@@ -73,18 +92,21 @@ fn main() {
 
     // Thin client: connect to a daemon, send one command, print the response, exit.
     if let Some(endpoint) = connect {
+        let client = Client { endpoint, app_dir };
         let code = if connect_watch {
-            run_client_framed_watch(&endpoint)
+            run_client_framed_watch(&client)
         } else if connect_framed {
-            run_client_framed(&endpoint, &connect_cmd)
+            run_client_framed(&client, &connect_cmd)
         } else {
-            run_client(&endpoint, &connect_cmd)
+            run_client(&client, &connect_cmd)
         };
         std::process::exit(code);
     }
 
     if app_dir.is_empty() {
-        eprintln!("usage: omni-node --app-dir <dir> [--listen <endpoint>]  |  --connect <endpoint> <command>");
+        eprintln!(
+            "usage: omni-node --app-dir <dir> [--files-dir <dir>] [--restore-backup <backup> <phrase-file>] [--listen <endpoint> [--allow-remote]]  |  [--app-dir <dir>] --connect <endpoint> <command>"
+        );
         std::process::exit(2);
     }
     // `--app-dir` is a directory (matching the WinUI shell); the DB lives in it as
@@ -94,6 +116,28 @@ fn main() {
         std::process::exit(1);
     }
     let db_path = format!("{}\\omni.db", app_dir.trim_end_matches(['\\', '/']));
+    let files_dir = files_dir.unwrap_or_else(|| format!("{}\\files", app_dir.trim_end_matches(['\\', '/'])));
+    if let Err(error) = omni_daemon::set_files_root(std::path::Path::new(&files_dir)) {
+        eprintln!("cannot use the files dir {files_dir}: {error}");
+        std::process::exit(1);
+    }
+
+    if let Some((backup, phrase_file)) = restore {
+        let restored = std::fs::read_to_string(&phrase_file)
+            .map_err(|error| format!("cannot read {phrase_file}: {error}"))
+            .and_then(|phrase| {
+                OmniApp::inspect_account_backup_manifest(&backup, phrase.trim()).map_err(|error| error.to_string())
+            })
+            .and_then(|inspection| {
+                OmniApp::import_database_backup_bundle(&db_path, &backup, &inspection.inspection_token)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = restored {
+            eprintln!("restore from {backup} failed: {error}");
+            std::process::exit(1);
+        }
+        eprintln!("restored from {backup}");
+    }
 
     let app = match OmniApp::init(AppInitRequest { db_path }) {
         Ok(app) => app,
@@ -114,8 +158,19 @@ fn main() {
                 shutdown_app.0.stop_mesh();
                 std::process::exit(0);
             });
+            let tcp = if is_pipe(&endpoint) {
+                None
+            } else {
+                match omni_daemon::TcpPolicy::for_app_dir(std::path::Path::new(&app_dir), allow_remote) {
+                    Ok(policy) => Some(policy),
+                    Err(error) => {
+                        eprintln!("cannot write the daemon token in {app_dir}: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            };
             eprintln!("omni-node listening on {endpoint}");
-            if let Err(error) = omni_daemon::serve_endpoint(&endpoint, app, on_shutdown) {
+            if let Err(error) = omni_daemon::serve_endpoint(&endpoint, app, on_shutdown, tcp) {
                 eprintln!("cannot listen on {endpoint}: {error}");
                 std::process::exit(1);
             }
@@ -131,23 +186,21 @@ fn main() {
     }
 }
 
-/// Connect to a daemon endpoint and return split read/write halves, so the client functions
-/// are transport-agnostic (mirrors the server-side `IpcListener`): a Windows pipe path
-/// (`\\.\pipe\…`) uses the named-pipe transport, anything else is localhost TCP.
-fn connect_endpoint(endpoint: &str) -> io::Result<(Box<dyn BufRead + Send>, Box<dyn Write + Send>)> {
+fn is_pipe(endpoint: &str) -> bool {
     #[cfg(windows)]
-    if omni_daemon::is_pipe_endpoint(endpoint) {
-        return omni_daemon::pipe::connect(endpoint);
+    return omni_daemon::is_pipe_endpoint(endpoint);
+    #[cfg(not(windows))]
+    {
+        let _ = endpoint;
+        false
     }
-    let stream = TcpStream::connect(endpoint)?;
-    let read_half = stream.try_clone()?;
-    Ok((Box::new(BufReader::new(read_half)), Box::new(stream)))
 }
 
 /// Thin client: connect, send one command line, print the response, return an exit
 /// code (1 if the response is an `ERR`, else 0).
-fn run_client(endpoint: &str, command: &str) -> i32 {
-    let (mut reader, mut writer) = match connect_endpoint(endpoint) {
+fn run_client(client: &Client, command: &str) -> i32 {
+    let endpoint = &client.endpoint;
+    let (mut reader, mut writer) = match client.connect() {
         Ok(halves) => halves,
         Err(error) => {
             eprintln!("connect {endpoint}: {error}");
@@ -177,8 +230,9 @@ fn run_client(endpoint: &str, command: &str) -> i32 {
 /// length-prefixed JSON request (id 1), print the response frame's `text`, and return an exit
 /// code (1 on `ERR`). Proves the framed path end-to-end without juggling binary frames in a
 /// shell; the line client (`run_client`) stays the default. See omni_daemon::frame.
-fn run_client_framed(endpoint: &str, command: &str) -> i32 {
-    let (mut reader, mut writer) = match connect_endpoint(endpoint) {
+fn run_client_framed(client: &Client, command: &str) -> i32 {
+    let endpoint = &client.endpoint;
+    let (mut reader, mut writer) = match client.connect() {
         Ok(halves) => halves,
         Err(error) => {
             eprintln!("connect {endpoint}: {error}");
@@ -224,8 +278,9 @@ fn run_client_framed(endpoint: &str, command: &str) -> i32 {
 /// handshake, send a `watch` request (id 1), then print every received frame's raw JSON —
 /// the `watch` ack response first, then pushed event frames as they arrive. Long-lived
 /// (loops until EOF); the caller terminates it. See run_client_framed / omni_daemon::frame.
-fn run_client_framed_watch(endpoint: &str) -> i32 {
-    let (mut reader, mut writer) = match connect_endpoint(endpoint) {
+fn run_client_framed_watch(client: &Client) -> i32 {
+    let endpoint = &client.endpoint;
+    let (mut reader, mut writer) = match client.connect() {
         Ok(halves) => halves,
         Err(error) => {
             eprintln!("connect {endpoint}: {error}");

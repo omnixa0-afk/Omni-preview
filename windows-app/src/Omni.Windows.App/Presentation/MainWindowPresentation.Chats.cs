@@ -360,6 +360,54 @@ internal static partial class MainWindowPresentation
     private static readonly string[] PhotoExtensions = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"];
     internal const long PhotoSourceMaxBytes = 64L * 1024 * 1024;
 
+    /// «1:07», «12:30».
+    internal static string FormatVoiceTime(int milliseconds)
+    {
+        int seconds = Math.Max(0, milliseconds) / 1000;
+        return $"{seconds / 60}:{seconds % 60:00}";
+    }
+
+    /// The outline a voice message came with; a broken one draws evenly, like a missing one.
+    internal static byte[] DecodeVoiceWaveform(string? base64)
+    {
+        if (string.IsNullOrEmpty(base64))
+        {
+            return [];
+        }
+
+        try
+        {
+            return Convert.FromBase64String(base64);
+        }
+        catch (FormatException)
+        {
+            return [];
+        }
+    }
+
+    private const float QuietestVoiceLevel = 0.02f;
+
+    /// Levels sampled while recording into the outline's bars: the loudest of each stretch, the whole
+    /// scaled so the loudest bar is full (a quiet voice still draws a shape).
+    internal static byte[] BuildVoiceWaveform(IReadOnlyList<float> levels, int bars)
+    {
+        if (levels.Count == 0 || bars <= 0)
+        {
+            return [];
+        }
+
+        float[] peaks = new float[Math.Min(bars, levels.Count)];
+        for (int i = 0; i < levels.Count; i++)
+        {
+            int bar = (int)((long)i * peaks.Length / levels.Count);
+            peaks[bar] = Math.Max(peaks[bar], levels[i]);
+        }
+
+        // The floor: a recording of silence or room hum draws low, not as loud as speech.
+        float scale = Math.Max(peaks.Max(), QuietestVoiceLevel);
+        return peaks.Select(peak => (byte)Math.Clamp((int)(255 * Math.Sqrt(peak / scale)), 0, 255)).ToArray();
+    }
+
     internal static bool CanSendAsPhoto(string? fileName, long fileSizeBytes)
         => fileSizeBytes is > 0 and <= PhotoSourceMaxBytes &&
            PhotoExtensions.Contains(Path.GetExtension(fileName ?? string.Empty), StringComparer.OrdinalIgnoreCase);
