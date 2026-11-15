@@ -735,7 +735,7 @@ impl Interface for QuicOverUdpInterface {
         door_port: u16,
     ) -> io::Result<()> {
         match &self.mux {
-            Some(mux) => mux.route_over_punched(peer, stream, &self.sni.resolve(), door_port),
+            Some(mux) => mux.route_over_punched(peer, stream, OMNI_SNI, door_port),
             None => Err(io::Error::other("interface has no mux router (pure-TCP carrier)")),
         }
     }
