@@ -1,10 +1,6 @@
 # Omni: a Map of Network Behavior (what actually happens at runtime)
 
-**Purpose.** This is a **map**, not a spec. The mesh-layer spec is `networking-overlay.md`; the "why"
-lives in `decisions/serverless-connectivity-masterplan.md` and about 30 ADRs next to it. This document
-gives a **coherent picture of the runtime**: what happens step by step, in what order, with which
-entities, and what it degrades into on failure. Each section points to the authoritative document for
-depth.
+This map follows startup, carriers, discovery, background workers and failures. Read the [overlay design](networking-overlay.md) for protocol details and the [mesh startup code](../../core-rust/crates/omni-app/src/app_mesh.rs) for the runtime entry points.
 
 Intended reading order: addresses, startup, planes, first-contact paths, background workers, failures, leaks.
 

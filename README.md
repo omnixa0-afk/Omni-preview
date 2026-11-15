@@ -48,7 +48,7 @@ Requirements: Windows 10 1809+ or Windows 11, x64.
 
 ## Build from source
 
-You need the .NET 10 SDK, Rust (stable, MSVC toolchain) and the Visual Studio C++ build tools.
+You need the .NET 10 SDK, Rust 1.99.1 (MSVC target), Visual Studio C++ build tools, Perl and NASM.
 
 ```powershell
 dotnet publish windows-app/src/Omni.Windows.App/Omni.Windows.App.csproj -p:PublishProfile=win-x64-standalone

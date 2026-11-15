@@ -180,6 +180,8 @@ All run on the **transport-runtime thread**. They use `runtime_event_storage_for
 `transport_handle_for_callback` and `session_lock_for_callback`, cloned from
 `OmniApp` init. Locks are acquired per call.
 
+For the queue worker, start at [runtime_queue.rs](../../core-rust/crates/omni-app/src/runtime_queue.rs). For inbound events, start at [runtime_transport_events.rs](../../core-rust/crates/omni-app/src/runtime_transport_events.rs). Some decision records named below are internal. The module paths are available in the public tree.
+
 ## Failure mode index
 
 | Symptom | Where to look |

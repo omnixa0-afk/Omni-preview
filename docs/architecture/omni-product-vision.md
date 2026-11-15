@@ -161,7 +161,7 @@ recovery requires out-of-band key rotation.
 - LAN discovery (multicast mesh announces; the separate mDNS/UDP discovery was removed)
 - Multiple profiles per device (a user can keep several identities)
 
-**Known debt** (present but not production-grade):
+**Debt recorded during the original planning phase:**
 - The old signaling was awkwardly written and is being replaced by the mesh.
 - Audio testing was blocked pending the mesh work.
 
@@ -173,8 +173,9 @@ recovery requires out-of-band key rotation.
 - Reliable cross-machine pairing without manual configuration
 - Mobile readiness (Android), though not mandatory if time runs short
 
-**Should add**:
-- Backup / export of user data (encrypted)
+**Delivered:** encrypted account backup, export and restore. See the [backup format](../../core-rust/crates/omni-app/src/app_backup_file.rs).
+
+**Further work**:
 - Multi-device sync (carefully; see the constraints section)
 - Better diagnostics (observable mesh state, with problems visible to the user)
 
@@ -258,14 +259,14 @@ that can read messages. The current crypto layer provides this. ✅
 |---|---|---|
 | No dependence on a central server | Anchors are emergent hubs, not a required role | ✅ |
 | Free protection (no onion-routing latency) | Direct hole-punching first, relay only as fallback | ✅ |
-| Scale-ready | The mesh design handles 10k+ peers with rate limits | ✅ |
+| Scale-ready | Design target of 10k+ peers; rate limits are part of the design | Requires load testing |
 | Identity = key | NodeAddress = blake3(pubkey)[:20], derived from the existing X3DH | ✅ |
 | E2E by default | The existing X3DH layer is untouched | ✅ |
 | Wire-level metadata privacy | One QUIC connection per peer pair, encrypted forwarded tunnels | ✅ |
-| LAN works without internet | mDNS interface plus direct QUIC | ✅ |
+| LAN works without internet | Multicast mesh announcements and direct QUIC | ✅ |
 | Distribution: GitHub and p2p | No infrastructure dependency at runtime | ✅ |
 | Bootstrap addition through the UI | A Settings entry for bootstrap peers (phase α-ε deliverable) | ⚠️ pending |
-| Future group support | Mesh announce is already a universal mechanism | ✅ |
+| Group support | Group chats and calls use the mesh | ✅ |
 
 ## 10. Accepted trade-offs
 

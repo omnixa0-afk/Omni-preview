@@ -12,6 +12,10 @@ explains an existing thing, update its document instead.
 | Product vision & scope (what we build / anti-features) | `architecture/omni-product-vision.md` |
 | Threat model | `../omni-threat-model.md` |
 
+## Workspaces
+
+For shared projects, discussions and agents, start with the [architecture overview](../ARCHITECTURE.md#workspaces-and-agent-integrations). The [workspace trust boundaries](../omni-threat-model.md#workspace-trust-boundaries) explain command permissions, acknowledgement and file recovery.
+
 ## Find code / structure
 | You want… | Read | Note |
 |---|---|---|

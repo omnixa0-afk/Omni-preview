@@ -419,8 +419,7 @@ Landed in `omni-network`:
   connection. Data from an unverified or mismatched neighbor is dropped
   (anti-spoof); `Data` that races the handshake is buffered and flushed on
   verification.
-- ⏳ **Not yet**: integration into `omni-transport`/`omni-app` (a new Connection
-  over Link). The old signaling stays frozen until then.
+- Application integration followed this phase. The [mesh startup code](../../core-rust/crates/omni-app/src/app_mesh.rs) starts the networked runtime. See the [network behavior map](network-behavior-map.md) for carriers and discovery.
 
 ### Phase β: hole punching + multi-hop routing
 

@@ -100,6 +100,10 @@ These axes intentionally do not collapse into one mega-status.
 4. The shell renders the call through a global incoming surface plus in-chat call UI.
 5. Raw media is not written into chat history or persistent message storage.
 
+## Working in a shared project
+
+Open Workspaces to find the group's projects, tasks and discussions. A file project keeps versioned content and a local working folder. A discussion gives a task its conversation. An agent can receive a command there when its owner or an authorised member mentions it. See the [workspace architecture](../../ARCHITECTURE.md#workspaces-and-agent-integrations).
+
 ## Layer Map
 
 ### WinUI shell

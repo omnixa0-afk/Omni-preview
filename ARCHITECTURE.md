@@ -63,6 +63,10 @@ The guiding rule is simple:
 - `core-rust/crates/omni-node`
   - a headless node over `omni-app`, for development and validation
 
+## Workspaces and agent integrations
+
+A workspace brings group discussions, tasks, code repositories and versioned file projects into the shell. Rust owns task state, permissions and file-version recovery. The MCP server exposes workspace tools to local agent clients. Its wait and acknowledgement calls use profile storage. See [workspace tasks](core-rust/crates/omni-app/src/app_workspace_tasks.rs), [file versions](core-rust/crates/omni-app/src/app_workspace_versions.rs) and [MCP tools](core-rust/crates/omni-mcp/src/tools.rs).
+
 ## Active Session Boundary
 
 Transport may keep multiple verified peer contexts alive; Omni still exposes one active verified chat/session model to the shell.

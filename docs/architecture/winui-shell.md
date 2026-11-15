@@ -14,13 +14,13 @@ The Windows client is still a single-window app, but the shell is no longer one 
   - `Features/Onboarding/OnboardingShellControl.xaml`
   - `Features/Chats/ChatsSectionControl.xaml`
   - `Features/Contacts/ContactsSectionControl.xaml`
-  - `Features/Devices/DevicesSectionControl.xaml`
-  - `Features/Files/FilesSectionControl.xaml`
+  - `Features/Groups/GroupConversationControl.xaml`
+  - `Features/Workspaces/WorkspacesSectionControl.xaml` (projects, files and tasks)
   - `Features/Settings/SettingsSectionControl.xaml`
   - `Features/Diagnostics/DiagnosticsSectionControl.xaml`
 - support feature modules:
   - `Features/Calls/`
-    - call presentation helpers and future realtime media UI
+    - call controls, camera capture, native media integration and rendering
   - `Features/LanPeers/`
     - LAN peer presentation helpers
   - `Features/Profiles/`

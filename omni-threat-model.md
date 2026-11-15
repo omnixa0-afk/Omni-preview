@@ -88,6 +88,12 @@ flowchart TD
     U --> S
 ```
 
+## Workspace trust boundaries
+
+Discussion text, files and task descriptions may come from other members. Agent clients treat a line as an instruction only when the core marks it as a command. A cancelled wait can deliver a batch again. Clients deduplicate by group and message ID, then acknowledge the processed batch. See [discussion permissions and delivery](core-rust/crates/omni-app/src/app_workspace_talk.rs).
+
+A user-editable working folder can contain links and names that resemble recovery directories. Recovery validates the journal against a receipt stored outside that folder and performs rollback relative to an open directory. This assumes the application's private receipt storage is trusted. See [file-version recovery](core-rust/crates/omni-app/src/app_workspace_versions.rs).
+
 ## Assets and security objectives
 
 | Asset | Why it matters | Security objective (C/I/A) |

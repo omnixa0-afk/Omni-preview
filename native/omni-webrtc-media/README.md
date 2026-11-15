@@ -18,7 +18,7 @@ Current state:
 - Default builds without the WebRTC backend still return `OMNI_WEBRTC_MEDIA_STATUS_NOT_IMPLEMENTED` for session creation.
 - The Windows app copies `omni_webrtc_media.dll` into the app output when a native build exists and selects the native RTP-over-Omni-QUIC path only for codecs reported by `native_session_scaffold_codecs`.
 - `scripts/bootstrap-libwebrtc.ps1` prepares external depot_tools under `D:\OmniDeps` and can perform the large WebRTC checkout outside the repository when run with `-Sync`.
-- `scripts/build-libwebrtc.ps1` builds the external `webrtc.lib` plus the builtin encoder/decoder factory objects used by the probe, with proprietary H.264 and Chrome FFmpeg branding enabled for local H.264 decode proof.
+- `scripts/build-libwebrtc.ps1` builds the external `webrtc.lib` plus the builtin encoder/decoder factory objects used by the probe, with `proprietary_codecs=false` and `rtc_use_h264=false`. Windows Media Foundation supplies the hardware H.264 codec. The WebRTC H.265 build flag enables HEVC RTP handling.
 
 Rules:
 

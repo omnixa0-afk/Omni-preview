@@ -16,15 +16,15 @@ Rust is the source of truth; C# only renders state and sends commands over a thi
 logic goes into Rust, the shell only displays it.
 
 You do not build Rust separately: `dotnet build` (and F5 in an IDE) runs `cargo build` itself and
-places `omni_ffi.dll` next to the app. Without the C++ media DLL the app builds and runs, only without
-video codecs.
+places `omni_ffi.dll` next to the app. Without the C++ media DLL the app builds and runs, but native call audio and video are unavailable.
 
 ## Prerequisites
 
 - **.NET SDK 10** — pinned in `global.json` (`dotnet --list-sdks`)
-- **Rust stable** via rustup; the `x86_64-pc-windows-msvc` target comes from `core-rust/rust-toolchain.toml`
+- **Rust 1.99.1** via rustup; the `x86_64-pc-windows-msvc` target comes from `core-rust/rust-toolchain.toml`
 - **Visual Studio 2022/2026** with the C++ and Windows App SDK workloads (XAML designer, C# debugging,
   MSVC linker for Rust)
+- **Perl and NASM** on PATH for native dependencies of the Rust core (the Windows CI uses Strawberry Perl).
 - **CMake** — only for the native media module
 - **VS Code** with rust-analyzer is convenient for the Rust side
 
@@ -108,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\release.ps1
 Builds the portable exe, names it `Omni.exe` and writes `SHA256SUMS.txt`. Output goes to `dist\`.
 
 Published releases are not built on a developer machine: `.github/workflows/release.yml` builds
-everything from source on a GitHub-hosted runner when a `v*` tag is pushed — libwebrtc at the revision
+everything from source on a GitHub-hosted runner when a `v*` tag is pushed — an attested libwebrtc kit when available, otherwise libwebrtc at the revision
 pinned in `scripts/bootstrap-libwebrtc.ps1`, the native media module, the core and the shell — and
 attaches a build provenance attestation. To check that a downloaded `Omni.exe` came from that workflow
 and from which commit:
