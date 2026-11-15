@@ -15,7 +15,6 @@ Current LAN hardening has closed the previously identified `VerificationChalleng
   - `windows-app/src/Omni.Windows.App/Core`
   - `README.md`
   - `ARCHITECTURE.md`
-  - `docs/architecture/overview.md`
 - Out of scope:
   - external infrastructure, relay/STUN/TURN, and real runtime configs outside the repository
   - CI/CD as a separate attack target

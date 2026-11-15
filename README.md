@@ -67,7 +67,7 @@ calls. Full setup, debugging and troubleshooting: [DEVELOPING.md](DEVELOPING.md)
 | `native/omni-webrtc-media/` | C++ media engine (capture, codecs, RTCP) |
 | `docs/` | architecture notes and ADRs |
 
-Start with [ARCHITECTURE.md](ARCHITECTURE.md), then [docs/README.md](docs/README.md).
+To share a folder and give an agent its first task, follow [Working in a workspace](docs/workspaces.md). For build instructions, architecture and reference material, see the [documentation index](docs/README.md).
 
 ## Contributing and security
 

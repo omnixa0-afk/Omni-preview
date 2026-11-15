@@ -1,46 +1,30 @@
-# Omni docs — index
+# Omni documentation
 
-"Which question → which document." One home per topic; if you are about to write something that
-explains an existing thing, update its document instead.
-
-## Start here
-| You want… | Read |
+| What do you want to do? | Start here |
 |---|---|
-| Build, run, debug | `../DEVELOPING.md` |
-| Project rules, invariants, where things live | `../CONTRIBUTING.md` |
-| Architecture overview | `../ARCHITECTURE.md`, `architecture/overview.md` |
-| Product vision & scope (what we build / anti-features) | `architecture/omni-product-vision.md` |
-| Threat model | `../omni-threat-model.md` |
+| Install Omni for Windows | [Download, verify and run Omni](../README.md#install) |
+| Share a folder, save a version or give an agent a task | [Working in a workspace](workspaces.md) |
+| Build, run or debug from source | [Development guide](../DEVELOPING.md) and [contributing guidelines](../CONTRIBUTING.md) |
+| Understand how the Windows app and Rust core fit together | [Architecture](../ARCHITECTURE.md) |
+| Understand security guarantees or report a vulnerability | [Threat model](../omni-threat-model.md) and [security reporting](../SECURITY.md) |
 
-## Workspaces
+## Implementation references
 
-For shared projects, discussions and agents, start with the [architecture overview](../ARCHITECTURE.md#workspaces-and-agent-integrations). The [workspace trust boundaries](../omni-threat-model.md#workspace-trust-boundaries) explain command permissions, acknowledgement and file recovery.
-
-## Find code / structure
-| You want… | Read | Note |
-|---|---|---|
-| Symbol → file (Rust/C#/native) | `architecture/code-map.md` | auto-gen |
-| SQLite tables & columns | `architecture/storage-schema.md` | auto-gen |
-| FFI exports (`omni_*`) by domain | `architecture/ffi-surface.md` | auto-gen |
-| Hot-path chains (send / call-end / queue tick / transport cb) | `architecture/lifecycle-paths.md` | manual |
-| WinUI shell structure | `architecture/winui-shell.md` | manual |
-
-Regenerate the auto-gen maps after refactors/new FFI/migrations:
-`powershell -ExecutionPolicy Bypass -File scripts/regen-docs.ps1`.
-
-## Architecture & design
-| Topic | Doc |
+| Topic | Documents |
 |---|---|
-| How the network behaves at runtime (start → carriers → discovery → rendezvous → workers → degradation) | `architecture/network-behavior-map.md` |
-| Mesh overlay spec | `architecture/networking-overlay.md` |
-| Realtime media over QUIC | `architecture/realtime-media-quic.md`, `../native/omni-webrtc-media/README.md` |
-| FFI model | `architecture/ffi-model.md` |
-| Groups and group calls plan | `architecture/group-chat-and-calls-plan.md` |
-| Android / cross-platform readiness | `architecture/core-portability-audit.md`, `architecture/cross-platform-media-audit.md` |
-| Logo | `design/logo/` |
-| Founding architecture decisions (Rust core as the source of truth, C ABI boundary) | `adr/` |
+| Find a symbol, SQLite column or exported function | [Code map](architecture/code-map.md), [storage schema](architecture/storage-schema.md), [FFI surface](architecture/ffi-surface.md) |
+| Trace a runtime operation | [Lifecycle paths](architecture/lifecycle-paths.md), [network behavior](architecture/network-behavior-map.md) |
+| Networking and calls | [Mesh overlay](architecture/networking-overlay.md), [realtime media over QUIC](architecture/realtime-media-quic.md), [native media component](../native/omni-webrtc-media/README.md) |
+| Windows UI and its Rust bridge | [WinUI shell](architecture/winui-shell.md), [FFI model](architecture/ffi-model.md) |
+| Visual assets | [Logo files](design/logo/README.md) |
 
-## Notes
-- References to `docs/decisions/…`, `docs/bugs/…` and `docs/notes/…` in code and in older documents point to
-  internal design notes that are not part of this repository.
-- ADRs are append-mostly: supersede (and say so), don't silently delete.
+The code map, storage schema and FFI surface are generated from source. After a refactor, run `powershell -ExecutionPolicy Bypass -File scripts/regen-docs.ps1` from the repository root.
+
+## Design history and planning
+
+- [Product vision and scope](architecture/omni-product-vision.md)
+- [Group chat and calls plan](architecture/group-chat-and-calls-plan.md)
+- Portability assessments for the [core](architecture/core-portability-audit.md) and [media](architecture/cross-platform-media-audit.md)
+- Founding decisions on [Rust ownership](adr/0001-rust-core-as-source-of-truth.md) and the [C ABI](adr/0002-c-abi-boundary.md)
+
+Older references to `docs/decisions/`, `docs/bugs/` and `docs/notes/` refer to internal development notes.

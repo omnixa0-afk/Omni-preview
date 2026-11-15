@@ -154,6 +154,10 @@ The product keeps these state families independent:
 
 These do not collapse into one mega-status.
 
+## Local profile lifecycle
+
+Creating or restoring a profile makes it available in the profile chooser on that device. Signing out returns to the chooser or welcome screen. The saved profile can be unlocked again. Deleting a profile from the device removes its local copy.
+
 ## Contact And Presence Rules
 
 Important rules:
@@ -163,19 +167,23 @@ Important rules:
 - offline add by `account_id` creates local `Approved` immediately
 - `Never met` clears only after a verified secure session
 - `Friend` is a local flag on top of `Approved`
+- quiet reconnect is reserved for approved friends. A discovered peer can appear in the LAN list before any probe or introduction
 - presence comes from secure-session activity and lightweight secure service traffic, not from discovery alone
 - forgetting a contact removes relationship state and local dialog history
 - if forgetting happens while a verified secure session is still live, Rust may let that live session disconnect naturally before the transport context fully disappears so later re-request flows remain honest
 
 ## Call And Media Rules
 
-Important rules:
+Omni supports direct and group calls. A group member can start a call and others can explicitly join or leave it. The group feed carries call control. When a peer forwards media, it forwards sealed frames that recipients open with the sender's media key.
 
-- the shipped call surface is 1:1 only, even though call contracts already use participant rosters
-- v1 enforces exactly two participants at the app/runtime layer
+Direct calls have two participants and follow these lifecycle rules:
+
 - only one ringing or active call is allowed per local profile
 - unanswered calls time out after `30 s`
 - active calls get a `10 s` reconnect grace before ending as `ConnectionLost`
+
+Media and application boundaries:
+
 - Rust owns call eligibility, call state, media admission, history projection, and network-quality truth
 - production realtime media must use the V2 native/QUIC media path
 - JSON/base64 call media, local Opus bridge loops, and request-response media payloads are not supported
