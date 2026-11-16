@@ -143,8 +143,8 @@ impl Storage {
         )?;
         self.connection
             .execute(
-                "UPDATE messages SET copied_from_device_id = ?2 WHERE id = ?1",
-                params![id, from_device_id.0.as_str()],
+                "UPDATE messages SET copied_from_device_id = ?2 WHERE id = ?1 AND profile_id = ?3",
+                params![id, from_device_id.0.as_str(), self.resolve_transition_profile_id()?.0],
             )
             .map_err(map_sqlite_error)?;
         self.connection
@@ -153,12 +153,14 @@ impl Storage {
                 UPDATE messages
                 SET status = 'delivered',
                     remote_delivered_at_unix_ms = (
-                        SELECT delivered_at_unix_ms FROM delivery_receipts WHERE message_id = ?1
+                        SELECT r.delivered_at_unix_ms FROM delivery_receipts r WHERE r.message_id = ?1 AND r.profile_id = messages.profile_id
                     )
-                WHERE id = ?1
-                  AND EXISTS (SELECT 1 FROM delivery_receipts WHERE message_id = ?1)
+                WHERE id = ?1 AND profile_id = ?2
+                  AND EXISTS (
+                      SELECT 1 FROM delivery_receipts r WHERE r.message_id = ?1 AND r.profile_id = messages.profile_id AND r.dialog_key = messages.dialog_key
+                  )
                 ",
-                params![id],
+                params![id, self.resolve_transition_profile_id()?.0],
             )
             .map_err(map_sqlite_error)?;
         Ok(true)

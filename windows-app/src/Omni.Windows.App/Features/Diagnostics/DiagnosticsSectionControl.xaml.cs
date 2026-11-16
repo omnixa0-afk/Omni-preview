@@ -5,6 +5,9 @@ namespace Omni.Windows.App.Features.Diagnostics;
 
 public sealed partial class DiagnosticsSectionControl : UserControl
 {
+    /// A row of the help page asked to go somewhere: the tag of its button.
+    internal event Action<string>? HelpActionRequested;
+
     public DiagnosticsSectionControl()
     {
         InitializeComponent();
@@ -29,7 +32,55 @@ public sealed partial class DiagnosticsSectionControl : UserControl
 
     private void ApplyRailWidth() => DiagnosticsNavColumn.Width = new GridLength(Shared.SectionRail.Width);
 
-    /// Open a section by its tag (network, delivery, security, video, tools).
+    internal void ShowHelpStatus(string title, string detail, string people, bool problem)
+    {
+        HelpStatusTitleTextBlock.Text = title;
+        HelpStatusDetailTextBlock.Text = detail;
+        HelpStatusPeopleTextBlock.Text = people;
+        if (problem)
+        {
+            HelpStatusTitleTextBlock.Foreground = Presentation.MainWindowPresentation.ResolveThemeBrush(
+                "OmniCallControlWarnIconBrush", HelpStatusDetailTextBlock.Foreground);
+        }
+        else
+        {
+            HelpStatusTitleTextBlock.ClearValue(TextBlock.ForegroundProperty);
+        }
+    }
+
+    private string shownWaiting = string.Empty;
+
+    /// The conversations with messages not gone yet, each with the way to it. Rows stay as they are
+    /// until the list changes: a refresh must not replace a button under the mouse.
+    internal void ShowHelpWaiting(IReadOnlyList<(string DialogKey, string Title, string Text)> waiting)
+    {
+        string now = string.Join('\n', waiting.Select(row => $"{row.DialogKey}\t{row.Title}\t{row.Text}"));
+        if (now == shownWaiting)
+        {
+            return;
+        }
+
+        shownWaiting = now;
+        HelpWaitingRows.Children.Clear();
+        foreach ((string dialogKey, string title, string text) in waiting)
+        {
+            Button open = new() { Content = "Открыть", Tag = "chat:" + dialogKey };
+            open.Click += OnHelpActionClicked;
+            HelpWaitingRows.Children.Add(new Shared.SettingRow { Header = title, Description = text, Control = open });
+        }
+
+        HelpWaitingPanel.Visibility = waiting.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void OnHelpActionClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string action })
+        {
+            HelpActionRequested?.Invoke(action);
+        }
+    }
+
+    /// Open a section by its tag (help, network, delivery, security, video, tools).
     internal void ShowSection(string tag)
     {
         foreach (object item in DiagnosticsNavList.Items)
@@ -44,10 +95,10 @@ public sealed partial class DiagnosticsSectionControl : UserControl
 
     private void ShowSelectedSection()
     {
-        string tag = (DiagnosticsNavList.SelectedItem as ListViewItem)?.Tag as string ?? "network";
-        foreach (StackPanel section in new[]
+        string tag = (DiagnosticsNavList.SelectedItem as ListViewItem)?.Tag as string ?? "help";
+        foreach (FrameworkElement section in new FrameworkElement[]
                  {
-                     DiagnosticsSection_network, DiagnosticsSection_delivery, DiagnosticsSection_security,
+                     DiagnosticsSection_help, DiagnosticsSection_network, DiagnosticsSection_delivery, DiagnosticsSection_security,
                      DiagnosticsSection_video, DiagnosticsSection_tools,
                  })
         {

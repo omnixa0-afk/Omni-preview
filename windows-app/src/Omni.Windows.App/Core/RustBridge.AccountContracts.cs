@@ -304,15 +304,8 @@ internal sealed partial class RustBridge
         [property: JsonPropertyName("profile_id")] string ProfileId,
         [property: JsonPropertyName("confirmation_token")] string? ConfirmationToken);
 
-    internal sealed record AddContactByIdentifierRequest(
-        [property: JsonPropertyName("account_id")] string AccountId,
-        [property: JsonPropertyName("petname")] string Petname,
-        [property: JsonPropertyName("public_display_name")] string? PublicDisplayName);
-
-    internal sealed record RequestContactByIdentifierRequest(
-        [property: JsonPropertyName("account_id")] string AccountId,
-        [property: JsonPropertyName("petname")] string Petname,
-        [property: JsonPropertyName("public_display_name")] string? PublicDisplayName);
+    internal sealed record AllowContactCourierRequest(
+        [property: JsonPropertyName("url")] string Url);
 
     internal sealed record AddContactFromPayloadRequest(
         [property: JsonPropertyName("payload")] ImportableContactPayloadV1 Payload,

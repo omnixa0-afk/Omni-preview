@@ -1,17 +1,34 @@
-/// A photo to send, re-encoded (`omni_storage::photo`): the staged JPEG, the name it goes under and
-/// what the receiver shows. The photo, not the picked file, is what goes out.
+/// A photo to send, re-encoded (`omni_storage::photo`), or a voice message, checked
+/// (`omni_storage::voice`): the staged file, the name it goes under and what the receiver shows. This,
+/// not the picked file, is what goes out.
 struct StagedOutgoingPhoto {
     path: PathBuf,
     file_name: String,
     presentation: omni_types::AttachmentPresentationV1,
 }
 
+/// The names a recording goes under; the chat shows no name, «Сохранить как…» does.
+const VOICE_FILE_NAME: &str = "voice-message.ogg";
+const VIDEO_NOTE_FILE_NAME: &str = "video-message.mp4";
+
 fn stage_outgoing_photo_if_asked(
     storage: &Storage,
     message_id: &str,
     source_file_path: &str,
     as_photo: bool,
+    recording: Option<omni_types::AttachmentPresentationKindV1>,
 ) -> OmniResult<Option<StagedOutgoingPhoto>> {
+    match recording {
+        Some(omni_types::AttachmentPresentationKindV1::Voice) => {
+            let (path, presentation) = storage.stage_outgoing_voice(message_id, Path::new(source_file_path))?;
+            return Ok(Some(StagedOutgoingPhoto { path, file_name: VOICE_FILE_NAME.to_string(), presentation }));
+        }
+        Some(omni_types::AttachmentPresentationKindV1::VideoNote) => {
+            let (path, presentation) = storage.stage_outgoing_video_note(message_id, Path::new(source_file_path))?;
+            return Ok(Some(StagedOutgoingPhoto { path, file_name: VIDEO_NOTE_FILE_NAME.to_string(), presentation }));
+        }
+        Some(omni_types::AttachmentPresentationKindV1::Photo) | None => {}
+    }
     if !as_photo {
         return Ok(None);
     }
@@ -237,9 +254,35 @@ fn handle_incoming_attachment_transfer_stream(
         })
 }
 
+/// Whether `requester` may still receive the file of `message_id` (A02, A12, audit 2026-11-09 #6),
+/// asked before its first chunk and again while it goes out: the profile is signed in; the requester
+/// is a device of ours, or the file's contact — approved and not blocked. Said as a retryable
+/// failure: the asker hears no final "unavailable" from a contact it is no longer one of.
+fn attachment_still_servable(storage: &Storage, message_id: &str, requester: &omni_crypto::SessionAddress) -> OmniResult<()> {
+    let ended = |why: &str| Err(OmniError::Transport(format!("the right to send it ended: {why}")));
+    if !storage.is_profile_signed_in()? {
+        return ended("the profile is signed out");
+    }
+    if storage.is_own_other_device(&requester.remote_account_id, &requester.remote_device_id)? {
+        return Ok(());
+    }
+    if !attachment_requester_allowed(storage, message_id, requester)? {
+        return ended("not the file's contact");
+    }
+    let approved = storage
+        .find_contact_by_remote_account_id(&requester.remote_account_id)?
+        .is_some_and(|contact| contact.relationship_state == ContactRelationshipState::Approved && !contact.is_blocked);
+    if !approved {
+        return ended("the contact is no longer approved");
+    }
+    Ok(())
+}
+
 fn spawn_attachment_transfer_sender(
     storage: &Storage,
     transport: &TransportManager,
+    session_lock: &Arc<Mutex<()>>,
+    requester: &omni_crypto::SessionAddress,
     request: &omni_types::AttachmentDownloadRequestV1,
     receive_context: &ReceivedChatContext,
 ) -> OmniResult<()> {
@@ -250,11 +293,11 @@ fn spawn_attachment_transfer_sender(
     // Idempotency: a download request duplicated/replayed across carriers must NOT start a second
     // sender for a transfer already streaming — that sends the whole file twice (2x data + CPU) and
     // starves the sender's UI thread. Reserve first; a live worker for this transfer drops the dup.
-    let Some(worker) = reserve_attachment_send_worker(&db_key, &transfer_id) else {
+    let Some(worker) = reserve_attachment_send_worker(&db_key, &transfer_id, &receive_context.dialog_key) else {
         omni_app_trace_log(
             "attachment/send-worker",
             &format!(
-                "message={message_id} transfer={transfer_id} duplicate request ignored (already in flight)"
+                "message={message_id} transfer={transfer_id} request not served now (in flight already, or the bound)"
             ),
         );
         return Ok(());
@@ -265,6 +308,8 @@ fn spawn_attachment_transfer_sender(
     let worker_db_key = db_key.clone();
     let worker_transfer_id = transfer_id.clone();
     let spawned_worker = Arc::clone(&worker);
+    let session_lock = Arc::clone(session_lock);
+    let requester = requester.clone();
     let spawned = thread::Builder::new()
         .name("omni-attachment-transfer-out".to_string())
         .spawn(move || {
@@ -288,6 +333,7 @@ fn spawn_attachment_transfer_sender(
                     AttachmentServeRange::from_offset(request.resume_offset_bytes),
                     Some(&receive_context.dialog_key),
                     Some(&spawned_worker),
+                    &mut || attachment_still_servable(&storage, &request.message_id, &requester),
                     || AttachmentChunkSink::open(&transport, &receive_context.dialog_key, &request.transfer_id),
                 ) {
                     Ok(()) => Ok(()),
@@ -297,6 +343,9 @@ fn spawn_attachment_transfer_sender(
                     // download Failed for good: any hiccup on a bad network ended the transfer. The
                     // receiver sees the stall and asks again from where its `.part` ends.
                     Err(error) if attachment_transfer_failure_is_final(&error) => {
+                        // Under the session lock every sender takes (B04, audit 2026-11-09 #6): the
+                        // worker runs on its own thread, and a stale session lost the notice.
+                        let _session_guard = lock_session(&session_lock);
                         let _ = send_attachment_transfer_failure_notice(
                             &storage,
                             &transport,
@@ -457,6 +506,9 @@ impl AttachmentServeRange {
 /// the 1:1 dialog whose liveness a slow write proves; a group pull has none. A copy of ours still
 /// being downloaded serves, when `range` allows it, the blocks of the range it has and skips the
 /// others: the asker learns what it lacks from what does not come and asks someone else.
+/// `right`: whether the asker may still have it — the same rule that let the stream open, asked
+/// before the first chunk and again as it goes ([`crate::app_serve_right::ServeRight`]).
+#[allow(clippy::too_many_arguments)]
 fn send_attachment_over_sink(
     storage: &Storage,
     message_id: &str,
@@ -464,6 +516,7 @@ fn send_attachment_over_sink(
     range: AttachmentServeRange,
     progress_dialog_key: Option<&str>,
     worker: Option<&AttachmentSendWorker>,
+    right: &mut dyn FnMut() -> OmniResult<()>,
     open_sink: impl FnOnce() -> OmniResult<AttachmentChunkSink>,
 ) -> OmniResult<()> {
     let resume_offset_bytes = range.from_offset_bytes;
@@ -544,7 +597,20 @@ fn send_attachment_over_sink(
     ))?;
 
     let mut offset_bytes = resume as i64;
-    let mut last_serving_recheck_offset = offset_bytes;
+    // The asker's right and, for a whole file, ours to hand it on (a revoked file is not served —
+    // a download in progress is not "served" by a flag: its map says what it may hand on).
+    let whole = have.is_none();
+    let mut serve_right = crate::app_serve_right::ServeRight::new(|| {
+        if whole {
+            let runtime = storage
+                .get_attachment_runtime_info(message_id)?
+                .ok_or_else(|| OmniError::Storage(format!("attachment '{}' was not found", message_id)))?;
+            if !runtime.attachment.local_serving_enabled {
+                return Err(OmniError::Storage("attachment transfer was cancelled locally".to_string()));
+            }
+        }
+        right()
+    });
     // One of a few streams of this file at a time; the others wait their turn (C3,
     // `app_upload_slots`). The stream has started: a receiver in line sees a pause, not a refusal.
     let content_key = attachment.attachment.content_id_hex.clone();
@@ -615,25 +681,9 @@ fn send_attachment_over_sink(
         });
         hash_total += hash_started.elapsed();
         while (offset_bytes as u64) < block_end {
-            // A download in progress is not "served" by a flag: its map says what it may hand on.
-            if have.is_none()
-                && offset_bytes > last_serving_recheck_offset
-                && offset_bytes - last_serving_recheck_offset >= ATTACHMENT_SERVING_RECHECK_BYTES
-            {
-                let runtime = storage
-                    .get_attachment_runtime_info(message_id)?
-                    .ok_or_else(|| {
-                        OmniError::Storage(format!("attachment '{}' was not found", message_id))
-                    })?;
-                if !runtime.attachment.local_serving_enabled {
-                    return Err(OmniError::Storage(
-                        "attachment transfer was cancelled locally".to_string(),
-                    ));
-                }
-                last_serving_recheck_offset = offset_bytes;
-            }
             let at = (offset_bytes as u64 - block_start) as usize;
             let read = (leaf_bytes as usize).min(block_buffer.len() - at);
+            serve_right.before_sending(read as u64)?;
             let data = &block_buffer[at..at + read];
             let chunk_index = attachment_chunk_counter(offset_bytes, content_crypto.chunk_size_bytes)?;
             let sent_at_unix_ms = current_unix_ms();

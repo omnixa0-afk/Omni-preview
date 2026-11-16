@@ -119,18 +119,18 @@ impl Storage {
             })?;
             writer.finish()
         } else {
-            omni_crypto::decrypt_file_at_rest(source, destination, &key)
+            // A plain copy out of our storage (to open it, or «Save as»): it came from someone,
+            // so Windows treats it as downloaded (V-18).
+            omni_crypto::decrypt_file_at_rest(source, destination, &key)?;
+            mark_as_downloaded(destination);
+            Ok(())
         }
     }
 
     /// The writer a download assembles its `.part` with (see [`AttachmentPartWriter`]).
     pub fn open_attachment_part_writer(&self, path: &Path) -> OmniResult<AttachmentPartWriter> {
         if self.is_internal_media_path(path) {
-            self.seal_plain_part_before_writing(path)?;
-            return Ok(AttachmentPartWriter::Encrypted(omni_crypto::FileAtRestWriter::open_for_offsets(
-                path,
-                &self.file_at_rest_key()?,
-            )?));
+            return self.internal_part_writer(path).map(AttachmentPartWriter::Encrypted);
         }
         let file = fs::OpenOptions::new()
             .create(true)
@@ -144,108 +144,284 @@ impl Storage {
         Ok(AttachmentPartWriter::Plain(file))
     }
 
-    /// Seal one plain file in Omni's storage in place. Steps that survive a crash between any two:
-    /// the encrypted copy is written beside it (`.sealing`), the plaintext steps aside (`.plain-old`),
-    /// the copy takes its name, the plaintext is overwritten and removed
-    /// (`recover_interrupted_sealing` finishes or undoes an interrupted run).
-    fn seal_plain_media_file(&self, path: &Path, key: &[u8; 32]) -> OmniResult<bool> {
-        if omni_crypto::is_file_at_rest(path) {
-            return Ok(false);
+    fn internal_part_writer(&self, path: &Path) -> OmniResult<omni_crypto::FileAtRestWriter> {
+        use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
+        let key = self.file_at_rest_key()?;
+        let root = self
+            .internal_media_roots()
+            .into_iter()
+            .find(|r| path.starts_with(r))
+            .ok_or_else(|| OmniError::Storage("invalid internal part path".into()))?;
+        let relative = path.strip_prefix(&root).map_err(media_io)?;
+        let mut dir = open_media_root(&root).map_err(media_io)?;
+        for component in relative.parent().unwrap_or(Path::new("")).components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(media_io("invalid part directory"));
+            };
+            dir = open_media_child(&dir, name).map_err(media_io)?;
         }
-        let sealing = media_sibling(path, ".sealing");
-        let plain_old = media_sibling(path, ".plain-old");
-        omni_crypto::encrypt_file_at_rest(path, &sealing, key)?;
-        let io = |error: std::io::Error| OmniError::Storage(format!("failed to seal '{}': {error}", path.display()));
-        fs::rename(path, &plain_old).map_err(io)?;
-        fs::rename(&sealing, path).map_err(io)?;
-        wipe_file_best_effort(&plain_old);
-        Ok(true)
+        let name = relative
+            .file_name()
+            .ok_or_else(|| media_io("invalid part name"))?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
+        match dir.open_with(name, options.clone().create_new(true)) {
+            Ok(file) => {
+                return omni_crypto::FileAtRestWriter::from_empty_file(file.into_std(), &key)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(media_io(e)),
+        }
+        seal_media_entry(&dir, Path::new(name), &key)?;
+        let file = dir.open_with(name, &options).map_err(media_io)?;
+        let meta = file.metadata().map_err(media_io)?;
+        if !meta.is_file() || cap_media_link(&meta) || meta.nlink() != 1 {
+            return Err(media_io("unsafe partial attachment"));
+        }
+        omni_crypto::FileAtRestWriter::resume_file(file.into_std(), &key)
     }
 
-    /// A download's `.part` in Omni's storage left plain by a build before encryption is sealed before
-    /// it is written into again — its blocks already in the map stay valid.
-    fn seal_plain_part_before_writing(&self, path: &Path) -> OmniResult<()> {
-        if path.is_file() {
-            self.seal_plain_media_file(path, &self.file_at_rest_key()?)?;
-        }
-        Ok(())
-    }
-
-    /// Encrypt every plain file still left in Omni's storage — attachments and profile media — written
-    /// before encryption.
-    /// Runs in the background at start; a file that cannot be sealed now (held open by another program)
-    /// is left for the next start. `.part` files are sealed when their download resumes instead.
-    /// Answers how many files were sealed.
+    /// Migrate legacy attachments using operations relative to opened storage directories.
     pub fn seal_plain_attachment_files(&self) -> OmniResult<usize> {
-        let roots: Vec<PathBuf> = self.internal_media_roots().into_iter().filter(|root| root.is_dir()).collect();
-        if roots.is_empty() {
+        use cap_fs_ext::MetadataExt as _;
+        let mut sealed = 0;
+        let mut visited = std::collections::HashSet::new();
+        let mut pending: Vec<_> = self
+            .internal_media_roots()
+            .iter()
+            .filter_map(|root| open_media_root(root).ok())
+            .collect();
+        if pending.is_empty() {
             return Ok(0);
         }
         let key = self.file_at_rest_key()?;
-        let mut files = Vec::new();
-        for root in &roots {
-            collect_media_files(root, &mut files);
-        }
-        recover_interrupted_sealing(&files);
-        let mut files = Vec::new();
-        for root in &roots {
-            collect_media_files(root, &mut files);
-        }
-        let mut sealed = 0;
-        for path in files {
-            let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
-            if name.ends_with(".part") || name.ends_with(".sealing") || name.ends_with(".plain-old") {
+        while let Some(dir) = pending.pop() {
+            let meta = dir.dir_metadata().map_err(media_io)?;
+            if !visited.insert((meta.dev(), meta.ino())) {
                 continue;
             }
-            if let Ok(true) = self.seal_plain_media_file(&path, &key) {
-                sealed += 1;
+            let mut files = Vec::new();
+            for entry in dir.entries().map_err(media_io)?.flatten() {
+                let name = entry.file_name();
+                let Ok(meta) = dir.symlink_metadata(&name) else {
+                    continue;
+                };
+                if cap_media_link(&meta) {
+                    continue;
+                }
+                if meta.is_dir() {
+                    if let Ok(child) = open_media_child(&dir, &name) {
+                        pending.push(child);
+                    }
+                } else if meta.is_file() {
+                    files.push(PathBuf::from(name));
+                }
+            }
+            for name in &files {
+                recover_media_entry(&dir, name, &key);
+            }
+            // Recovery can put back a file which did not exist during enumeration.
+            for entry in dir.entries().map_err(media_io)?.flatten() {
+                let name = entry.file_name();
+                let text = name.to_string_lossy();
+                if [".part", ".sealing", ".plain-old"]
+                    .iter()
+                    .any(|suffix| text.ends_with(suffix))
+                {
+                    continue;
+                }
+                if seal_media_entry(&dir, Path::new(&name), &key).unwrap_or(false) {
+                    sealed += 1;
+                }
             }
         }
         Ok(sealed)
     }
 }
 
-fn media_sibling(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
+fn media_io(e: impl std::fmt::Display) -> OmniError {
+    OmniError::Storage(e.to_string())
 }
 
-fn collect_media_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn media_reparse_point(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::MetadataExt::file_attributes(meta) & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn cap_media_link(meta: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        cap_std::fs::MetadataExt::file_attributes(meta) & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn open_media_child(
+    dir: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+    let child = dir.open_dir_nofollow(name)?;
+    if cap_media_link(&child.dir_metadata()?) {
+        return Err(std::io::Error::other("linked media directory"));
+    }
+    Ok(child)
+}
+
+fn open_media_root(root: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let parent = root
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    open_media_child(
+        &dir,
+        root.file_name().ok_or(std::io::ErrorKind::InvalidInput)?,
+    )
+}
+
+fn media_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn open_regular_media(dir: &cap_std::fs::Dir, name: &Path) -> OmniResult<fs::File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    let meta = dir.symlink_metadata(name).map_err(media_io)?;
+    if !meta.is_file() || cap_media_link(&meta) {
+        return Err(media_io("not a regular media file"));
+    }
+    let input = dir
+        .open_with(
+            name,
+            cap_std::fs::OpenOptions::new()
+                .read(true)
+                .follow(FollowSymlinks::No),
+        )
+        .map_err(media_io)?
+        .into_std();
+    if !input.metadata().map_err(media_io)?.is_file() {
+        return Err(media_io("not a regular media file"));
+    }
+    Ok(input)
+}
+
+fn seal_media_entry(dir: &cap_std::fs::Dir, name: &Path, key: &[u8; 32]) -> OmniResult<bool> {
+    let mut input = open_regular_media(dir, name)?;
+    if omni_crypto::opened_file_is_at_rest(&mut input)? {
+        return Ok(false);
+    }
+    let temp = media_sibling(name, ".sealing");
+    let output = dir
+        .open_with(
+            &temp,
+            cap_std::fs::OpenOptions::new().write(true).create_new(true),
+        )
+        .map_err(media_io)?;
+    let mut writer = omni_crypto::FileAtRestWriter::from_empty_file(output.into_std(), key)?;
+    std::io::copy(&mut input, &mut writer).map_err(media_io)?;
+    writer.finish()?;
+    drop(input);
+    dir.rename(&temp, dir, name).map_err(media_io)?;
+    Ok(true)
+}
+
+// Only discard an old plaintext when a complete, authenticated encrypted copy holds the same bytes.
+fn sealed_copy_matches(
+    dir: &cap_std::fs::Dir,
+    sealed: &Path,
+    old: &Path,
+    key: &[u8; 32],
+) -> OmniResult<bool> {
+    use std::io::Read as _;
+    let mut sealed =
+        omni_crypto::FileAtRestReader::from_file(open_regular_media(dir, sealed)?, key)?;
+    let mut old = open_regular_media(dir, old)?;
+    let mut remaining = old.metadata().map_err(media_io)?.len();
+    if !sealed.is_encrypted() || sealed.len() != remaining {
+        return Ok(false);
+    }
+    let mut a = vec![0; 65536];
+    let mut b = vec![0; 65536];
+    while remaining > 0 {
+        let n = remaining.min(a.len() as u64) as usize;
+        sealed.read_exact(&mut a[..n]).map_err(media_io)?;
+        old.read_exact(&mut b[..n]).map_err(media_io)?;
+        if a[..n] != b[..n] {
+            return Ok(false);
+        }
+        remaining -= n as u64;
+    }
+    Ok(true)
+}
+
+fn recover_media_entry(dir: &cap_std::fs::Dir, name: &Path, key: &[u8; 32]) {
+    let Some(text) = name.to_str() else { return };
+    let original = text
+        .strip_suffix(".plain-old")
+        .or_else(|| text.strip_suffix(".sealing"));
+    let Some(original) = original
+        .map(Path::new)
+        .filter(|p| p.file_name() == Some(p.as_os_str()))
+    else {
         return;
     };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_media_files(&path, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
+    let regular = |path: &Path| {
+        dir.symlink_metadata(path)
+            .is_ok_and(|m| m.is_file() && !cap_media_link(&m))
+    };
+    let absent = |path: &Path| {
+        dir.symlink_metadata(path)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
+    if !regular(name) {
+        return;
     }
-}
-
-/// Finish or undo sealing runs a crash cut short (see `seal_plain_media_file`).
-fn recover_interrupted_sealing(files: &[PathBuf]) {
-    for path in files {
-        let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
-        if let Some(original) = name.strip_suffix(".plain-old") {
-            let original = path.with_file_name(original);
-            let sealing = media_sibling(&original, ".sealing");
-            if original.is_file() {
-                // The sealed copy took the name; the plaintext only waits to be wiped.
-                wipe_file_best_effort(path);
-            } else if sealing.is_file() && fs::rename(&sealing, &original).is_ok() {
-                wipe_file_best_effort(path);
+    if text.ends_with(".plain-old") {
+        let sealing = media_sibling(original, ".sealing");
+        if regular(original) {
+            if sealed_copy_matches(dir, original, name, key).unwrap_or(false) {
+                let _ = dir.remove_file(name);
+            }
+        } else if absent(original) {
+            if sealed_copy_matches(dir, &sealing, name, key).unwrap_or(false)
+                && dir.rename(&sealing, dir, original).is_ok()
+            {
+                let _ = dir.remove_file(name);
             } else {
-                let _ = fs::rename(path, &original);
-            }
-        } else if let Some(original) = name.strip_suffix(".sealing") {
-            // The plaintext never stepped aside: the copy may be cut short — start that file over.
-            if !media_sibling(&path.with_file_name(original), ".plain-old").exists() {
-                let _ = fs::remove_file(path);
+                let _ = dir.rename(name, dir, original);
             }
         }
+    } else if absent(&media_sibling(original, ".plain-old")) && regular(original) {
+        let _ = dir.remove_file(name);
     }
 }
 
+/// Mark a file that came from someone else as downloaded from the internet (V-18): Windows' own
+/// Mark-of-the-Web, the `Zone.Identifier` stream with zone 3, so SmartScreen and Office's protected
+/// view treat it as they treat a browser download. Best effort — a disk without alternate streams
+/// (FAT, a network share) keeps the file unmarked; the shell's own warning for programs still holds.
+pub(crate) fn mark_as_downloaded(path: &Path) {
+    #[cfg(windows)]
+    {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        if let Err(error) = fs::write(&stream, b"[ZoneTransfer]
+ZoneId=3
+") {
+            eprintln!("could not mark '{}' as downloaded: {error}", path.display());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}

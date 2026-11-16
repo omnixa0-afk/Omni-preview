@@ -11,6 +11,12 @@ namespace Omni.Windows.App.Core;
 internal sealed partial class RustBridge : IDisposable
 {
     private readonly object syncRoot = new();
+    /// <summary>
+    /// The core's lifetime against <see cref="CallRawLong"/>: long workspace calls (git over a folder of
+    /// models) hold it shared and run outside <see cref="syncRoot"/>, so the rest of the shell does not
+    /// wait for them; freeing the core takes it exclusively. The core serializes its own state.
+    /// </summary>
+    private readonly ReaderWriterLockSlim handleLifetime = new(LockRecursionPolicy.SupportsRecursion);
     private readonly string appDirectory;
     private readonly SidecarSettingsCache sidecarSettingsCache = new();
     private IntPtr handle = IntPtr.Zero;
@@ -29,15 +35,44 @@ internal sealed partial class RustBridge : IDisposable
 
     public string DatabasePath => GetDatabasePath();
 
-    internal IntPtr GetInitializedHandleForRealtimeMedia()
+    /// <summary>
+    /// A native call that takes the core's handle and runs outside <see cref="syncRoot"/> (mesh, media):
+    /// it holds <see cref="handleLifetime"/> shared until the call returns, and reads the handle inside
+    /// it — so freeing the core waits for the call instead of freeing it under it (F01, audit
+    /// 2026-11-09: a handle read before, then freed by closing or a backup import, went to the core as
+    /// freed memory). <paramref name="call"/> must not call back into the bridge's
+    /// <see cref="syncRoot"/> calls: freeing takes <see cref="syncRoot"/> first, then this lock.
+    /// </summary>
+    internal T WithCoreHandle<T>(Func<IntPtr, T> call)
     {
-        IntPtr currentHandle = Interlocked.CompareExchange(ref handle, IntPtr.Zero, IntPtr.Zero);
-        if (currentHandle == IntPtr.Zero)
+        T result = default!;
+        if (!TryWithCoreHandle(current => result = call(current)))
         {
             throw new InvalidOperationException("Omni ещё запускается — повторите через несколько секунд.");
         }
 
-        return currentHandle;
+        return result;
+    }
+
+    /// <summary><see cref="WithCoreHandle{T}"/> for a call that has nothing to do once the core is gone: false then.</summary>
+    internal bool TryWithCoreHandle(Action<IntPtr> call)
+    {
+        handleLifetime.EnterReadLock();
+        try
+        {
+            IntPtr current = Volatile.Read(ref handle);
+            if (current == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            call(current);
+            return true;
+        }
+        finally
+        {
+            handleLifetime.ExitReadLock();
+        }
     }
 
     public void Init()
@@ -115,11 +150,7 @@ internal sealed partial class RustBridge : IDisposable
 
         lock (syncRoot)
         {
-            if (handle != IntPtr.Zero)
-            {
-                NativeMethods.omni_app_free(handle);
-                handle = IntPtr.Zero;
-            }
+            FreeHandle();
         }
 
         string configJson = JsonSerializer.Serialize(
@@ -174,7 +205,9 @@ internal sealed partial class RustBridge : IDisposable
         string payload = CallRaw(nativeCall, operation);
         ThrowIfRustError(payload, operation);
 
+        long started = BridgeCost.Start();
         T? response = JsonSerializer.Deserialize(payload, typeInfo);
+        BridgeCost.Record("json", started);
         if (response is null)
         {
             throw new InvalidOperationException("Rust core returned an empty JSON payload.");
@@ -264,7 +297,10 @@ internal sealed partial class RustBridge : IDisposable
 
             try
             {
-                return ReadUtf8Response(nativeCall(), operation);
+                long started = BridgeCost.Start();
+                string response = ReadUtf8Response(nativeCall(), operation);
+                BridgeCost.Record(operation, started, response.Length);
+                return response;
             }
             catch (Exception ex)
             {
@@ -272,6 +308,51 @@ internal sealed partial class RustBridge : IDisposable
                 throw new InvalidOperationException(BuildUserMessage(ex, diagnosticPath), ex);
             }
         }
+    }
+
+    /// <summary>
+    /// A call whose slow part (git) the core already runs outside its own serializer: it does not take
+    /// <see cref="syncRoot"/> either, so the shell's other calls (switching sections) do not wait for it.
+    /// </summary>
+    private string CallRawLong(Func<IntPtr> nativeCall, string operation)
+    {
+        handleLifetime.EnterReadLock();
+        try
+        {
+            EnsureInitialized();
+            try
+            {
+                long started = BridgeCost.Start();
+                string response = ReadUtf8Response(nativeCall(), operation);
+                BridgeCost.Record(operation, started, response.Length);
+                return response;
+            }
+            catch (Exception ex)
+            {
+                string diagnosticPath = WriteDiagnostic(operation, ex, null);
+                throw new InvalidOperationException(BuildUserMessage(ex, diagnosticPath), ex);
+            }
+        }
+        finally
+        {
+            handleLifetime.ExitReadLock();
+        }
+    }
+
+    private T CallJsonLong<T>(Func<IntPtr> nativeCall, JsonTypeInfo<T> typeInfo, string operation)
+    {
+        string payload = CallRawLong(nativeCall, operation);
+        ThrowIfRustError(payload, operation);
+        return JsonSerializer.Deserialize(payload, typeInfo)
+            ?? throw new InvalidOperationException("Rust core returned an empty JSON payload.");
+    }
+
+    private T? CallOptionalJsonLong<T>(Func<IntPtr> nativeCall, JsonTypeInfo<T> typeInfo, string operation)
+        where T : class
+    {
+        string payload = CallRawLong(nativeCall, operation);
+        ThrowIfRustError(payload, operation);
+        return string.Equals(payload.Trim(), "null", StringComparison.Ordinal) ? null : JsonSerializer.Deserialize(payload, typeInfo);
     }
 
     private static string ReadUtf8Response(IntPtr responsePtr, string operation)
@@ -344,7 +425,6 @@ internal sealed partial class RustBridge : IDisposable
                 "identity_restore_account_from_input" => "Проверьте фразу восстановления и название устройства.",
                 "identity_export_current_database_backup" => "Не удалось создать резервную копию базы данных.",
                 "identity_inspect_account_backup_manifest" => "Проверьте файл резервной копии и фразу восстановления.",
-                "contacts_add_by_identifier" => "Проверьте идентификатор контакта и локальное имя.",
                 "contacts_add_from_payload" => "Не удалось импортировать карточку контакта.",
                 "contacts_rename" => "Укажите новое имя контакта.",
                 "contacts_block" or "contacts_get_card" or "contacts_get_verification_state" or "contacts_confirm_verification"
@@ -352,6 +432,9 @@ internal sealed partial class RustBridge : IDisposable
                 // Group actions: the core says exactly why (rights, membership) — keep it.
                 _ when operation.StartsWith("groups_", StringComparison.Ordinal)
                     => Presentation.GroupErrorText.ForCoreMessage(error.Message),
+                // Workspace actions: the core says which folder, version or role — keep it.
+                _ when operation.StartsWith("workspace_", StringComparison.Ordinal)
+                    => Presentation.WorkspaceErrorText.ForCoreMessage(error.Message),
                 _ => "Некорректные входные данные.",
             },
             // Принять звонок можно только если согласие ДОШЛО. Ядро отказывает, когда живого пути
@@ -549,11 +632,7 @@ internal sealed partial class RustBridge : IDisposable
         }
         catch (Exception ex)
         {
-            if (handle != IntPtr.Zero)
-            {
-                NativeMethods.omni_app_free(handle);
-                handle = IntPtr.Zero;
-            }
+            FreeHandle();
 
             string diagnosticPath = WriteDiagnostic("init", ex, databasePath);
             throw new InvalidOperationException(BuildUserMessage(ex, diagnosticPath), ex);
@@ -607,10 +686,27 @@ internal sealed partial class RustBridge : IDisposable
             return;
         }
 
-        NativeMethods.omni_app_free(handle);
-        handle = IntPtr.Zero;
+        FreeHandle();
         ReleaseAppDirectoryLock();
         GC.SuppressFinalize(this);
+    }
+
+    /// <summary>Frees the core once no long call (<see cref="CallRawLong"/>) is inside it.</summary>
+    private void FreeHandle()
+    {
+        handleLifetime.EnterWriteLock();
+        try
+        {
+            if (handle != IntPtr.Zero)
+            {
+                NativeMethods.omni_app_free(handle);
+                handle = IntPtr.Zero;
+            }
+        }
+        finally
+        {
+            handleLifetime.ExitWriteLock();
+        }
     }
 
     private string GetDatabasePath()

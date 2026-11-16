@@ -15,7 +15,7 @@ param(
     [string]$Cmd = ''
 )
 $root = Join-Path $env:TEMP 'omni-two-instance'
-$exe = Join-Path (Split-Path -Parent $PSScriptRoot) 'windows-app\src\Omni.Windows.App\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\Omni.Windows.App.exe'
+$exe = Join-Path (Split-Path -Parent $PSScriptRoot) 'windows-app\src\Omni.Windows.App\bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\Omni.exe'
 
 function Start-Node([string]$name) {
     $data = Join-Path $root "data$name"
@@ -47,7 +47,7 @@ function Send-Cmd([string]$name, [string]$text) {
 
 switch ($Step) {
     'kill' {
-        Get-Process -Name 'Omni.Windows.App' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
+        Get-Process -Name 'Omni' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
     }
     'start' {
         if (Test-Path $root) { Remove-Item $root -Recurse -Force }
@@ -60,7 +60,7 @@ switch ($Step) {
     }
     'copy' {
         # A's folder -> B's folder, with A stopped, then both back up.
-        Get-Process -Name 'Omni.Windows.App' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
+        Get-Process -Name 'Omni' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
         Start-Sleep 3
         Copy-Item (Join-Path $root 'dataA') (Join-Path $root 'dataB') -Recurse -Force
         Start-Node 'A'

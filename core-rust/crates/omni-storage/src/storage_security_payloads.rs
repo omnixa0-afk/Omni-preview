@@ -401,8 +401,12 @@ impl Storage {
                     skipped_message_keys_blob,
                     revision
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?36, ?37, 1)
-                ON CONFLICT(session_address) DO UPDATE SET
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?36, ?37, 1
+                -- A copy read from a stored row (revision > 0) only updates that row: the row gone (the
+                -- session deleted meanwhile), it inserted it back, the deleted keys with it (blind audit
+                -- 2026-11-10). A new session (revision 0) or a replacement (-1) inserts.
+                WHERE ?35 <= 0 OR EXISTS (SELECT 1 FROM sessions WHERE profile_id = ?32 AND session_address = ?1)
+                ON CONFLICT(profile_id, session_address) DO UPDATE SET
                     remote_account_id = excluded.remote_account_id,
                     remote_device_id = excluded.remote_device_id,
                     local_account_id = excluded.local_account_id,
@@ -431,6 +435,9 @@ impl Storage {
                     remote_signed_prekey_id = excluded.remote_signed_prekey_id,
                     remote_one_time_prekey_id = excluded.remote_one_time_prekey_id,
                     suite_version = excluded.suite_version,
+                    -- A new session replacing an old one is as old as itself, not as the old one: the
+                    -- grace for a fresh session's stray frames is measured from it.
+                    created_at_unix_ms = excluded.created_at_unix_ms,
                     updated_at_unix_ms = excluded.updated_at_unix_ms,
                     rendezvous_secret_protection_scheme = excluded.rendezvous_secret_protection_scheme,
                     rendezvous_secret_blob = excluded.rendezvous_secret_blob,
@@ -712,6 +719,78 @@ impl Storage {
         Ok(())
     }
 
+    /// What a ratchet session a backup brought back is marked by in its profile's `app_meta` (then
+    /// its address). The value is the session's creation time, so a newer session at the same
+    /// address is not taken for it.
+    const RESTORED_SESSION_META: &'static str = "restored-session:";
+
+    /// A database brought back from a backup: mark the ratchet session of every profile in it as the
+    /// copy's.
+    ///
+    /// Its sessions are as they were when the copy was made, and its contacts have most likely
+    /// taken frames past that point since: the restored device's next frames would reuse counters
+    /// they already took, and its keys would not open their newer chains. The pair healed only once
+    /// the contact counted five failed frames in a row (~50 s). A marked session is not used: the
+    /// contact's first frame on it starts a fresh one (`start_a_fresh_session_after_a_restore`). It
+    /// stays meanwhile for its rendezvous pair secret, which is how the device finds the contact
+    /// again (removing it left the device unable to find a contact whose address had changed).
+    /// Nobody else can cause this: only the restore marks.
+    ///
+    /// One-time prekeys in the contacts' bundles are dropped too: the copy's ones were likely spent,
+    /// and a bootstrap naming a spent one is refused. Returns how many sessions were marked.
+    pub fn mark_ratchet_sessions_of_a_restored_copy(&self) -> OmniResult<usize> {
+        let marked = self
+            .connection
+            .execute(
+                "
+                INSERT INTO app_meta (key, value)
+                SELECT ?1 || profile_id || ':' || ?2 || session_address, CAST(created_at_unix_ms AS TEXT)
+                FROM sessions
+                WHERE profile_id IS NOT NULL
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                ",
+                params![PROFILE_META_PREFIX, Self::RESTORED_SESSION_META],
+            )
+            .map_err(map_sqlite_error)?;
+        self.connection
+            .execute(
+                "UPDATE remote_prekey_bundles SET one_time_prekey_id = NULL, one_time_prekey_public_key = NULL",
+                [],
+            )
+            .map_err(map_sqlite_error)?;
+        // Nothing is sent on them either: not established, a send starts a fresh session at once
+        // (`updated_at` 0: no bootstrap of theirs is waiting). Sending on the copy's chains reused
+        // message keys the contact had already taken (blind audit 2026-11-10).
+        self.connection
+            .execute(
+                "UPDATE sessions SET bootstrap_state = 'initiator_bootstrap_created', updated_at_unix_ms = 0",
+                [],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(marked)
+    }
+
+    /// Whether `session` is the very one a restored backup brought back
+    /// ([`Self::mark_ratchet_sessions_of_a_restored_copy`]).
+    pub fn is_ratchet_session_from_a_restored_copy(&self, session: &SessionRecord) -> OmniResult<bool> {
+        let key = format!("{}{}", Self::RESTORED_SESSION_META, session.session_address.storage_key());
+        Ok(self
+            .get_profile_meta(&key)?
+            .is_some_and(|created| created == session.created_at_unix_ms.to_string()))
+    }
+
+    pub fn clear_restored_copy_mark(&self, session_address: &SessionAddress) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        let key = profile_meta_key(
+            &profile_id,
+            &format!("{}{}", Self::RESTORED_SESSION_META, session_address.storage_key()),
+        );
+        self.connection
+            .execute("DELETE FROM app_meta WHERE key = ?1", params![key])
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
     pub fn delete_replay_windows_for_remote_account(
         &self,
         remote_account_id: &AccountId,
@@ -883,7 +962,7 @@ impl Storage {
                     profile_id
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(session_address) DO UPDATE SET
+                ON CONFLICT(profile_id, session_address) DO UPDATE SET
                     highest_counter = excluded.highest_counter,
                     recent_tags_json = excluded.recent_tags_json,
                     updated_at_unix_ms = excluded.updated_at_unix_ms
@@ -930,6 +1009,49 @@ impl Storage {
             )
             .optional()
             .map_err(map_sqlite_error)
+    }
+
+    /// Newest verified bootstrap timestamp recorded from this remote device (its own clock).
+    pub fn newest_inbound_bootstrap_at(
+        &self,
+        remote_account_id: &AccountId,
+        remote_device_id: &DeviceId,
+    ) -> OmniResult<Option<i64>> {
+        let profile_id = self.resolve_transition_profile_id()?;
+        self.connection
+            .query_row(
+                "SELECT created_at_unix_ms FROM inbound_bootstrap_marks
+                 WHERE profile_id = ?3 AND remote_account_id = ?1 AND remote_device_id = ?2",
+                params![remote_account_id.0, remote_device_id.0, profile_id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| OmniError::Storage(format!("read inbound bootstrap mark: {error}")))
+    }
+
+    /// Record a verified bootstrap from this remote device. The mark only moves forward, except that a
+    /// mark past `trusted_until_unix_ms` (stamped far ahead of our clock, V-08) is replaced outright.
+    pub fn record_inbound_bootstrap_at(
+        &self,
+        remote_account_id: &AccountId,
+        remote_device_id: &DeviceId,
+        created_at_unix_ms: i64,
+        trusted_until_unix_ms: i64,
+    ) -> OmniResult<()> {
+        let profile_id = self.resolve_transition_profile_id()?;
+        self.connection
+            .execute(
+                "INSERT INTO inbound_bootstrap_marks (remote_account_id, remote_device_id, created_at_unix_ms, profile_id)
+                 VALUES (?1, ?2, ?3, ?5)
+                 ON CONFLICT (profile_id, remote_account_id, remote_device_id)
+                 DO UPDATE SET created_at_unix_ms = CASE
+                     WHEN created_at_unix_ms > ?4 THEN excluded.created_at_unix_ms
+                     ELSE MAX(created_at_unix_ms, excluded.created_at_unix_ms)
+                 END",
+                params![remote_account_id.0, remote_device_id.0, created_at_unix_ms, trusted_until_unix_ms, profile_id.0],
+            )
+            .map(|_| ())
+            .map_err(|error| OmniError::Storage(format!("record inbound bootstrap mark: {error}")))
     }
 
     pub fn ensure_replay_window(
@@ -980,7 +1102,7 @@ impl Storage {
                     profile_id
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(message_id) DO UPDATE SET
+                ON CONFLICT(profile_id, message_id) DO UPDATE SET
                     dialog_key = excluded.dialog_key,
                     contact_id = excluded.contact_id,
                     session_address = excluded.session_address,

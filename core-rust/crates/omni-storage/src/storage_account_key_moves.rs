@@ -216,10 +216,19 @@ impl Storage {
         let row = self
             .get_profile_secrets_row(&profile_id)?
             .ok_or_else(|| OmniError::InvalidInput("profile was not found".to_string()))?;
+        let unlock_key = if row.password_enabled {
+            let password = password.ok_or_else(|| {
+                OmniError::InvalidInput("the profile password is needed to move the account key".to_string())
+            })?;
+            Some(self.verify_profile_password(&profile_id, password)?)
+        } else {
+            None
+        };
+
         let root_secret = match phrase.map(str::trim).filter(|phrase| !phrase.is_empty()) {
             Some(phrase) => omni_identity::parse_mnemonic_v2(phrase)?.root_secret,
-            None => match load_profile_secrets_from_profile_secrets_row(&row) {
-                Ok(Some(stored)) => stored.root_secret,
+            None => match read_stored_profile_root(&row, unlock_key.as_ref()) {
+                Ok(StoredProfileRoot::Open(stored)) => stored.root_secret,
                 _ => {
                     return Err(OmniError::InvalidInput(
                         "the recovery phrase is needed: this computer cannot open the stored root".to_string(),
@@ -233,15 +242,6 @@ impl Storage {
                 "the recovery phrase does not belong to this account".to_string(),
             ));
         }
-        let unlock_key = if row.password_enabled {
-            let password = password.ok_or_else(|| {
-                OmniError::InvalidInput("the profile password is needed to move the account key".to_string())
-            })?;
-            Some(self.verify_profile_password(&profile_id, password)?)
-        } else {
-            None
-        };
-
         let current = self.current_working_key_version(&account_id)?.unwrap_or(1);
         let new_working = master.working_key(current + 1)?;
         let mut keep_chains = Vec::new();
@@ -342,6 +342,7 @@ impl Storage {
             return Ok(None);
         };
         let seed: [u8; 32] = seed_bytes
+            .as_slice()
             .try_into()
             .map_err(|_| OmniError::Storage("pending key move seed is malformed".to_string()))?;
         let mut statement = self
@@ -662,6 +663,7 @@ impl Storage {
             return Ok(()); // sealed on another machine: it cannot be opened here
         };
         let seed: [u8; 32] = seed_bytes
+            .as_slice()
             .try_into()
             .map_err(|_| OmniError::Storage("pending working key is malformed".to_string()))?;
         let working = omni_crypto::WorkingKey::from_seed(certificate.version, seed);

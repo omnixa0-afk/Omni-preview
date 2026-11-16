@@ -48,7 +48,7 @@ Requirements: Windows 10 1809+ or Windows 11, x64.
 
 ## Build from source
 
-You need the .NET 10 SDK, Rust (stable, MSVC toolchain) and the Visual Studio C++ build tools.
+You need the .NET 10 SDK, Rust 1.99.1 (MSVC target), Visual Studio C++ build tools, Perl and NASM.
 
 ```powershell
 dotnet publish windows-app/src/Omni.Windows.App/Omni.Windows.App.csproj -p:PublishProfile=win-x64-standalone
@@ -67,7 +67,7 @@ calls. Full setup, debugging and troubleshooting: [DEVELOPING.md](DEVELOPING.md)
 | `native/omni-webrtc-media/` | C++ media engine (capture, codecs, RTCP) |
 | `docs/` | architecture notes and ADRs |
 
-Start with [ARCHITECTURE.md](ARCHITECTURE.md), then [docs/README.md](docs/README.md).
+To share a folder and give an agent its first task, follow [Working in a workspace](docs/workspaces.md). For build instructions, architecture and reference material, see the [documentation index](docs/README.md).
 
 ## Contributing and security
 

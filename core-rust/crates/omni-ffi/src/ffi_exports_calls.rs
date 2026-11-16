@@ -149,6 +149,14 @@ pub extern "C" fn omni_calls_request_remote_control(
     }
 }
 
+/// How many call datagrams were dropped because they did not open with the sender's key or were
+/// replays, 1:1 and group calls together, since the process started. No handle: a process-wide
+/// counter; the shell shows its growth over a call (Diagnostics → Media).
+#[no_mangle]
+pub extern "C" fn omni_calls_media_unopened_total() -> u64 {
+    catch_unwind(omni_app::call_datagrams_unopened_total).unwrap_or(0)
+}
+
 /// Block (up to `timeout_ms`) until a call changed after revision `since`; returns the current
 /// revision. No handle: it is a process-wide "look now" signal, so the shell can wait on it from
 /// its own thread instead of polling the call inbox. `since = 0` with `timeout_ms = 0` reads it.

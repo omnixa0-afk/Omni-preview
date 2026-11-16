@@ -12,7 +12,6 @@ internal sealed record ShellControlState(
     bool IsQuickAddContactEnabled,
     bool IsShowLocalPrekeyBundleEnabled,
     bool IsImportRemotePrekeyBundleEnabled,
-    bool IsAddContactByIdentifierEnabled,
     bool IsAddContactFromPayloadEnabled,
     bool IsRenameContactEnabled,
     Visibility RenameContactVisibility,

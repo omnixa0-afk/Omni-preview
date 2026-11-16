@@ -19,6 +19,154 @@ public sealed partial class MainWindow
 {
     private UiTestChannel? uiTestChannel;
 
+    // The text a control shows: a string, or the text blocks of its content panel.
+    private static string ShownText(object? content) => content switch
+    {
+        string text => text,
+        Microsoft.UI.Xaml.Controls.TextBlock block => block.Text,
+        Microsoft.UI.Xaml.Controls.Panel panel => string.Join(" ", panel.Children.OfType<Microsoft.UI.Xaml.Controls.TextBlock>().Select(t => t.Text)),
+        _ => string.Empty,
+    };
+
+    private static FrameworkElement? FindByText(DependencyObject node, string text)
+    {
+        if (node is UIElement { Visibility: Visibility.Collapsed }) return null;
+        string shown = node switch
+        {
+            Microsoft.UI.Xaml.Controls.ToggleSwitch toggle => toggle.Header as string ?? string.Empty,
+            Microsoft.UI.Xaml.Controls.Primitives.ButtonBase button => ShownText(button.Content),
+            _ => string.Empty,
+        };
+        if (shown == text && node is Microsoft.UI.Xaml.Controls.Control { IsEnabled: true } hit) return hit;
+        int count = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < count; i++)
+        {
+            if (FindByText(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i), text) is { } found) return found;
+        }
+        return null;
+    }
+
+    private static FrameworkElement? FindField(DependencyObject node, string label)
+    {
+        if (node is UIElement { Visibility: Visibility.Collapsed }) return null;
+        if (node is Microsoft.UI.Xaml.Controls.NumberBox number && number.Header as string == label) return number;
+        if (node is Microsoft.UI.Xaml.Controls.TextBox box && (box.Header as string == label || box.PlaceholderText == label)) return box;
+        int count = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < count; i++)
+        {
+            if (FindField(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i), label) is { } found) return found;
+        }
+        return null;
+    }
+
+    private static Microsoft.UI.Xaml.Controls.ComboBox? FindCombo(DependencyObject node, string header)
+    {
+        if (node is UIElement { Visibility: Visibility.Collapsed }) return null;
+        if (node is Microsoft.UI.Xaml.Controls.ComboBox combo && (combo.Header as string == header || combo.PlaceholderText == header)) return combo;
+        int count = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < count; i++)
+        {
+            if (FindCombo(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i), header) is { } found) return found;
+        }
+        return null;
+    }
+
+    // A list row whose text blocks, read together, hold the text.
+    private static Microsoft.UI.Xaml.Controls.ListViewItem? FindRow(DependencyObject node, string text)
+    {
+        if (node is UIElement { Visibility: Visibility.Collapsed }) return null;
+        if (node is Microsoft.UI.Xaml.Controls.ListViewItem row && string.Join(" ", TextsOf(row)).Contains(text, StringComparison.Ordinal)) return row;
+        int count = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < count; i++)
+        {
+            if (FindRow(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i), text) is { } found) return found;
+        }
+        return null;
+    }
+
+    private static IEnumerable<string> TextsOf(DependencyObject node)
+    {
+        if (node is Microsoft.UI.Xaml.Controls.TextBlock block) yield return block.Text;
+        int count = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node);
+        for (int i = 0; i < count; i++)
+        {
+            foreach (string text in TextsOf(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i))) yield return text;
+        }
+    }
+
+    /// The lowest message on screen: hidden sections keep their bubbles in the tree, and a list keeps
+    /// rows past its edges.
+    private static Features.Shared.MessageComposer? FindShownComposer(DependencyObject node)
+    {
+        for (int i = 0; i < Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node); i++)
+        {
+            DependencyObject child = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i);
+            // A hidden panel keeps its composer's own Visibility and size: what is inside it is not shown.
+            if (child is UIElement { Visibility: Visibility.Collapsed })
+            {
+                continue;
+            }
+
+            if (child is Features.Shared.MessageComposer { ActualWidth: > 0 } composer)
+            {
+                return composer;
+            }
+
+            if (FindShownComposer(child) is { } found)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static Features.Shared.MessageBubble? LastMessageBubble(FrameworkElement root)
+    {
+        Features.Shared.MessageBubble? lowest = null;
+        double lowestTop = double.MinValue;
+        void Walk(DependencyObject node)
+        {
+            if (node is UIElement { Visibility: Visibility.Collapsed })
+            {
+                return;
+            }
+
+            if (node is Features.Shared.MessageBubble { Row.BubbleVisibility: Visibility.Visible, ActualHeight: > 0 } bubble)
+            {
+                double top = bubble.TransformToVisual(root).TransformPoint(default).Y;
+                if (top >= 0 && top + bubble.ActualHeight <= root.ActualHeight && top > lowestTop)
+                {
+                    lowest = bubble;
+                    lowestTop = top;
+                }
+
+                return;
+            }
+
+            for (int i = 0; i < Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node); i++)
+            {
+                Walk(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i));
+            }
+        }
+
+        Walk(root);
+        return lowest;
+    }
+
+    private static FrameworkElement? FindLastNamedDescendant(DependencyObject node, string name)
+    {
+        for (int i = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(node) - 1; i >= 0; i--)
+        {
+            if (FindLastNamedDescendant(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(node, i), name) is { } found)
+            {
+                return found;
+            }
+        }
+
+        return node is FrameworkElement element && element.Name == name ? element : null;
+    }
+
     private static FrameworkElement? FindNamedDescendant(DependencyObject node, string name)
     {
         if (node is FrameworkElement element && element.Name == name)
@@ -47,6 +195,8 @@ public sealed partial class MainWindow
         {
             case "state":
                 return BuildUiTestStateDump();
+            case "ui.icon":
+                return DescribeWindowIconForUiTest();
 
             // ui.shot <png path> — the window as XAML draws it (RenderTargetBitmap), so a script can
             // look at a layout without taking the screen from whoever sits at the machine. Video in a
@@ -113,6 +263,64 @@ public sealed partial class MainWindow
                 var bitmap = new Microsoft.UI.Xaml.Media.Imaging.RenderTargetBitmap();
                 await bitmap.RenderAsync(root);
                 byte[] pixels = (await bitmap.GetPixelsAsync()).ToArray();
+                // Open popups (a menu, a ComboBox's list, a dialog) are not in the window's tree:
+                // each is rendered on its own and laid over at its place.
+                double scale = bitmap.PixelWidth / Math.Max(1, ((FrameworkElement)root).ActualWidth);
+                string drawnPopups = string.Empty;
+                foreach (var popup in Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(root.XamlRoot))
+                {
+                    // A Flyout's popup holds a sizeless canvas with the presenter inside.
+                    FrameworkElement? child = popup.Child as FrameworkElement;
+                    while (child is { ActualWidth: < 1 } && Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(child) > 0)
+                    {
+                        child = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(child, 0) as FrameworkElement;
+                    }
+
+                    if (child is null || child.ActualWidth < 1)
+                    {
+                        continue;
+                    }
+
+                    var layer = new Microsoft.UI.Xaml.Media.Imaging.RenderTargetBitmap();
+                    await layer.RenderAsync(child);
+                    // A Flyout's shell draws nothing by itself: what it holds does.
+                    while (layer.PixelWidth == 0 && Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(child) > 0 &&
+                           Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(child, 0) is FrameworkElement inner)
+                    {
+                        child = inner;
+                        await layer.RenderAsync(child);
+                    }
+
+                    byte[] over = (await layer.GetPixelsAsync()).ToArray();
+                    var at = child.TransformToVisual(root).TransformPoint(new global::Windows.Foundation.Point(0, 0));
+                    drawnPopups += $" popup={child.GetType().Name}:{layer.PixelWidth}x{layer.PixelHeight}@{at.X:0},{at.Y:0}";
+                    int left = (int)Math.Round(at.X * scale), top = (int)Math.Round(at.Y * scale);
+                    for (int y = 0; y < layer.PixelHeight; y++)
+                    {
+                        int ty = top + y;
+                        if (ty < 0 || ty >= bitmap.PixelHeight)
+                        {
+                            continue;
+                        }
+
+                        for (int x = 0; x < layer.PixelWidth; x++)
+                        {
+                            int tx = left + x;
+                            if (tx < 0 || tx >= bitmap.PixelWidth)
+                            {
+                                continue;
+                            }
+
+                            // Premultiplied BGRA: source over destination.
+                            int s = (y * layer.PixelWidth + x) * 4, d = (ty * bitmap.PixelWidth + tx) * 4;
+                            int keep = 255 - over[s + 3];
+                            for (int c = 0; c < 4; c++)
+                            {
+                                pixels[d + c] = (byte)(over[s + c] + pixels[d + c] * keep / 255);
+                            }
+                        }
+                    }
+                }
                 using (var stream = new global::Windows.Storage.Streams.InMemoryRandomAccessStream())
                 {
                     var encoder = await global::Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(
@@ -134,7 +342,470 @@ public sealed partial class MainWindow
                     File.WriteAllBytes(string.Join(' ', args), png);
                 }
 
-                return $"ok {bitmap.PixelWidth}x{bitmap.PixelHeight}";
+                return $"ok {bitmap.PixelWidth}x{bitmap.PixelHeight}{drawnPopups}";
+            }
+
+            // ui.open <x:Name> — a ComboBox's list, a button's flyout or an element's context menu, open
+            // as a click opens it, so ui.shot shows how it looks; ui.close shuts every open popup
+            // (a dialog included).
+            case "ui.open":
+            {
+                // «last»: the last of many with that name, as a transcript's newest bubble.
+                if (args.Count == 0 || Content is not FrameworkElement root ||
+                    (args.Count > 1 && args[1] == "last" ? FindLastNamedDescendant(root, args[0]) : FindNamedDescendant(root, args[0])) is not { } target)
+                {
+                    return "error: ui.open <x:Name of a ComboBox, a button with a flyout, an element with a context menu> [last]";
+                }
+
+                switch (target)
+                {
+                    case ComboBox box:
+                        box.IsDropDownOpen = true;
+                        break;
+                    case Button { Flyout: { } flyout } button:
+                        flyout.ShowAt(button);
+                        break;
+                    case { ContextFlyout: { } menu }:
+                        menu.ShowAt(target);
+                        break;
+                    default:
+                        return "error: " + args[0] + " opens nothing";
+                }
+
+                return "ok";
+            }
+
+            // ui.menu <item's text or emoji> — the last message on screen: its menu opened, that item
+            // pressed as a click presses it; with no text, the menu left open to look at.
+            case "ui.menu":
+            {
+                if (Content is not FrameworkElement root || LastMessageBubble(root) is not { } bubble)
+                {
+                    return "error: no message on screen";
+                }
+
+                if (args.Count == 0)
+                {
+                    bubble.OpenMenuForUiTest();
+                    return "ok";
+                }
+
+                return bubble.PressMenuItemForUiTest(string.Join(' ', args));
+            }
+
+            // ui.gc — everything unreachable collected and finalized: what is left in native memory after
+            // this is held, not waiting for a collection.
+            case "ui.gc":
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                return $"ok\nheap={GC.GetTotalMemory(false) / (1024 * 1024)}MB committed={GC.GetGCMemoryInfo().TotalCommittedBytes / (1024 * 1024)}MB";
+            }
+
+            // ui.hold <begin|outside|inside|lock|release> — the record button's gesture, step by step.
+            case "ui.hold":
+            {
+                if (args.Count == 0 || Content is not FrameworkElement root || FindShownComposer(root) is not { } composer)
+                {
+                    return "error: ui.hold <step>, with a composer on screen";
+                }
+
+                string said = composer.HoldForUiTest(args[0]);
+                return said.StartsWith("error", StringComparison.Ordinal) ? said : $"ok\n{said}";
+            }
+
+            // ui.record — the record button's right click. ui.smiley [emoji] — the panel opened, or one pressed.
+            case "ui.record":
+            case "ui.smiley":
+            {
+                if (Content is not FrameworkElement root || FindShownComposer(root) is not { } composer)
+                {
+                    return "error: no composer on screen";
+                }
+
+                return "ok\n" + (command == "ui.record"
+                    ? composer.RecordKindForUiTest()
+                    : composer.EmojiForUiTest(args.Count > 0 ? args[0] : null));
+            }
+
+            // ui.voice <start|cancel|send|state|tone seconds> — the composer on screen's recording.
+            case "ui.voice":
+            {
+                if (Content is not FrameworkElement root || FindShownComposer(root) is not { } composer)
+                {
+                    return "error: no composer on screen";
+                }
+
+                double seconds = args.Count > 1 && double.TryParse(args[1], System.Globalization.CultureInfo.InvariantCulture, out double parsed) ? parsed : 3;
+                string said = composer.VoiceForUiTest(args.Count > 0 ? args[0] : "state", seconds);
+                return said.StartsWith("error", StringComparison.Ordinal) ? said : $"ok\n{said}";
+            }
+
+            // ui.circle <start|cancel|send|state|tone seconds|check> — the composer on screen's video message.
+            case "ui.circle":
+            {
+                if (Content is not FrameworkElement root || FindShownComposer(root) is not { } composer)
+                {
+                    return "error: no composer on screen";
+                }
+
+                double seconds = args.Count > 1 && double.TryParse(args[1], System.Globalization.CultureInfo.InvariantCulture, out double parsed) ? parsed : 3;
+                string said = await composer.VideoNoteForUiTestAsync(args.Count > 0 ? args[0] : "state", seconds);
+                return said.StartsWith("error", StringComparison.Ordinal) ? said : $"ok\n{said}";
+            }
+
+            // ui.watch [play|state] — the last message on screen, a video message.
+            case "ui.watch":
+            {
+                if (args.Count == 0 || args[0] == "state")
+                {
+                    return "ok\n" + Features.Shared.VideoNotePlayer.StateForUiTest();
+                }
+
+                if (Content is not FrameworkElement root || LastMessageBubble(root) is not { Row: { } row } bubble)
+                {
+                    return "error: no message on screen";
+                }
+
+                if (row.VideoNoteVisibility != Visibility.Visible)
+                {
+                    return "error: the last message is no video message";
+                }
+
+                bubble.PressVideoNoteForUiTest();
+                return "ok";
+            }
+
+            // ui.listen [play|seek fraction|state] — the last message on screen, a voice message.
+            case "ui.listen":
+            {
+                string what = args.Count > 0 ? args[0] : "state";
+                if (what == "state")
+                {
+                    return "ok\n" + Features.Shared.VoicePlayer.StateForUiTest();
+                }
+
+                if (Content is not FrameworkElement root || LastMessageBubble(root) is not { Row: { } row } bubble)
+                {
+                    return "error: no message on screen";
+                }
+
+                if (row.VoiceVisibility != Visibility.Visible)
+                {
+                    return "error: the last message is no voice message";
+                }
+
+                if (what == "seek" && args.Count > 1 && double.TryParse(args[1], System.Globalization.CultureInfo.InvariantCulture, out double fraction))
+                {
+                    Features.Shared.VoicePlayer.Seek(row, fraction);
+                }
+                else
+                {
+                    bubble.PressVoicePlayForUiTest();
+                }
+
+                return "ok";
+            }
+
+            // ui.mention [text] — the open list after `@` in the composer on screen; with text, its row
+            // pressed.
+            case "ui.mention":
+            {
+                if (Content is not FrameworkElement root)
+                {
+                    return "error: no window content";
+                }
+
+                string? choose = args.Count > 0 ? string.Join(' ', args) : null;
+                return FindShownComposer(root)?.MentionsForUiTest(choose) ?? "error: no composer on screen";
+            }
+
+            case "ui.close":
+            {
+                if (Content is not UIElement root)
+                {
+                    return "error: no window content";
+                }
+
+                int closed = 0;
+                foreach (var popup in Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(root.XamlRoot))
+                {
+                    if (popup.Child is ContentDialog dialog)
+                    {
+                        dialog.Hide();
+                    }
+                    else
+                    {
+                        popup.IsOpen = false;
+                    }
+
+                    closed++;
+                }
+
+                return $"ok closed={closed}";
+            }
+
+            // ui.select <x:Name of a list> <row> — a row picked, as a click picks it (a contact, a setting page).
+            case "ui.select":
+            {
+                if (args.Count < 2 || Content is not FrameworkElement root || FindNamedDescendant(root, args[0]) is not ListViewBase list
+                    || !int.TryParse(args[1], out int row) || row < 0 || row >= list.Items.Count)
+                {
+                    return "error: ui.select <x:Name of a list> <row from 0>";
+                }
+
+                list.SelectedIndex = row;
+                return "ok";
+            }
+
+            // ui.click <x:Name> — a button's click through its automation peer (what a screen reader
+            // does), for the buttons that open a dialog: ui.shot then shows the dialog.
+            // ui.click <x> <y> is the real click at a point (MainWindow.TestChannel.ScreenControl.cs): two
+            // numbers are not a name, and this case answered for it with an error.
+            case "ui.click" when args.Count >= 2
+                && double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _)
+                && double.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _):
+                return TryExecuteScreenControlUiTestCommand("ui.click", args) ?? "error: ui.click <x> <y> [right]";
+            case "ui.click":
+            {
+                if (args.Count == 0 || Content is not FrameworkElement root || FindNamedDescendant(root, args[0]) is not Button button)
+                {
+                    return "error: ui.click <x:Name of a button>";
+                }
+
+                (new Microsoft.UI.Xaml.Automation.Peers.ButtonAutomationPeer(button) as Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider).Invoke();
+                return "ok";
+            }
+
+            // ui.press <text…> — a control built in code has no x:Name: the first visible button,
+            // check box, radio button or switch whose own text is this, in the window or an open
+            // popup (a dialog), pressed through its automation peer — never the mouse.
+            case "ui.press":
+            {
+                string wanted = string.Join(' ', args);
+                if (wanted.Length == 0 || Content is not UIElement { XamlRoot: { } pressRoot } pressContent)
+                {
+                    return "error: ui.press <text of a button, check box, radio button or switch>";
+                }
+                List<DependencyObject> roots = [pressContent];
+                roots.AddRange(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(pressRoot).Select(p => (DependencyObject)p.Child));
+                foreach (DependencyObject start in roots.AsEnumerable().Reverse())
+                {
+                    if (FindByText(start, wanted) is not { } hit) continue;
+                    switch (hit)
+                    {
+                        case Microsoft.UI.Xaml.Controls.ToggleSwitch toggle:
+                            toggle.IsOn = !toggle.IsOn;
+                            return $"ok switch={toggle.IsOn}";
+                        case Microsoft.UI.Xaml.Controls.RadioButton radio:
+                            radio.IsChecked = true;
+                            return "ok checked";
+                        case Microsoft.UI.Xaml.Controls.CheckBox box:
+                            (new Microsoft.UI.Xaml.Automation.Peers.CheckBoxAutomationPeer(box) as Microsoft.UI.Xaml.Automation.Provider.IToggleProvider)!.Toggle();
+                            return $"ok checked={box.IsChecked}";
+                        case Microsoft.UI.Xaml.Controls.Button pressed:
+                            (new Microsoft.UI.Xaml.Automation.Peers.ButtonAutomationPeer(pressed) as Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider)!.Invoke();
+                            return "ok pressed";
+                        case Microsoft.UI.Xaml.Controls.HyperlinkButton link:
+                            (new Microsoft.UI.Xaml.Automation.Peers.HyperlinkButtonAutomationPeer(link) as Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider)!.Invoke();
+                            return "ok pressed";
+                        // An expander's header (and any other toggle button): opened or closed as a click does.
+                        case Microsoft.UI.Xaml.Controls.Primitives.ToggleButton toggled:
+                            (new Microsoft.UI.Xaml.Automation.Peers.ToggleButtonAutomationPeer(toggled) as Microsoft.UI.Xaml.Automation.Provider.IToggleProvider)!.Toggle();
+                            return $"ok toggled={toggled.IsChecked}";
+                    }
+                }
+                return "error: nothing to press with the text " + wanted;
+            }
+
+            // ui.tap <x> <y> — what is at this point of ui.shot's picture (pixels), pressed as a screen
+            // reader presses it: the topmost thing there that can be invoked, toggled, selected or opened;
+            // a text box gets the focus. Unlike ui.click it never moves the mouse, so another window on
+            // top cannot take the click (a model walking the app by its pictures uses it).
+            case "ui.tap":
+            {
+                if (args.Count < 2 || Content is not UIElement { XamlRoot: { } tapRoot } tapContent
+                    || !double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double tapX)
+                    || !double.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double tapY))
+                {
+                    return "error: ui.tap <x> <y> (pixels of ui.shot)";
+                }
+                double tapScale = tapRoot.RasterizationScale;
+                global::Windows.Foundation.Point at = new(tapX / tapScale, tapY / tapScale);
+                // An open popup (a dialog, a menu) is above the window: it answers first.
+                List<UIElement> tapRoots = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(tapRoot).Select(p => p.Child).OfType<UIElement>().Reverse().ToList();
+                tapRoots.Add(tapContent);
+                foreach (UIElement start in tapRoots)
+                {
+                    bool covered = false;
+                    foreach (UIElement hit in Microsoft.UI.Xaml.Media.VisualTreeHelper.FindElementsInHostCoordinates(at, start))
+                    {
+                        covered = true;
+                        if (hit is Microsoft.UI.Xaml.Controls.TextBox box)
+                        {
+                            box.Focus(FocusState.Programmatic);
+                            return $"ok focused text box «{box.Header ?? box.PlaceholderText}»";
+                        }
+                        Microsoft.UI.Xaml.Automation.Peers.AutomationPeer? peer = Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer.FromElement(hit)
+                            ?? Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer.CreatePeerForElement(hit);
+                        if (peer is null) continue;
+                        string what = peer.GetName() is { Length: > 0 } name ? name : peer.GetClassName();
+                        if (peer.GetPattern(Microsoft.UI.Xaml.Automation.Peers.PatternInterface.Invoke) is Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider invoke)
+                        {
+                            invoke.Invoke();
+                            return $"ok pressed «{what}»";
+                        }
+                        if (peer.GetPattern(Microsoft.UI.Xaml.Automation.Peers.PatternInterface.Toggle) is Microsoft.UI.Xaml.Automation.Provider.IToggleProvider toggle)
+                        {
+                            toggle.Toggle();
+                            return $"ok toggled «{what}»";
+                        }
+                        if (peer.GetPattern(Microsoft.UI.Xaml.Automation.Peers.PatternInterface.SelectionItem) is Microsoft.UI.Xaml.Automation.Provider.ISelectionItemProvider item)
+                        {
+                            item.Select();
+                            return $"ok selected «{what}»";
+                        }
+                        if (peer.GetPattern(Microsoft.UI.Xaml.Automation.Peers.PatternInterface.ExpandCollapse) is Microsoft.UI.Xaml.Automation.Provider.IExpandCollapseProvider expand)
+                        {
+                            if (expand.ExpandCollapseState == Microsoft.UI.Xaml.Automation.ExpandCollapseState.Expanded) expand.Collapse(); else expand.Expand();
+                            return $"ok opened «{what}»";
+                        }
+                    }
+                    // A popup covers what is under it, as on screen.
+                    if (covered && start != tapContent) return "ok nothing to press there (a popup covers it)";
+                }
+                return "ok nothing to press there";
+            }
+
+            // ui.pick <text…> — a row of a list built in code (files of a project, versions of the
+            // history): the first visible row whose text holds this, selected as a click does.
+            // ui.pick <header> = <item…> — an item of a drop-down list with this header.
+            case "ui.pick":
+            {
+                string line = string.Join(' ', args);
+                if (line.Length == 0 || Content is not UIElement { XamlRoot: { } pickRoot } pickContent)
+                {
+                    return "error: ui.pick <text of a row> | ui.pick <header> = <item>";
+                }
+                List<DependencyObject> roots = [pickContent];
+                roots.AddRange(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(pickRoot).Select(p => (DependencyObject)p.Child));
+                int eq = line.IndexOf(" = ", StringComparison.Ordinal);
+                foreach (DependencyObject start in roots.AsEnumerable().Reverse())
+                {
+                    if (eq > 0)
+                    {
+                        if (FindCombo(start, line[..eq]) is not { } combo) continue;
+                        string item = line[(eq + 3)..];
+                        object? hit = combo.Items.FirstOrDefault(i => (i is Microsoft.UI.Xaml.Controls.ComboBoxItem c ? ShownText(c.Content) : i?.ToString() ?? string.Empty) == item);
+                        if (hit is null) return "error: no item " + item;
+                        combo.SelectedItem = hit;
+                        return "ok";
+                    }
+                    if (FindRow(start, line) is { } row && Microsoft.UI.Xaml.Controls.ItemsControl.ItemsControlFromItemContainer(row) is Microsoft.UI.Xaml.Controls.ListViewBase list)
+                    {
+                        list.SelectedItem = list.ItemFromContainer(row);
+                        return "ok";
+                    }
+                }
+                return "error: nothing to pick with the text " + line;
+            }
+
+            // ui.size [<width> <height>] — the window's size in pixels: without numbers says it, with
+            // them sets it (a narrow layout is checked without dragging the window's edge).
+            case "ui.size":
+            {
+                if (args.Count >= 2)
+                {
+                    // A minimized window ignores the size and keeps drawing the old one.
+                    if (AppWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter { State: not Microsoft.UI.Windowing.OverlappedPresenterState.Restored } presenter)
+                    {
+                        presenter.Restore();
+                    }
+
+                    AppWindow.Resize(new global::Windows.Graphics.SizeInt32(int.Parse(args[0], System.Globalization.CultureInfo.InvariantCulture), int.Parse(args[1], System.Globalization.CultureInfo.InvariantCulture)));
+                }
+                return $"ok {AppWindow.Size.Width}x{AppWindow.Size.Height}";
+            }
+
+            // ui.type <header or placeholder> = <text…> — a text box or a number box built in code.
+            case "ui.type":
+            {
+                string line = string.Join(' ', args);
+                int eq = line.IndexOf(" = ", StringComparison.Ordinal);
+                if (eq < 0 || Content is not UIElement { XamlRoot: { } typeRoot } typeContent)
+                {
+                    return "error: ui.type <header or placeholder> = <text>";
+                }
+                string label = line[..eq], value = line[(eq + 3)..];
+                List<DependencyObject> roots = [typeContent];
+                roots.AddRange(Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(typeRoot).Select(p => (DependencyObject)p.Child));
+                foreach (DependencyObject start in roots.AsEnumerable().Reverse())
+                {
+                    switch (FindField(start, label))
+                    {
+                        case Microsoft.UI.Xaml.Controls.NumberBox number:
+                            number.Value = double.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                            return "ok";
+                        case Microsoft.UI.Xaml.Controls.TextBox box:
+                            box.Text = value;
+                            return "ok";
+                    }
+                }
+                return "error: no field " + label;
+            }
+
+            // ui.theme <light|dark|system> — the theme picker in Settings, so a page is shot in both themes.
+            // ui.pins — the open chat's pins and recent deletions, as the core reads them.
+            case "ui.pins":
+            {
+                string? open = GetResolvedCurrentDialogKey();
+                if (open is null)
+                {
+                    return "error: no open chat";
+                }
+
+                MessageActionsView seen = rustBridge.GetMessageActions(open);
+                return $"ok dialog={open} mark={seen.Mark} pinned=[{string.Join(" | ", seen.Pinned.Select(p => p.MessageId + ":" + p.Text))}] deleted={seen.Deleted.Count} rows_pinned={messageItems.Count(i => i.IsPinned)}";
+            }
+
+            // ui.answer delete <here|everyone> | forward <title> — what the next such dialog would be told.
+            case "ui.answer":
+            {
+                if (args.Count == 2 && args[0] == "delete")
+                {
+                    Features.Shared.MessageActions.UiTestDeleteForEveryone = args[1] == "everyone";
+                    return "ok";
+                }
+
+                if (args.Count >= 2 && args[0] == "forward")
+                {
+                    Features.Shared.MessageActions.UiTestForwardTo = string.Join(' ', args.Skip(1));
+                    return "ok";
+                }
+
+                return "error: ui.answer delete <here|everyone> | forward <title>";
+            }
+
+            // ui.emoji <noto|twemoji|system> — the emoji style, as the setting chooses it.
+            case "ui.emoji":
+            {
+                if (args.Count == 0 || SettingsEmojiStyleComboBox.Items.OfType<ComboBoxItem>().FirstOrDefault(i => (string)i.Tag == args[0]) is not { } style)
+                {
+                    return "error: ui.emoji <noto|twemoji|system>";
+                }
+                SettingsEmojiStyleComboBox.SelectedItem = style;
+                return "ok";
+            }
+
+            case "ui.theme":
+            {
+                if (args.Count == 0 || FindThemeComboItem(args[0]) is not { } item)
+                {
+                    return "error: ui.theme <light|dark|system>";
+                }
+                SettingsThemeComboBox.SelectedItem = item;
+                return "ok";
             }
 
             // ui.bounds <x:Name> [minWidth] — where an element and its ancestors really sit (window
@@ -189,27 +860,20 @@ public sealed partial class MainWindow
                 return lines.ToString();
             }
 
-            // ui.pane <open|close> — what the rail's toggle button does, so the open pane (item labels)
-            // can be shot with ui.shot.
-            case "ui.pane":
-            {
-                AuthenticatedNavigationView.IsPaneOpen = args.Count > 0 && args[0].Equals("open", StringComparison.OrdinalIgnoreCase);
-                return $"ok pane={(AuthenticatedNavigationView.IsPaneOpen ? "open" : "closed")}";
-            }
-
-            // nav <chats|contacts|settings|diagnostics> [section] — the same switch a click on the
+            // nav <chats|contacts|workspaces|settings|diagnostics> [section] — the same switch a click on the
             // navigation rail makes (section = a Settings / Diagnostics page tag, e.g. `calls`), so a
             // script can shoot a page with ui.shot.
             case "nav":
             {
                 if (args.Count < 1)
                 {
-                    return "error: nav <chats|contacts|settings|diagnostics> [section]";
+                    return "error: nav <chats|contacts|workspaces|settings|diagnostics> [section]";
                 }
 
                 AuthenticatedNavigationView.SelectedItem = args[0].ToLowerInvariant() switch
                 {
                     "contacts" => ContactsNavigationItem,
+                    "workspaces" => WorkspacesNavigationItem,
                     "settings" => SettingsNavigationItem,
                     "diagnostics" => DiagnosticsNavigationItem,
                     _ => ChatsNavigationItem,
@@ -612,6 +1276,8 @@ public sealed partial class MainWindow
             case "contact.block":
             case "contact.remove":
             case "contact.approve":
+            // V-13: the «Разрешить встречу через его сервер» button on the contact's card.
+            case "contact.allow-couriers":
             {
                 string? wanted = args.Count > 0 ? string.Join(' ', args) : null;
                 ContactSnapshot? target = rustBridge.GetContactsScreenSnapshot().Contacts.FirstOrDefault(contact =>
@@ -624,6 +1290,11 @@ public sealed partial class MainWindow
                 windowState.SelectedContactId = target.ContactId;
                 switch (command)
                 {
+                    case "contact.allow-couriers":
+                        RefreshSelectedContactCard();
+                        int asked = selectedContactCouriersToAllow.Count;
+                        OnAllowContactCourierClicked(this, new RoutedEventArgs());
+                        return $"ok\nallowed={asked}\nleft={selectedContactCouriersToAllow.Count}";
                     case "contact.block":
                         OnBlockContactClicked(this, new RoutedEventArgs());
                         break;
@@ -895,6 +1566,53 @@ public sealed partial class MainWindow
                 OnSettingsSavePublicProfileClicked(this, new RoutedEventArgs());
                 return await SettleUiTestCommandAsync();
 
+            // «Сменить фото…» without the file dialog: the crop frame opens over the window and stays
+            // open (ui.shot sees it, ui.close cancels); turns and zoom (1 = just covers) move it.
+            case "photo.crop":
+            {
+                if (args.Count < 1 || !System.IO.File.Exists(args[0]))
+                {
+                    return "error: photo.crop <existing image path> [quarter turns] [zoom]";
+                }
+
+                _ = CropPublicAvatarAsync(args[0]);
+                for (int waited = 0; Features.Shared.PhotoCropDialog.Open is null && waited < 50; waited++)
+                {
+                    await Task.Delay(100);
+                }
+
+                Features.Shared.PhotoCropDialog? crop = Features.Shared.PhotoCropDialog.Open;
+                if (crop is null)
+                {
+                    return $"error: the crop frame did not open: {SettingsProfileEditorStatusTextBlock.Text}";
+                }
+
+                crop.ApplyForUiTest(
+                    args.Count > 1 ? int.Parse(args[1], System.Globalization.CultureInfo.InvariantCulture) : 0,
+                    args.Count > 2 ? double.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture) : 1);
+                return crop.DescribeForUiTest();
+            }
+
+            // «Готово» in the open crop frame: the framed square becomes the pending avatar.
+            case "photo.crop.done":
+            {
+                if (Features.Shared.PhotoCropDialog.Open is not { } crop)
+                {
+                    return "error: no crop frame is open";
+                }
+
+                string? before = pendingPublicAvatarSourcePath;
+                crop.AcceptForUiTest();
+                for (int waited = 0; pendingPublicAvatarSourcePath == before && waited < 50; waited++)
+                {
+                    await Task.Delay(100);
+                }
+
+                return pendingPublicAvatarSourcePath == before
+                    ? "error: the framed picture was not taken"
+                    : $"ok pending={pendingPublicAvatarSourcePath}";
+            }
+
             case "name.findable":
                 rustBridge.SetNameFindable(args.Count > 0 && args[0] == "on");
                 RefreshDiscoverabilitySettings();
@@ -1037,6 +1755,8 @@ public sealed partial class MainWindow
                 return TryExecuteScreenControlUiTestCommand(command.ToLowerInvariant(), args)
                     ?? TryExecuteRemoteAccessUiTestCommand(command.ToLowerInvariant(), args)
                     ?? await TryExecuteGroupUiTestCommandAsync(command.ToLowerInvariant(), args)
+                    ?? await TryExecuteWorkspaceUiTestCommandAsync(command.ToLowerInvariant(), args)
+                    ?? await TryExecuteVideoDeviceUiTestCommandAsync(command.ToLowerInvariant(), args)
                     ?? $"error: unknown command '{command}'";
         }
     }
@@ -1175,6 +1895,8 @@ public sealed partial class MainWindow
         builder.AppendLine($"remote_image_visible={(RemoteCallVideoImage.Visibility == Visibility.Visible).ToString().ToLowerInvariant()}");
         builder.AppendLine($"remote_swapchain_visible={(RemoteCallVideoSwapChainPanel.Visibility == Visibility.Visible).ToString().ToLowerInvariant()}");
         builder.AppendLine($"video_grid_visible={(ChatCallVideoGrid.Visibility == Visibility.Visible).ToString().ToLowerInvariant()}");
+        // Diagnostics > Media mirrors this block's Visibility too: hidden here = a blank page.
+        builder.AppendLine($"diagnostics_visible={(CallVideoDiagnosticsTextBlock.Visibility == Visibility.Visible).ToString().ToLowerInvariant()}");
         builder.AppendLine($"diagnostics={(CallVideoDiagnosticsTextBlock.Text ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ')}");
         return builder.ToString().TrimEnd();
     }

@@ -50,9 +50,8 @@ internal static partial class NativeMethods
         LoadExport(ref omniContactsList, nameof(omni_contacts_list));
         LoadExport(ref omniContactsGetRefreshSummary, nameof(omni_contacts_get_refresh_summary));
         LoadExport(ref omniContactsGetScreenSnapshot, nameof(omni_contacts_get_screen_snapshot));
-        LoadExport(ref omniContactsAddByIdentifier, nameof(omni_contacts_add_by_identifier));
-        LoadExport(ref omniContactsRequestByIdentifier, nameof(omni_contacts_request_by_identifier));
         LoadExport(ref omniContactsAddFromPayload, nameof(omni_contacts_add_from_payload));
+        LoadExport(ref omniContactsAllowCourier, nameof(omni_contacts_allow_courier));
         LoadExport(ref omniContactsRename, nameof(omni_contacts_rename));
         LoadExport(ref omniContactsBlock, nameof(omni_contacts_block));
         LoadExport(ref omniContactsApprove, nameof(omni_contacts_approve));

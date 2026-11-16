@@ -1,0 +1,19 @@
+[package]
+name = "omni-git-helper"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# git's side of a workspace fetch over the mesh (docs/decisions/omni-workspace-git.md, phase 1). The
+# core runs `git fetch "ext::<this helper> --relay <addr> <token> %S"`; git talks its pack protocol on
+# the helper's stdin/stdout, and the helper carries those bytes to the core's one-shot loopback
+# entry, which carries them on to a member's `git upload-pack` over a mesh bulk stream. Holds no
+# keys, knows nothing of Omni beyond the address and the token. A separate process because git
+# needs a command to run; in a single-file host it is the host re-run with `--run-helper git`.
+
+[[bin]]
+name = "omni-git-helper"
+path = "src/main.rs"
+
+[lints]
+workspace = true

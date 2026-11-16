@@ -62,6 +62,17 @@ impl AttachmentTransferStream {
         }
     }
 
+    /// As [`Self::read_frame`], waiting for the frame no longer than `wait`: a peer that keeps the
+    /// stream open and sends nothing must not hold the reader's thread for good.
+    pub fn read_frame_within(&mut self, wait: std::time::Duration) -> OmniResult<Option<AttachmentTransferFrameV2>> {
+        let recv = &mut self.recv;
+        match self.runtime.block_on(async { tokio::time::timeout(wait, read_attachment_stream_frame(recv)).await }) {
+            Ok(Ok(frame)) => Ok(frame),
+            Ok(Err(error)) => Err(OmniError::Transport(format!("failed to read attachment stream frame: {error}"))),
+            Err(_) => Err(OmniError::Transport("no attachment stream frame came in time".into())),
+        }
+    }
+
     /// Finish the sending half: the peer's reader sees clean end-of-stream rather than a reset.
     pub fn close(&mut self) -> OmniResult<()> {
         use tokio::io::AsyncWriteExt as _;

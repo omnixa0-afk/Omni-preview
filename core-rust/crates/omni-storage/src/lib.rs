@@ -52,6 +52,13 @@ pub const STALE_SESSION_WRITE: &str = "stale session write";
 /// (`Storage::get_one_time_prekey_for_inbound_bootstrap`): a bundle spreads to many peers, and the
 /// late ones keep resending a bootstrap made from it. A week — the catch-up window of a new device.
 pub const ONE_TIME_PREKEY_SHARED_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// How often a device makes a new signed prekey (`Storage::maintain_prekeys`). The old one stays
+/// usable for bootstraps that name it until [`PREKEY_LATE_BOOTSTRAP_MS`] past its expiry (and at
+/// least that long after the rotation), then its private half is erased (V-09).
+pub const SIGNED_PREKEY_ROTATION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// How late a bootstrap made from a still-valid prekey can arrive: the longest a durable frame lives
+/// (`omni-network` `MAX_DURABLE_TTL_SECS`, 7 days).
+pub const PREKEY_LATE_BOOTSTRAP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const LOCAL_INSTANCE_ID_META_KEY: &str = "local_instance_id";
 const PROFILE_MASTER_KEY_LEN: usize = 32;
 const PASSWORD_SALT_LEN: usize = 16;
@@ -59,9 +66,100 @@ const PASSWORD_ARGON2_MEMORY_KIB: u32 = 64 * 1024;
 const PASSWORD_ARGON2_ITERATIONS: u32 = 3;
 const PASSWORD_ARGON2_PARALLELISM: u32 = 1;
 
+/// Rename `from` to `to`, waiting up to a few seconds while another handle still has it open: the
+/// core just freed leaves threads that close their connection a moment later, and the restore that
+/// follows found the database busy (full core run 2026-11-10). Any other failure returns at once.
+fn rename_once_let_go(from: &Path, to: &Path) -> std::io::Result<()> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match fs::rename(from, to) {
+            Err(error)
+                if std::time::Instant::now() < until
+                    && (error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(32)) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// A database's data moved aside (`Storage::set_aside_local_data_at_path`): each file and folder
+/// renamed into one folder beside the database, with where it came from.
+pub struct SetAsideLocalData {
+    folder: PathBuf,
+    moved: Vec<(PathBuf, PathBuf)>,
+}
+
+impl SetAsideLocalData {
+    /// What replaced the data failed: remove what it wrote and move the old data back.
+    pub fn put_back(self, db_path: &Path) -> OmniResult<()> {
+        Storage::delete_local_data_files(db_path)?;
+        self.move_back()
+    }
+
+    /// Move what was set aside back where it was (nothing else is touched).
+    fn move_back(self) -> OmniResult<()> {
+        for (original, moved_to) in self.moved.iter().rev() {
+            rename_once_let_go(moved_to, original).map_err(|error| {
+                OmniError::Storage(format!(
+                    "failed to put '{}' back (it is kept in '{}'): {error}",
+                    original.display(),
+                    self.folder.display()
+                ))
+            })?;
+        }
+        let _ = fs::remove_dir_all(&self.folder);
+        Ok(())
+    }
+
+    /// What replaced the data took: the old data goes.
+    pub fn discard(self) -> OmniResult<()> {
+        fs::remove_dir_all(&self.folder)
+            .map_err(|error| OmniError::Storage(format!("failed to delete '{}': {error}", self.folder.display())))
+    }
+}
+
 pub struct Storage {
     connection: Connection,
     db_path: PathBuf,
+    /// Files and folders whose rows went in a transaction still open: removed once it commits,
+    /// kept if it rolls back — a rollback never leaves rows naming files already gone (code audit
+    /// 2026-11-09, OMNI-05).
+    after_commit: std::cell::RefCell<Vec<AfterCommit>>,
+    /// Files made for rows of a transaction still open: removed if it rolls back (unless a row
+    /// still names them), kept once it commits. A file copied for a row that a rollback took away
+    /// stayed on the disk, named by nothing (blind audit 2026-11-13, pass 22).
+    after_rollback: std::cell::RefCell<Vec<AfterCommit>>,
+}
+
+/// What a profile's own `app_meta` keys start with (then its id and `:`).
+const PROFILE_META_PREFIX: &str = "profile:";
+
+/// What a profile kept in `app_meta` before its keys carried its id: moved by `migrate`.
+const LEGACY_PROFILE_META_PREFIXES: &[&str] = &[
+    "agent_",
+    "my_agents",
+    "workspace_agents",
+    "workspace_talk",
+    "workspace_news:",
+    "group_device_join:",
+    "group_device_offer:",
+    "group_profile_answered:",
+    "account_recovery_v1",
+];
+
+fn profile_meta_key(profile_id: &LocalProfileId, key: &str) -> String {
+    format!("{PROFILE_META_PREFIX}{}:{key}", profile_id.0)
+}
+
+/// A removal held until the transaction it belongs to commits.
+#[derive(Debug)]
+enum AfterCommit {
+    /// An attachment file: removed only if no row names it once the transaction is in.
+    AttachmentFile(PathBuf),
+    /// A profile's media folder.
+    Folder(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +177,8 @@ pub struct AttachmentRuntimeInfo {
     pub content_chunk_size_bytes: Option<u32>,
     pub local_source_size_bytes: Option<i64>,
     pub local_source_modified_unix_ms: Option<i64>,
+    /// The message this file's message answers.
+    pub reply_to: Option<String>,
 }
 
 impl AttachmentRuntimeInfo {
@@ -97,6 +197,7 @@ impl AttachmentRuntimeInfo {
             content_chunk_size_bytes: self.content_chunk_size_bytes,
             created_at_unix_ms,
             presentation: self.attachment.presentation.clone(),
+            reply_to: self.reply_to.clone(),
         }
     }
 }
@@ -303,6 +404,8 @@ impl Storage {
         Ok(Self {
             connection,
             db_path: path.to_path_buf(),
+            after_commit: Default::default(),
+            after_rollback: Default::default(),
         })
     }
 
@@ -409,6 +512,50 @@ impl Storage {
         Self::delete_local_data_files(&self.db_path)
     }
 
+    /// Move everything the database at `path` owns (the files `delete_local_data_at_path` would delete
+    /// and the profile's folders) aside, into one folder beside it: renames, no copying. What replaces
+    /// it is then written in its place, and the old data is put back if that fails
+    /// ([`SetAsideLocalData::put_back`]) or dropped once it took ([`SetAsideLocalData::discard`]).
+    /// Restoring a backup deleted the old data first, so a copy that failed half way left the user
+    /// with neither (blind audit 2026-11-10).
+    pub fn set_aside_local_data_at_path(path: impl AsRef<Path>) -> OmniResult<SetAsideLocalData> {
+        let path = path.as_ref();
+        let _confined = confine_destructive_path(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| OmniError::Storage("invalid database path".to_string()))?;
+        let folder = parent.join(format!(
+            ".omni-restore-previous-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default(),
+            std::process::id()
+        ));
+        fs::create_dir_all(&folder)
+            .map_err(|error| OmniError::Storage(format!("failed to create '{}': {error}", folder.display())))?;
+        let mut targets = Self::local_data_file_targets(path)?;
+        for profile_folder in ProfileFolder::ALL {
+            targets.push(profile_folder.path(path)?);
+        }
+        forget_database_key(path);
+        let mut aside = SetAsideLocalData { folder, moved: Vec::new() };
+        for (index, target) in targets.into_iter().enumerate() {
+            if !target.exists() {
+                continue;
+            }
+            let moved_to = aside.folder.join(index.to_string());
+            if let Err(error) = rename_once_let_go(&target, &moved_to) {
+                let failed = OmniError::Storage(format!("failed to set '{}' aside: {error}", target.display()));
+                // Half set aside: what is still in place is the old data too — only move back.
+                let _ = aside.move_back();
+                return Err(failed);
+            }
+            aside.moved.push((target, moved_to));
+        }
+        Ok(aside)
+    }
+
     pub fn delete_local_data_at_path(path: impl AsRef<Path>) -> OmniResult<()> {
         // TM-006: refuse to delete files at protected system locations.
         // Validate-only: actual delete uses the original path (preserves
@@ -485,29 +632,9 @@ impl Storage {
                 }
             }
         }
-        let attachments_dir = Self::attachments_root_for_db_path(path)?;
-        match fs::remove_dir_all(&attachments_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(OmniError::Storage(format!(
-                    "failed to delete attachments directory '{}': {error}",
-                    attachments_dir.display()
-                )));
-            }
-        }
-        let profile_media_dir = Self::profile_media_root_for_db_path(path)?;
-        match fs::remove_dir_all(&profile_media_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(OmniError::Storage(format!(
-                    "failed to delete profile media directory '{}': {error}",
-                    profile_media_dir.display()
-                )));
-            }
-        }
-        Ok(())
+        // Every folder the core keeps beside the database ([`ProfileFolder`]), not a list of its own
+        // here: the list was two folders long while the core kept five.
+        remove_profile_folders(path)
     }
 
     /// Fixed-name settings sidecars: the pre-rename layout, plus the ones the SHELL writes by a
@@ -574,6 +701,16 @@ impl Storage {
         Ok(targets)
     }
 
+    /// The files a copy of a database at `path` is made of: the database, its SQLite journals and its
+    /// key file. A copy writes these and nothing else.
+    fn database_copy_files(path: &Path) -> OmniResult<Vec<PathBuf>> {
+        let mut files = vec![path.to_path_buf()];
+        for suffix in ["-wal", "-shm", "-journal", DB_KEY_SIDECAR_SUFFIX] {
+            files.push(Self::sidecar_path(path, suffix)?);
+        }
+        Ok(files)
+    }
+
     fn sidecar_path(path: &Path, suffix: &str) -> OmniResult<PathBuf> {
         let file_name = path
             .file_name()
@@ -593,10 +730,7 @@ impl Storage {
     }
 
     fn profile_media_root_for_db_path(path: &Path) -> OmniResult<PathBuf> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| OmniError::Storage("invalid database path".to_string()))?;
-        Ok(parent.join("profile-media"))
+        ProfileFolder::ProfileMedia.path(path)
     }
 
     fn comparable_path_for_equality(path: &Path) -> OmniResult<String> {
@@ -648,22 +782,100 @@ impl Storage {
 
         match f(self) {
             Ok(value) => {
-                self.connection.execute_batch("COMMIT").map_err(|error| {
-                    OmniError::Storage(format!(
+                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    self.after_commit.borrow_mut().clear();
+                    self.run_after_rollback();
+                    return Err(OmniError::Storage(format!(
                         "failed to commit transaction for '{operation_name}': {error}"
-                    ))
-                })?;
+                    )));
+                }
+                self.after_rollback.borrow_mut().clear();
+                self.run_after_commit(operation_name)?;
                 Ok(value)
             }
             Err(error) => {
                 let _ = self.connection.execute_batch("ROLLBACK");
+                self.after_commit.borrow_mut().clear();
+                self.run_after_rollback();
                 Err(error)
             }
+        }
+    }
+
+    /// Whether a transaction is open on this connection: what is written now may still be rolled
+    /// back, so nothing that depends on it may leave the process yet (a frame sealed with a ratchet
+    /// step that a rollback takes back — blind audit 2026-11-13, pass 18).
+    pub fn in_transaction(&self) -> bool {
+        !self.connection.is_autocommit()
+    }
+
+    /// The connection itself, for the MLS engine (`omni-group-mls`): its state lives in this database,
+    /// and on this connection an MLS step and the app's rows around it are one transaction (blind
+    /// audit 2026-11-12, pass 17). Nothing else takes it.
+    pub fn connection_for_mls_engine(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Hold a removal until the open transaction commits; outside one, it is done now.
+    fn remove_after_commit(&self, removal: AfterCommit) -> OmniResult<()> {
+        if self.connection.is_autocommit() {
+            return self.remove_now(removal);
+        }
+        self.after_commit.borrow_mut().push(removal);
+        Ok(())
+    }
+
+    /// Remove a file made for a row of the open transaction if that transaction rolls back; outside
+    /// one there is nothing to roll back.
+    fn remove_after_rollback(&self, removal: AfterCommit) {
+        if !self.connection.is_autocommit() {
+            self.after_rollback.borrow_mut().push(removal);
+        }
+    }
+
+    /// The transaction rolled back: the files made for its rows go (best effort — a file that
+    /// stays is named by nothing, as before).
+    fn run_after_rollback(&self) {
+        for removal in std::mem::take(&mut *self.after_rollback.borrow_mut()) {
+            let _ = self.remove_now(removal);
+        }
+    }
+
+    /// The transaction is in: the removals it held. Every one is tried; the first failure is told
+    /// (the rows are gone already, so what stays on disk is a file no row names).
+    fn run_after_commit(&self, operation_name: &str) -> OmniResult<()> {
+        let held = std::mem::take(&mut *self.after_commit.borrow_mut());
+        let mut first_error = None;
+        for removal in held {
+            if let Err(error) = self.remove_now(removal) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            None => Ok(()),
+            Some(error) => Err(OmniError::Storage(format!("'{operation_name}' is done, but a file stayed: {error}"))),
+        }
+    }
+
+    fn remove_now(&self, removal: AfterCommit) -> OmniResult<()> {
+        match removal {
+            AfterCommit::AttachmentFile(path) => self.remove_unnamed_attachment_file(&path),
+            AfterCommit::Folder(path) => match fs::remove_dir_all(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(OmniError::Storage(format!(
+                    "failed to delete profile media directory '{}': {error}",
+                    path.display()
+                ))),
+            },
         }
     }
 }
 
 pub mod photo;
+pub mod video_note;
+pub mod voice;
 
 include!("storage_db_key.rs");
 
@@ -671,10 +883,16 @@ include!("storage_migrations.rs");
 
 include!("storage_ownership.rs");
 
+include!("storage_profile_folder.rs");
+
 include!("storage_profile_foundation.rs");
 
 include!("storage_durable_frames.rs");
 include!("storage_groups.rs");
+include!("storage_message_replies.rs");
+include!("storage_message_actions.rs");
+include!("storage_workspaces.rs");
+include!("storage_workspace_files.rs");
 include!("storage_remote_access.rs");
 
 include!("storage_mesh_dialog_route.rs");

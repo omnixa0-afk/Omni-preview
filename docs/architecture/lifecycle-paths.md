@@ -15,8 +15,9 @@ survive refactors.
 
 `OmniApp::sign_out` (or `prepare_sign_out` → `confirm_sign_out`)
 → `ProfileLifecycleCoordinator::stop_runtime_context` (`app_profile_lifecycle.rs`)
-→ `transport.stop_discovery` + `transport.stop_listener` + `clear_transport_local_identity`
-→ **All static-registry clears:**
+→ `OmniApp::stop_mesh` first (`app_mesh.rs`: autoconnect, runtime, dialog maps, rendezvous helper;
+  the shell starts it again on sign-in) + `clear_transport_local_identity`
+→ **All static-registry clears**, among them:
 - `clear_runtime_chat_sessions_for_active_profile` (`runtime_chat_sessions.rs`)
 - `clear_call_runtime_for_profile` (`app_calls.rs`)
 - `clear_realtime_media_negotiation_for_profile` (`app_realtime_media.rs`)
@@ -178,6 +179,8 @@ Inside `OmniApp::init`, the transport is given a callback. Variants:
 All run on the **transport-runtime thread**. They use `runtime_event_storage_for_callback`,
 `transport_handle_for_callback` and `session_lock_for_callback`, cloned from
 `OmniApp` init. Locks are acquired per call.
+
+For the queue worker, start at [runtime_queue.rs](../../core-rust/crates/omni-app/src/runtime_queue.rs). For inbound events, start at [runtime_transport_events.rs](../../core-rust/crates/omni-app/src/runtime_transport_events.rs). Some decision records named below are internal. The module paths are available in the public tree.
 
 ## Failure mode index
 

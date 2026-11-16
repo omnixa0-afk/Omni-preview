@@ -84,7 +84,7 @@ internal static partial class MainWindowPresentation
         if (snapshot is not null)
         {
             lines.Add(snapshot.State == "connected"
-                ? $"Активная сессия: {snapshot.RemoteDeviceName ?? snapshot.PeerKey ?? "есть"}{(string.IsNullOrWhiteSpace(snapshot.PeerId) ? string.Empty : $" ({snapshot.PeerId})")}"
+                ? $"Активная сессия: {snapshot.RemoteDeviceName ?? snapshot.PeerKey ?? "есть"}{(string.IsNullOrWhiteSpace(snapshot.PeerId) ? string.Empty : $" ({snapshot.PeerId})")}{DescribeActiveSessionPeer(snapshot, mesh)}"
                 : "Активная сессия: нет");
             if (!string.IsNullOrWhiteSpace(snapshot.LastError))
             {
@@ -93,6 +93,28 @@ internal static partial class MainWindowPresentation
         }
 
         return string.Join("\n", lines);
+    }
+
+    // The transport's active session is the last verified one it saw, whoever it is with — a group
+    // member, our own other device, a stranger whose request came in — and it stays after the link
+    // drops. Printed bare next to "0 contacts on a link", it read as a contact connected out of
+    // nowhere (docs/bugs/contact-request-said-sent-without-a-link.md). Who it is with and whether a
+    // link is up now come from the mesh state.
+    private static string DescribeActiveSessionPeer(TransportSnapshot snapshot, MeshConnectionStateDto? mesh)
+    {
+        if (mesh is null || string.IsNullOrWhiteSpace(snapshot.RemoteAccountId))
+        {
+            return string.Empty;
+        }
+
+        ContactConnectionDto? contact = mesh.Contacts.FirstOrDefault(
+            c => string.Equals(c.AccountId, snapshot.RemoteAccountId, StringComparison.Ordinal));
+        return contact switch
+        {
+            null => " — не из ваших контактов (участник группы, ваше устройство или чужая заявка)",
+            { Link: "online_direct" or "online_via_relay" } => " — контакт на связи",
+            _ => " — контакт, сейчас без связи",
+        };
     }
 
     private static string FormatNodeKind(string kind) => kind switch

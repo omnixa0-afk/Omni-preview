@@ -308,35 +308,11 @@ impl<'a> ProfileLifecycleCoordinator<'a> {
     }
 
     fn stop_runtime_context(&self) -> Result<(), ProfileLifecycleDomainError> {
+        // The mesh first (A55, audit 2026-11-09): left running, it kept carrying the profile's groups
+        // and dialing its contacts until the shell stopped it. The shell starts it again on sign-in.
+        self.app.stop_mesh();
         self.app.clear_transport_local_identity();
-        let _ = clear_runtime_chat_sessions_for_active_profile(&self.app.storage);
-        let db_path = self.app.storage.db_path().to_string_lossy().to_string();
-        clear_session_reachability_for_profile(&db_path);
-        clear_outgoing_envelopes_for_profile(&db_path);
-        clear_session_resync_for_profile(&db_path);
-        clear_call_runtime_for_profile(&db_path);
-        crate::app_group_calls::clear_group_calls_for_profile(&db_path);
-        crate::app_group_attachments::clear_group_attachment_pulls_for_db(&db_path);
-        crate::clear_own_device_not_here_for_db(&db_path);
-        crate::app_attachment_preparation::stop_attachment_preparations_for_profile(&db_path);
-        crate::app_screen_control::clear_screen_control_for_profile(&db_path);
-        crate::app_nat_class::clear_nat_class_for_profile(&db_path);
-        crate::app_peer_door::clear_peer_doors_for_profile(&db_path);
-        clear_realtime_media_negotiation_for_profile(&db_path);
-        clear_verification_challenges_for_profile(&db_path);
-        clear_public_profile_syncs_for_profile(&db_path);
-        clear_attachment_buffers_for_profile(&db_path);
-        clear_pending_contact_rate_limits_for_profile(&db_path);
-        clear_core_events_for_profile(&db_path);
-        clear_rendezvous_runtime_for_profile(&db_path);
-        crate::app_name_discovery::clear_name_discovery_for_profile(&db_path);
-        crate::app_relay_directory::clear_relay_directory_for_profile(&db_path);
-        crate::app_pinned_relay::clear_pinned_relay_for_profile(&db_path);
-        clear_account_mailbox_for_profile(&db_path);
-        clear_account_passport_state_for_profile(&db_path);
-        clear_history_sync_state_for_profile(&db_path);
-        clear_revocation_notices_for_profile(&db_path);
-        clear_connection_traces(&db_path);
+        clear_profile_registries(&self.app.storage);
         Ok(())
     }
 
@@ -480,6 +456,8 @@ impl<'a> ProfileLifecycleCoordinator<'a> {
     ) -> Result<LocalProfileSummary, ProfileLifecycleDomainError> {
         let profile = self.get_profile_summary_required(profile_id)?;
         self.validate_command_preconditions(profile.state, LifecycleCommandKind::UnlockWithPassword)?;
+        // The unlocked profile becomes the active one.
+        self.app.stop_the_active_profile_unless(Some(profile_id));
         let summary = self
             .app
             .storage
@@ -501,6 +479,8 @@ impl<'a> ProfileLifecycleCoordinator<'a> {
     ) -> Result<LocalProfileSummary, ProfileLifecycleDomainError> {
         let profile = self.get_profile_summary_required(profile_id)?;
         self.validate_command_preconditions(profile.state, LifecycleCommandKind::UnlockWithMnemonic)?;
+        // The unlocked profile becomes the active one.
+        self.app.stop_the_active_profile_unless(Some(profile_id));
         let summary = self
             .app
             .storage
@@ -552,19 +532,41 @@ impl<'a> ProfileLifecycleCoordinator<'a> {
                 )
             })?;
         self.ensure_confirmation_token(&preview, confirmation_token)?;
+        // Read while the rows are there: the projects' data on disk goes after them (F3).
+        let workspace_paths = self
+            .app
+            .storage
+            .workspace_published_paths_for_profile(profile_id)
+            .map_err(|error| self.map_storage_error(error))?;
         let active_profile_id = self
             .app
             .storage
             .get_active_profile_id()
             .map_err(|error| self.map_storage_error(error))?;
         if active_profile_id.as_ref() == Some(profile_id) {
-            // While the profile is still active (the MLS engine needs its identity): forget its groups.
-            crate::app_groups::forget_groups_mls(&self.app.storage);
             self.stop_runtime_context()?;
         }
+        // Its MLS rows, by the key they are sealed with, and its other rows (the key among them), as
+        // one: the MLS rows went first and on their own, so a delete that failed half way left the
+        // profile here without its groups' keys (blind audit 2026-11-13, pass 18).
         self.app
             .storage
-            .delete_local_profile(profile_id)
+            .with_immediate_transaction("delete_local_profile", |storage| {
+                crate::app_groups::forget_profile_mls(storage, profile_id)?;
+                storage.delete_local_profile(profile_id)
+            })
+            .or_else(|error| {
+                // The rows went and a file stayed (held open by another program): the profile is
+                // deleted, and the rest of the delete goes on — it stopped here and left the
+                // active profile pointing at one that is gone (blind audit 2026-11-13, pass 19).
+                match self.app.storage.get_local_profile_summary(profile_id) {
+                    Ok(None) => {
+                        crate::omni_app_trace_log("profile/delete", &format!("deleted; a file stays: {error}"));
+                        Ok(())
+                    }
+                    _ => Err(error),
+                }
+            })
             .map_err(|error| self.map_storage_error(error))?;
         if active_profile_id.as_ref() == Some(profile_id) {
             self.app
@@ -585,6 +587,8 @@ impl<'a> ProfileLifecycleCoordinator<'a> {
             ));
         }
         self.validate_transition(LocalProfileState::Deleting, LocalProfileState::Deleted)?;
+        crate::app_workspace::remove_profile_workspace_data(self.app.storage.db_path(), &workspace_paths);
+        crate::remove_profile_sidecars(self.app.storage.db_path(), profile_id);
         self.wipe_device_traces_if_no_profiles_remain()?;
         Ok(())
     }
@@ -621,4 +625,42 @@ impl<'a> ProfileLifecycleCoordinator<'a> {
         }
         Ok(())
     }
+}
+
+/// What a profile keeps in the process's registries, cleared: when it stops, and when its account
+/// takes this device back (blind audit 2026-11-13, pass 20 — the profile was erased and all of it
+/// stayed). Every registry keyed by the database path goes here (CONTRIBUTING, «Static registries»).
+pub(crate) fn clear_profile_registries(storage: &omni_storage::Storage) {
+    let db_path = storage.db_path().to_string_lossy().to_string();
+    crate::forget_taken_back(&db_path);
+    let _ = clear_runtime_chat_sessions_for_active_profile(storage);
+    clear_session_reachability_for_profile(&db_path);
+    clear_outgoing_envelopes_for_profile(&db_path);
+    clear_session_resync_for_profile(&db_path);
+    clear_call_runtime_for_profile(&db_path);
+    crate::app_group_calls::clear_group_calls_for_profile(&db_path);
+    crate::app_group_attachments::clear_group_attachment_pulls_for_db(&db_path);
+    crate::app_workspace::clear_workspaces_for_profile(&db_path);
+    crate::clear_own_device_not_here_for_db(&db_path);
+    crate::app_attachment_preparation::stop_attachment_preparations_for_profile(&db_path);
+    crate::app_screen_control::clear_screen_control_for_profile(&db_path);
+    crate::app_nat_class::clear_nat_class_for_profile(&db_path);
+    crate::app_peer_door::clear_peer_doors_for_profile(&db_path);
+    clear_realtime_media_negotiation_for_profile(&db_path);
+    clear_verification_challenges_for_profile(&db_path);
+    clear_public_profile_syncs_for_profile(&db_path);
+    clear_attachment_buffers_for_profile(&db_path);
+    clear_pending_contact_rate_limits_for_profile(&db_path);
+    clear_core_events_for_profile(&db_path);
+    clear_rendezvous_runtime_for_profile(&db_path);
+    crate::app_name_discovery::clear_name_discovery_for_profile(&db_path);
+    crate::app_relay_directory::clear_relay_directory_for_profile(&db_path);
+    crate::app_pinned_relay::clear_pinned_relay_for_profile(&db_path);
+    clear_account_mailbox_for_profile(&db_path);
+    clear_account_passport_state_for_profile(&db_path);
+    // Its plain copies for outside programs go with it (blind audit 2026-11-11, I8).
+    clear_media_open_copies(storage.db_path());
+    clear_history_sync_state_for_profile(&db_path);
+    clear_revocation_notices_for_profile(&db_path);
+    clear_connection_traces(&db_path);
 }

@@ -1,9 +1,9 @@
 ---
 title: Groups: chats and calls over the mesh (work plan)
-status: in-progress (G0-G10 implemented; remaining: per-sender tiles / active-speaker and a live 3-node A/V gate)
+status: in-progress (G0-G10 implemented; tile grid, manual focus and per-sender speaking indicators implemented; live 3-node A/V validation remains)
 relates:
   - docs/architecture/omni-product-vision.md (scope: groups of 3-8 first; non-goal: 50+ video; C1)
-  - docs/architecture/networking-overlay.md (mesh: destination=blake3(pubkey)[:16], announce-routed, multi-hop relay, E2E to the destination)
+  - docs/architecture/networking-overlay.md (mesh: destination=blake3(pubkey)[:20], announce-routed, multi-hop relay, E2E to the destination)
   - docs/decisions/networking-mesh-overlay-adoption.md
   - docs/decisions/media-hw-efficiency-and-device-codec-selection.md (HW enc/dec and device selection, reused for N incoming streams)
 ---
@@ -23,7 +23,7 @@ how it looks in the application.
   chosen by the participants, not a project-operated service.
 - **E2E by default, minimal metadata.** Intermediate nodes (including a call's peer forwarder) see
   only encrypted frames plus the minimum routing metadata, never content.
-- **The mesh already provides**: destination = `blake3(pubkey)[:16]`, announce-based routing,
+- **The mesh already provides**: destination = `blake3(pubkey)[:20]`, announce-based routing,
   multi-hop relay, store-and-forward potential, E2E up to the destination. The mesh has **no**
   group or multicast address, so fan-out is built on unicast destinations (or a group-destination is
   introduced as a separate primitive, see §3, open question).
@@ -365,9 +365,7 @@ A ✅ means the component exists and is covered by unit tests. The implementatio
   `publish_group_media_capabilities` (self-negotiation without a pairwise exchange). C#
   `CallVideoService.StartGroupMediaAsync` and `WatchDialogAsync(groupMode)` skip the 1:1 loops
   (control / capability / negotiation). Test
-  `group_call_media_routes_through_group_path_not_1to1_approval`. **v1 boundary:** one mixed remote
-  view (SSRC demux by the native receiver); per-sender tiles, active speaker, SVC and a **live 3-node
-  A/V gate** remain as UI and validation work.
+  `group_call_media_routes_through_group_path_not_1to1_approval`. **Original v1 boundary:** one mixed remote view (SSRC demux by the native receiver). The increments below record subsequent tile and speaking-indicator work. Automatic speaker selection, SVC and live three-node validation are separate milestones.
 
 ## Multi-party UI toward a conferencing view (after G10)
 

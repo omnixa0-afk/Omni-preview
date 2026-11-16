@@ -38,6 +38,17 @@ pub fn validate_call_invite_v1(invite: &CallInviteV1) -> OmniResult<()> {
             "call invite timestamps must be positive and expires_at_unix_ms must be greater than created_at_unix_ms".to_string(),
         ));
     }
+    validate_media_key_share("call invite", &invite.media_key_share)
+}
+
+/// A call's media key share is 32 bytes, hex. A call without one would have no media keys, and
+/// there is no unencrypted fallback.
+fn validate_media_key_share(what: &str, share: &str) -> OmniResult<()> {
+    if share.len() != 64 || !share.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(OmniError::InvalidInput(format!(
+            "{what} media_key_share must be 32 bytes of hex"
+        )));
+    }
     Ok(())
 }
 
@@ -56,7 +67,7 @@ pub fn validate_call_accept_v1(accept: &CallAcceptV1) -> OmniResult<()> {
         "call accept accepted_at_unix_ms",
         accept.accepted_at_unix_ms,
     )?;
-    Ok(())
+    validate_media_key_share("call accept", &accept.media_key_share)
 }
 
 pub fn validate_call_decline_v1(decline: &CallDeclineV1) -> OmniResult<()> {

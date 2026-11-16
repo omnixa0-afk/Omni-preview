@@ -3,8 +3,12 @@
 /// they do not know (an Oct 3 build re-created `group_ops`, and the next start dropped the MLS
 /// groups' rows on it; docs/bugs/old-build-wiped-groups.md). Bump it with any migration a build
 /// before it must not run over.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// Node address (hex) the expired base bootstrap relay's identity was pinned to; the
+/// `remove_expired_base_network_node_by_address` migration deletes its row from existing profiles.
+pub(crate) const EXPIRED_BASE_NODE_ADDRESS: &str = "91257e3bf737ba5e0645c8d2e4033d13e35ae872";
 
 impl Storage {
     /// Refuse a database a newer build has written (see [`SCHEMA_VERSION`]).
@@ -29,7 +33,7 @@ impl Storage {
         }
     }
 
-    fn table_exists(&self, table_name: &str) -> OmniResult<bool> {
+    pub(crate) fn table_exists(&self, table_name: &str) -> OmniResult<bool> {
         let exists: i64 = self
             .connection
             .query_row(
@@ -253,36 +257,18 @@ impl Storage {
             )
             .map_err(map_sqlite_error)?;
 
+        // A group line goes by the group feed and never waits in the 1:1 queue. This backfill used
+        // to bring them in at every start: no 1:1 receipt ever came, each turned `retrying` and was
+        // tried again every tick (four times a second, for good). Take back what it brought.
         self.connection
-            .execute(
+            .execute_batch(
                 "
-                INSERT OR IGNORE INTO outbound_queue (
-                    message_id,
-                    dialog_key,
-                    status,
-                    attempt_count,
-                    next_attempt_unix_ms,
-                    last_attempt_unix_ms,
-                    created_at_unix_ms,
-                    updated_at_unix_ms
-                )
-                SELECT
-                    id,
-                    dialog_key,
-                    status,
-                    0,
-                    NULL,
-                    CASE
-                        WHEN status = 'queued' THEN NULL
-                        ELSE updated_at_unix_ms
-                    END,
-                    created_at_unix_ms,
-                    updated_at_unix_ms
-                FROM messages
-                WHERE direction = 'outgoing'
-                  AND status IN ('queued', 'sending', 'sent', 'retrying', 'failed')
+                DELETE FROM outbound_queue WHERE dialog_key LIKE 'group:%';
+                UPDATE messages SET status = 'sent'
+                WHERE dialog_key LIKE 'group:%'
+                  AND direction = 'outgoing'
+                  AND status IN ('queued', 'sending', 'retrying');
                 ",
-                [],
             )
             .map_err(map_sqlite_error)?;
 
@@ -504,6 +490,16 @@ impl Storage {
                 highest_counter INTEGER NOT NULL DEFAULT 0,
                 recent_tags_json TEXT NOT NULL,
                 updated_at_unix_ms INTEGER NOT NULL
+            );
+
+            -- Newest verified session bootstrap seen from each remote device, in that device's clock:
+            -- an older one is a replay, the same one a re-delivery. On disk, so a restart does not
+            -- reopen the door to replays (it was an in-memory registry until 2026-10-18).
+            CREATE TABLE IF NOT EXISTS inbound_bootstrap_marks (
+                remote_account_id TEXT NOT NULL,
+                remote_device_id TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (remote_account_id, remote_device_id)
             );
 
             CREATE TABLE IF NOT EXISTS remote_device_observations (
@@ -734,6 +730,19 @@ impl Storage {
             );
             ",
         )?;
+        // Couriers a contact's device named that are not ours, which the user let us meet that
+        // contact through (V-13, courier-metadata-and-quota.md, step 6).
+        self.execute_migration_batch(
+            "create_allowed_pair_couriers",
+            "
+            CREATE TABLE IF NOT EXISTS allowed_pair_couriers (
+                profile_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                allowed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, url)
+            );
+            ",
+        )?;
         // The account passport: ours, its holders, and the ones we keep for others
         // (account-recovery-from-friends.md, Б1).
         self.execute_migration_batch(
@@ -815,6 +824,101 @@ impl Storage {
             );
             CREATE INDEX IF NOT EXISTS group_signed_lines_by_group
                 ON group_signed_lines (profile_id, group_id, authored_at_unix_ms);
+            ",
+        )?;
+        // What a message answers. Beside `messages`, whose rows every list reads by column number;
+        // the trigger takes a row with its message, whichever way the message goes.
+        self.execute_migration_batch(
+            "create_message_replies",
+            "
+            CREATE TABLE IF NOT EXISTS message_replies (
+                message_id TEXT PRIMARY KEY NOT NULL,
+                reply_to TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS message_mentions (
+                message_id TEXT PRIMARY KEY NOT NULL,
+                accounts_json TEXT NOT NULL
+            );
+            ",
+        )?;
+        // Lines deleted here or by their author, kept so that nothing brings them back; pins, one row
+        // per message so a late event cannot undo a newer one; a mark that views see an action by.
+        self.execute_migration_batch(
+            "create_message_actions",
+            "
+            CREATE TABLE IF NOT EXISTS message_deletions (
+                message_id TEXT PRIMARY KEY,
+                dialog_key TEXT NOT NULL,
+                at_unix_ms INTEGER NOT NULL,
+                unsent INTEGER NOT NULL DEFAULT 0,
+                changed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS message_deletions_unsent ON message_deletions (dialog_key) WHERE unsent = 1;
+            CREATE TABLE IF NOT EXISTS message_pins (
+                message_id TEXT PRIMARY KEY,
+                dialog_key TEXT NOT NULL,
+                pinned INTEGER NOT NULL,
+                at_unix_ms INTEGER NOT NULL,
+                unsent INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS message_pins_by_dialog ON message_pins (dialog_key, pinned);
+            CREATE TABLE IF NOT EXISTS message_actions_mark (
+                only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+                changed_at_unix_ms INTEGER NOT NULL
+            );
+            ",
+        )?;
+        // A deletion of a line not here yet: who asked, kept until the line comes and its author is
+        // known. A tombstone at once let anyone who knew the id keep someone else's line from us.
+        self.execute_migration_batch(
+            "create_message_delete_requests",
+            "
+            CREATE TABLE IF NOT EXISTS message_delete_requests (
+                message_id TEXT NOT NULL,
+                dialog_key TEXT NOT NULL,
+                requester_pub TEXT NOT NULL,
+                requester_account TEXT NOT NULL,
+                at_unix_ms INTEGER NOT NULL,
+                received_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (message_id, requester_pub, requester_account)
+            );
+            CREATE INDEX IF NOT EXISTS message_delete_requests_by_dialog
+                ON message_delete_requests (dialog_key, received_at_unix_ms);
+            ",
+        )?;
+        // The order group lines came in here — a number of ours, not the author's clock: what an
+        // agent has read is a place in it (code audit 2026-11-09, OMNI-03). AUTOINCREMENT: a number
+        // is never given twice, even after the latest line was deleted.
+        self.execute_migration_batch(
+            "create_group_message_arrivals",
+            "
+            CREATE TABLE IF NOT EXISTS group_message_arrivals (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                arrived_at_unix_ms INTEGER NOT NULL,
+                UNIQUE (profile_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS group_message_arrivals_by_group
+                ON group_message_arrivals (profile_id, group_id, seq);
+            ",
+        )?;
+        // Who put which emoji on a message: one per person, the latest stands (an empty one took it
+        // away, and stays to beat an older event arriving late).
+        self.execute_migration_batch(
+            "create_message_reactions",
+            "
+            CREATE TABLE IF NOT EXISTS message_reactions (
+                message_id TEXT NOT NULL,
+                reactor TEXT NOT NULL,
+                mine INTEGER NOT NULL,
+                emoji TEXT NOT NULL,
+                at_unix_ms INTEGER NOT NULL,
+                unsent INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_id, reactor)
+            );
+            CREATE INDEX IF NOT EXISTS message_reactions_unsent ON message_reactions (unsent) WHERE unsent = 1;
             ",
         )?;
         // A group that went on in two branches, and members asking to be put back
@@ -938,6 +1042,41 @@ impl Storage {
         self.ensure_table_column("profile_registry", "public_avatar_hash_hex", "TEXT")?;
         self.ensure_table_column("profile_registry", "public_avatar_mime_type", "TEXT")?;
         self.ensure_table_column("outbound_queue", "profile_id", "TEXT")?;
+        self.connection
+            .execute(
+                "
+                INSERT OR IGNORE INTO outbound_queue (
+                    profile_id,
+                    message_id,
+                    dialog_key,
+                    status,
+                    attempt_count,
+                    next_attempt_unix_ms,
+                    last_attempt_unix_ms,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                )
+                SELECT
+                    profile_id,
+                    id,
+                    dialog_key,
+                    status,
+                    0,
+                    NULL,
+                    CASE
+                        WHEN status = 'queued' THEN NULL
+                        ELSE updated_at_unix_ms
+                    END,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                FROM messages
+                WHERE direction = 'outgoing'
+                  AND status IN ('queued', 'sending', 'sent', 'retrying', 'failed')
+                  AND dialog_key NOT LIKE 'group:%'
+                ",
+                [],
+            )
+            .map_err(map_sqlite_error)?;
         self.ensure_table_column("inbound_dedup", "profile_id", "TEXT")?;
         self.ensure_table_column("delivery_receipts", "profile_id", "TEXT")?;
         self.ensure_table_column("contacts", "profile_id", "TEXT")?;
@@ -1260,6 +1399,13 @@ impl Storage {
         // without the profile password, so own devices keep finding each other while locked.
         self.ensure_table_column("account_keys", "rendezvous_secret_protection_scheme", "TEXT")?;
         self.ensure_table_column("account_keys", "rendezvous_secret_blob", "TEXT")?;
+        // The profile password over this machine's seal of the root secret (2026-10-29, r2 question 12):
+        // a process of the same Windows user without the password no longer opens the root.
+        self.ensure_table_column(
+            "profile_secrets",
+            "profile_master_key_password_layer",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         self.ensure_messages_column("copied_from_device_id", "TEXT")?;
         self.ensure_table_column(
             "identity_keys",
@@ -1327,6 +1473,29 @@ impl Storage {
         self.execute_migration_batch(
             "sessions_revision_starts_at_one",
             "UPDATE sessions SET revision = 1 WHERE revision < 1;",
+        )?;
+        // A session is a profile's: two profiles of this database may each talk to the same remote
+        // device. Keyed by the remote address alone, the second profile's new session overwrote the
+        // first one's row (its keys and chains) and could not read it back (blind audit 2026-11-10).
+        self.rebuild_table_with_primary_key("sessions", &["profile_id", "session_address"])?;
+        self.rebuild_table_with_primary_key("replay_windows", &["profile_id", "session_address"])?;
+        // Bootstrap marks are a profile's too, as its sessions are (maintainers' decision 2026-11-11): two
+        // profiles of one database each take their own bootstraps from the same remote device, and a
+        // shared mark made one profile's fresh bootstrap look like a replay to the other. Rows from
+        // before go to the database's only profile; with several, nobody can say whose — they go.
+        self.ensure_table_column("inbound_bootstrap_marks", "profile_id", "TEXT")?;
+        self.execute_migration_batch(
+            "inbound_bootstrap_marks_of_a_profile",
+            "
+            UPDATE inbound_bootstrap_marks
+            SET profile_id = (SELECT profile_id FROM profile_registry)
+            WHERE profile_id IS NULL AND (SELECT COUNT(*) FROM profile_registry) = 1;
+            DELETE FROM inbound_bootstrap_marks WHERE profile_id IS NULL;
+            ",
+        )?;
+        self.rebuild_table_with_primary_key(
+            "inbound_bootstrap_marks",
+            &["profile_id", "remote_account_id", "remote_device_id"],
         )?;
         self.execute_migration_batch(
             "create_stage11_call_tables",
@@ -1497,7 +1666,7 @@ impl Storage {
         // node seeded by the app layer, but NONE is seeded right now (the project VPS expired — see below);
         // the user adds/removes nodes from the GUI. The empty list MUST still connect (LAN + invite +
         // rendezvous). Endpoints are HINTS (the ed25519 challenge is the authority).
-        // See docs/decisions/community-volunteer-nodes.md + docs/notes/roadmap-CONTINUE.md (Always-connect).
+        // See docs/decisions/community-volunteer-nodes.md.
         self.execute_migration_batch(
             "create_network_nodes",
             "
@@ -1517,22 +1686,22 @@ impl Storage {
             ",
         )?;
 
-        // NO base bootstrap node is seeded right now: the project relay VPS (198.51.100.213) EXPIRED
-        // (dead — every fresh profile logged `relay TCP carrier bind failed → UDP-only` and wasted a
-        // dial timeout). The base-node MECHANISM is intact (this table, `source = 'base'`, GUI add/remove,
-        // the seed structure) — when a live relay lands, re-add a seed batch here pointing at it (endpoint
-        // + pinned identity + tcp_endpoint), mirroring what was removed 2026-07-24. "Works with an empty
+        // NO base bootstrap node is seeded right now: the project relay VPS EXPIRED (dead — every fresh
+        // profile logged `relay TCP carrier bind failed → UDP-only` and wasted a dial timeout). The
+        // base-node MECHANISM is intact (this table, `source = 'base'`, GUI add/remove, the seed
+        // structure) — when a live relay lands, re-add a seed batch here pointing at it (endpoint +
+        // pinned identity + tcp_endpoint), mirroring what was removed 2026-07-24. "Works with an empty
         // bootstrap list" (LAN + invite + rendezvous) stays true, so a base-less fresh profile still
-        // connects. This DELETE cleans the dead node out of EXISTING profiles (idempotent, guarded to the
-        // exact expired endpoint so a future live base node is never touched; a user removal already
-        // left no row → no-op). See docs/notes/roadmap-CONTINUE.md (Always-connect epic).
+        // connects. This DELETE cleans the dead node out of EXISTING profiles: idempotent, and matched by
+        // the node address its identity was pinned to (`EXPIRED_BASE_NODE_ADDRESS`), so a future live
+        // base node is never touched; a user removal already left no row → no-op. Until 2026-10-18 it
+        // matched an endpoint that had been rewritten by mistake and so removed nothing.
+        // See docs/decisions/community-volunteer-nodes.md.
         self.execute_migration_batch(
-            "remove_expired_base_network_node",
-            "
-            DELETE FROM network_nodes
-            WHERE source = 'base'
-              AND endpoint = '198.51.100.213:443';
-            ",
+            "remove_expired_base_network_node_by_address",
+            &format!(
+                "DELETE FROM network_nodes WHERE source = 'base' AND node_address = X'{EXPIRED_BASE_NODE_ADDRESS}';"
+            ),
         )?;
 
         // R1a connection-quality ladder: a relay carries the SEPARATE TLS-over-TCP bridge address
@@ -1682,6 +1851,8 @@ impl Storage {
             );
             ",
         )?;
+        // The inviter's key importers seal their beacons to (docs/bugs/an-invite-importer-dialed-another-importer.md).
+        self.ensure_table_column("mesh_bootstrap_invites", "inviter_reply_key", "BLOB")?;
 
         // Groups on MLS (docs/decisions/group-crypto-mls.md): membership and keys live in the OpenMLS
         // tables (created by `omni-group-mls`); these are the app's rows around them. The pre-MLS
@@ -1794,11 +1965,105 @@ impl Storage {
                 created_at_unix_ms INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS workspace_repos (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                published_path TEXT NOT NULL,
+                work_path TEXT,
+                announced_refs_json TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, group_id, repo)
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_member_refs (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                member_pub TEXT NOT NULL,
+                ref_name TEXT NOT NULL,
+                oid TEXT NOT NULL,
+                announced_at_unix_ms INTEGER NOT NULL,
+                fetched INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (profile_id, group_id, repo, account_id, ref_name)
+            );
+
+            DROP TABLE IF EXISTS workspace_settings;
+            CREATE TABLE IF NOT EXISTS workspace_main_rules (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                main_needs_approval INTEGER NOT NULL DEFAULT 0,
+                changed_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, group_id, repo)
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_repo_files (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                PRIMARY KEY (profile_id, group_id, repo)
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_approvals (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                oid TEXT NOT NULL,
+                approved_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, group_id, repo, account_id, oid)
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_file_events (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                sender_account TEXT NOT NULL,
+                sender_member TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, group_id, event_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_file_local (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                setting TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (profile_id, group_id, repo, setting)
+            );
+
             CREATE TABLE IF NOT EXISTS group_sent_invites (
                 profile_id TEXT NOT NULL,
                 group_id TEXT NOT NULL,
                 dialog_key TEXT NOT NULL,
                 sent_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, group_id, dialog_key)
+            );
+
+            -- When a contact was blocked (declined), and until when: what it wrote in that time is not
+            -- shown when it arrives after the block is lifted (maintainers' decision 2026-11-11).
+            CREATE TABLE IF NOT EXISTS contact_block_periods (
+                profile_id TEXT NOT NULL,
+                contact_id TEXT NOT NULL,
+                blocked_at_unix_ms INTEGER NOT NULL,
+                unblocked_at_unix_ms INTEGER,
+                PRIMARY KEY (profile_id, contact_id, blocked_at_unix_ms)
+            );
+
+            -- The Welcome we made for an invitee, kept until it is heard in the group: past the Commit
+            -- the invitation is spent, and a Welcome that did not arrive left the invitee in the tree
+            -- and out of the group for good (maintainers' decision 2026-11-11).
+            CREATE TABLE IF NOT EXISTS group_invitee_welcomes (
+                profile_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                dialog_key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                welcome_json TEXT NOT NULL,
+                made_at_unix_ms INTEGER NOT NULL,
                 PRIMARY KEY (profile_id, group_id, dialog_key)
             );
 
@@ -1831,6 +2096,7 @@ impl Storage {
             );
             ",
         )?;
+        self.ensure_table_column("groups", "newcomers_told", "TEXT")?;
         // The group's picture (its sha256; the bytes are a file in the profile media, see
         // storage_groups.rs). Set by an admin in the group's MLS meta.
         if !self.table_column_exists("groups", "avatar_hash")? {
@@ -1838,6 +2104,87 @@ impl Storage {
                 "groups_add_avatar_hash",
                 "
                 ALTER TABLE groups ADD COLUMN avatar_hash TEXT;
+                ",
+            )?;
+        }
+
+        // The key MLS state is sealed with, one per profile: with one per database, two profiles in
+        // one group shared their OpenMLS rows, and a profile's copy carried the others' MLS secrets
+        // (blind audit 2026-11-12, pass 17). The database's old key goes to the first profile that
+        // asks (`get_mls_storage_key_protected`).
+        if !self.table_exists("mls_storage_keys")? {
+            self.execute_migration_batch(
+                "create_mls_storage_keys",
+                "
+                CREATE TABLE mls_storage_keys (
+                    profile_id TEXT PRIMARY KEY NOT NULL,
+                    protected_json TEXT NOT NULL
+                );
+                ",
+            )?;
+        }
+
+        // Tombstones and deletions asked for lines not here yet, per profile: kept by message id
+        // alone, a profile's deletion kept a line of another profile of the database out (the same id
+        // sent to both), and its own devices were told the other profile's deleted ids (blind audit
+        // 2026-11-13, pass 22). Only migrate a row whose owner can be identified. An unknown or
+        // shared dialog in a multi-profile installation cannot authorize an action in any profile.
+        if !self.table_column_exists("message_deletions", "profile_id")? {
+            self.execute_migration_batch(
+                "message_actions_per_profile",
+                "
+                CREATE TEMP TABLE dialog_owners AS
+                    SELECT min(profile_id) AS profile_id, dialog_key FROM (
+                    SELECT DISTINCT profile_id, dialog_key FROM contact_dialog_links WHERE profile_id IS NOT NULL
+                    UNION SELECT profile_id, dialog_key FROM groups
+                    UNION SELECT DISTINCT profile_id, dialog_key FROM messages WHERE profile_id IS NOT NULL AND dialog_key IS NOT NULL
+                    ) GROUP BY dialog_key HAVING count(*) = 1;
+                CREATE TABLE message_deletions_by_profile (
+                    profile_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    dialog_key TEXT NOT NULL,
+                    at_unix_ms INTEGER NOT NULL,
+                    unsent INTEGER NOT NULL DEFAULT 0,
+                    changed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (profile_id, message_id)
+                );
+                INSERT INTO message_deletions_by_profile (profile_id, message_id, dialog_key, at_unix_ms, unsent, changed)
+                SELECT o.profile_id, d.message_id, d.dialog_key, d.at_unix_ms, d.unsent, d.changed
+                FROM message_deletions d JOIN dialog_owners o ON o.dialog_key = d.dialog_key;
+                INSERT INTO message_deletions_by_profile (profile_id, message_id, dialog_key, at_unix_ms, unsent, changed)
+                SELECT p.profile_id, d.message_id, d.dialog_key, d.at_unix_ms, d.unsent, d.changed
+                FROM message_deletions d, profile_registry p
+                WHERE (SELECT count(*) FROM profile_registry) = 1
+                  AND NOT EXISTS (SELECT 1 FROM dialog_owners o WHERE o.dialog_key = d.dialog_key);
+                DROP TABLE message_deletions;
+                ALTER TABLE message_deletions_by_profile RENAME TO message_deletions;
+                CREATE INDEX message_deletions_unsent ON message_deletions (profile_id, dialog_key) WHERE unsent = 1;
+
+                CREATE TABLE message_delete_requests_by_profile (
+                    profile_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    dialog_key TEXT NOT NULL,
+                    requester_pub TEXT NOT NULL,
+                    requester_account TEXT NOT NULL,
+                    at_unix_ms INTEGER NOT NULL,
+                    received_at_unix_ms INTEGER NOT NULL,
+                    PRIMARY KEY (profile_id, message_id, requester_pub, requester_account)
+                );
+                INSERT INTO message_delete_requests_by_profile
+                    (profile_id, message_id, dialog_key, requester_pub, requester_account, at_unix_ms, received_at_unix_ms)
+                SELECT o.profile_id, r.message_id, r.dialog_key, r.requester_pub, r.requester_account, r.at_unix_ms, r.received_at_unix_ms
+                FROM message_delete_requests r JOIN dialog_owners o ON o.dialog_key = r.dialog_key;
+                INSERT INTO message_delete_requests_by_profile
+                    (profile_id, message_id, dialog_key, requester_pub, requester_account, at_unix_ms, received_at_unix_ms)
+                SELECT p.profile_id, r.message_id, r.dialog_key, r.requester_pub, r.requester_account, r.at_unix_ms, r.received_at_unix_ms
+                FROM message_delete_requests r, profile_registry p
+                WHERE (SELECT count(*) FROM profile_registry) = 1
+                  AND NOT EXISTS (SELECT 1 FROM dialog_owners o WHERE o.dialog_key = r.dialog_key);
+                DROP TABLE message_delete_requests;
+                ALTER TABLE message_delete_requests_by_profile RENAME TO message_delete_requests;
+                CREATE INDEX message_delete_requests_by_dialog
+                    ON message_delete_requests (profile_id, dialog_key, received_at_unix_ms);
+                DROP TABLE dialog_owners;
                 ",
             )?;
         }
@@ -1864,7 +2211,22 @@ impl Storage {
             )?;
         }
 
+        // The app has handled this durable frame: a restart does not hand it over again. Frames
+        // stored before this start unmarked and go through once more.
+        if !self.table_column_exists("durable_frames", "handled")? {
+            self.execute_migration_batch(
+                "durable_frames_add_handled",
+                "
+                ALTER TABLE durable_frames ADD COLUMN handled INTEGER NOT NULL DEFAULT 0;
+                ",
+            )?;
+        }
+
+        if !self.table_column_exists("message_replies", "profile_id")? {
+            self.execute_migration_batch("message_keys_per_profile", include_str!("message_keys_per_profile.sql"))?;
+        }
         self.purge_legacy_contact_artifacts()?;
+        self.move_legacy_profile_meta()?;
 
         self.connection
             .execute(
@@ -2049,6 +2411,79 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_one_time_prekeys_device_state
             ON one_time_prekeys(device_id, state, created_at_unix_ms ASC, prekey_id ASC);
             ",
+        )
+    }
+
+    /// Rebuild `table` with `key` as its primary key, keeping its columns (types, NOT NULL, defaults),
+    /// rows and indexes. Does nothing when the key is already `key`.
+    fn rebuild_table_with_primary_key(&self, table: &str, key: &[&str]) -> OmniResult<()> {
+        struct Column {
+            name: String,
+            kind: String,
+            not_null: bool,
+            default: Option<String>,
+            pk: i64,
+        }
+        let columns: Vec<Column> = {
+            let mut statement = self
+                .connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .map_err(map_sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(Column {
+                        name: row.get(1)?,
+                        kind: row.get(2)?,
+                        not_null: row.get::<_, i64>(3)? != 0,
+                        default: row.get(4)?,
+                        pk: row.get(5)?,
+                    })
+                })
+                .map_err(map_sqlite_error)?;
+            rows.collect::<Result<_, _>>().map_err(map_sqlite_error)?
+        };
+        let mut current: Vec<&Column> = columns.iter().filter(|column| column.pk > 0).collect();
+        current.sort_by_key(|column| column.pk);
+        if current.iter().map(|column| column.name.as_str()).eq(key.iter().copied()) {
+            return Ok(());
+        }
+        let indexes: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL")
+                .map_err(map_sqlite_error)?;
+            let rows = statement.query_map([table], |row| row.get(0)).map_err(map_sqlite_error)?;
+            rows.collect::<Result<_, _>>().map_err(map_sqlite_error)?
+        };
+        let definitions: Vec<String> = columns
+            .iter()
+            .map(|column| {
+                let mut definition = format!("\"{}\" {}", column.name, column.kind);
+                if column.not_null {
+                    definition.push_str(" NOT NULL");
+                }
+                if let Some(default) = &column.default {
+                    definition.push_str(&format!(" DEFAULT {default}"));
+                }
+                definition
+            })
+            .collect();
+        let names: Vec<String> = columns.iter().map(|column| format!("\"{}\"", column.name)).collect();
+        let key: Vec<String> = key.iter().map(|column| format!("\"{column}\"")).collect();
+        let old = format!("{table}_rebuild_old");
+        self.execute_migration_batch(
+            &format!("rebuild_{table}_primary_key"),
+            &format!(
+                "ALTER TABLE {table} RENAME TO {old};
+                 CREATE TABLE {table} ({}, PRIMARY KEY ({}));
+                 INSERT INTO {table} ({names}) SELECT {names} FROM {old};
+                 DROP TABLE {old};
+                 {}",
+                definitions.join(", "),
+                key.join(", "),
+                indexes.iter().map(|sql| format!("{sql};")).collect::<Vec<_>>().join("\n"),
+                names = names.join(", "),
+            ),
         )
     }
 

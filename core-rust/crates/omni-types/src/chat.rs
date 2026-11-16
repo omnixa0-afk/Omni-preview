@@ -36,6 +36,9 @@ pub struct SendTextRequest {
     #[serde(rename = "peer_addr", alias = "peer_key", alias = "dialog_key")]
     pub dialog_key: String,
     pub body: String,
+    /// The message this one answers, in the same conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +52,15 @@ pub struct SendAttachmentRequest {
     /// «Фото» rather than «Файл»: re-encode and show it in the chat.
     #[serde(default)]
     pub as_photo: bool,
+    /// A voice message: the file is an Ogg/Opus recording, shown as one.
+    #[serde(default)]
+    pub as_voice: bool,
+    /// A round video message: the file is a short MP4 recording, shown as one.
+    #[serde(default)]
+    pub as_video_note: bool,
+    /// The message this one answers, in the same conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +82,74 @@ pub struct ChatMessageRecord {
     /// own send («со слов собеседника», account-recovery-from-friends.md Б2).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub told_by_contact: bool,
+    /// The message this one answers, as its quote shows it; none when it is not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<MessageReplyPreview>,
+    /// The emoji on it, most used first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<MessageReactionView>,
+    /// It is pinned in its conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+}
+
+/// What a conversation's view reads besides its lines: pins and deletions change no line's time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageActionsView {
+    /// Grows with every deletion and pin of any conversation.
+    pub mark: i64,
+    /// Pinned messages, the latest pinned first.
+    pub pinned: Vec<MessageReplyPreview>,
+    /// The newest lines deleted here.
+    pub deleted: Vec<String>,
+}
+
+/// A message taken back by its author, from everyone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDeleteV1 {
+    pub message_id: String,
+    pub at_unix_ms: i64,
+}
+
+/// A message pinned or unpinned in its conversation; the latest by `at_unix_ms` stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePinV1 {
+    pub message_id: String,
+    pub pinned: bool,
+    pub at_unix_ms: i64,
+}
+
+/// One emoji on a message, as its chip shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReactionView {
+    pub emoji: String,
+    pub count: usize,
+    pub mine: bool,
+    /// Who put it, in a group: accounts as stored, names as a view shows them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub who: Vec<String>,
+}
+
+/// A person's reaction to a message; an empty `emoji` takes it away. A person has one on a message,
+/// and the latest by `at_unix_ms` stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionV1 {
+    pub message_id: String,
+    pub emoji: String,
+    pub at_unix_ms: i64,
+}
+
+/// The answered message as a quote shows it. Read from this device's own copy of it, never from what
+/// the answer's author says it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReplyPreview {
+    pub message_id: String,
+    pub from_me: bool,
+    /// A group member's name; empty in a 1:1 chat, where the other side is known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    /// How it began, or its file's name.
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +237,9 @@ pub struct ChatTextV1 {
     pub message_id: String,
     pub body: String,
     pub created_at_unix_ms: i64,
+    /// The message this one answers, in the same conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// What one of our own devices sent to a contact, so our other devices show it in that chat too
@@ -172,6 +255,9 @@ pub struct SentTranscriptV1 {
     /// copy, never from the contact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<AttachmentOfferV1>,
+    /// The message this one answers, in the same conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// The account took one of its devices back (docs/decisions/multi-device-equal-nodes.md). The
@@ -276,6 +362,8 @@ pub enum HistorySyncMessageV1 {
         chat_account_id: String,
         lines: Vec<HistoryLineV1>,
     },
+    /// Lines our other device deleted: they go here too. Our own devices only.
+    Deleted { message_ids: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

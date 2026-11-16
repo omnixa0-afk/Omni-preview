@@ -20,10 +20,7 @@ internal sealed partial class RustBridge
         // Стоимость канала сообщаем ДО старта: контроллер перегрузки выбирается при создании
         // эндпоинта, позже смена уже ничего не изменит. См. LinkCostProbe.
         ReportLinkCost();
-        // GetInitializedHandleForRealtimeMedia returns the shared core handle
-        // (the name is historical — mesh + realtime media use the same handle).
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_start(coreHandle);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_start(coreHandle));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -85,16 +82,14 @@ internal sealed partial class RustBridge
     /// </summary>
     public string ApplyCongestionControlNow()
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr result = NativeMethods.omni_transport_apply_congestion_control_now(coreHandle);
+        IntPtr result = WithCoreHandle(coreHandle => NativeMethods.omni_transport_apply_congestion_control_now(coreHandle));
         return result == IntPtr.Zero ? "closed=0" : NativeErrorReader.ReadAndFree(result);
     }
 
     /// <summary>Stop the mesh overlay (call on sign-out).</summary>
     public void StopMesh()
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_stop(coreHandle);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_stop(coreHandle));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -108,8 +103,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void ConnectActiveCallToMesh()
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_connect_active_call(coreHandle);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_connect_active_call(coreHandle));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -146,8 +140,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void RegisterMeshPairingInvite(string token)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_register_pairing_invite(coreHandle, token);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_register_pairing_invite(coreHandle, token));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -171,8 +164,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void SetConnectionPrivacyMode(string mode)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_connection_privacy_mode_set(coreHandle, mode);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_connection_privacy_mode_set(coreHandle, mode));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -196,8 +188,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void SetCarrierPolicy(string policy)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_carrier_policy_set(coreHandle, policy);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_carrier_policy_set(coreHandle, policy));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -222,8 +213,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void SetDirectTcpPort(string port)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_direct_tcp_port_set(coreHandle, port);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_direct_tcp_port_set(coreHandle, port));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -248,8 +238,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void DialReachToken(string token)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_dial_reach_token(coreHandle, token);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_dial_reach_token(coreHandle, token));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -266,8 +255,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void RendezvousReachContact(string accountId)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_mesh_rendezvous_reach_contact(coreHandle, accountId);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_mesh_rendezvous_reach_contact(coreHandle, accountId));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -277,7 +265,7 @@ internal sealed partial class RustBridge
     /// <summary>
     /// The active profile's network entry-node registry (the seeded base node + user-added relays /
     /// bootstrap) — the list the «Узлы сети / Релеи» screen renders. An empty list is valid (LAN +
-    /// invite still connect; no node is privileged). See docs/notes/roadmap-CONTINUE.md.
+    /// invite still connect; no node is privileged). See docs/decisions/community-volunteer-nodes.md.
     /// </summary>
     public IReadOnlyList<NetworkNodeDto> ListNetworkNodes()
         => CallJson(
@@ -291,8 +279,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public long AddNetworkNode(string endpoint, string label)
         => CallJson(
-            () => NativeMethods.omni_network_node_add(
-                GetInitializedHandleForRealtimeMedia(), endpoint, label),
+            () => NativeMethods.omni_network_node_add(handle, endpoint, label),
             OmniJsonSerializerContext.Default.Int64,
             "network_node_add");
 
@@ -305,8 +292,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public long ImportRelayBundle(string token)
         => CallJson(
-            () => NativeMethods.omni_network_relay_bundle_import(
-                GetInitializedHandleForRealtimeMedia(), token),
+            () => NativeMethods.omni_network_relay_bundle_import(handle, token),
             OmniJsonSerializerContext.Default.Int64,
             "network_relay_bundle_import");
 
@@ -316,8 +302,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void RemoveNetworkNode(long id)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_network_node_remove(coreHandle, id);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_network_node_remove(coreHandle, id));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -331,8 +316,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void SetRelayShared(long id, bool shared)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_network_relay_set_shared(coreHandle, id, shared ? 1 : 0);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_network_relay_set_shared(coreHandle, id, shared ? 1 : 0));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -357,8 +341,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void AddRendezvousProvider(string url)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_rendezvous_provider_add(coreHandle, url);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_rendezvous_provider_add(coreHandle, url));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -370,8 +353,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void RemoveRendezvousProvider(long id)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_rendezvous_provider_remove(coreHandle, id);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_rendezvous_provider_remove(coreHandle, id));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -405,8 +387,7 @@ internal sealed partial class RustBridge
 
     public void SetRendezvousProviderMode(long id, string mode)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_rendezvous_provider_set_mode(coreHandle, id, mode);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_rendezvous_provider_set_mode(coreHandle, id, mode));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -432,8 +413,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void SetDhtEntryNodeEnabled(bool enabled)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_dht_entry_node_set(coreHandle, enabled ? "on" : "off");
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_dht_entry_node_set(coreHandle, enabled ? "on" : "off"));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -469,8 +449,7 @@ internal sealed partial class RustBridge
     /// </summary>
     public void RespawnRendezvousRuntime()
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_rendezvous_respawn(coreHandle);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_rendezvous_respawn(coreHandle));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -518,8 +497,7 @@ internal sealed partial class RustBridge
 
     public void AddDhtBootstrapNode(string addr)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_dht_bootstrap_add(coreHandle, addr);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_dht_bootstrap_add(coreHandle, addr));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));
@@ -528,8 +506,7 @@ internal sealed partial class RustBridge
 
     public void RemoveDhtBootstrapNode(string addr)
     {
-        IntPtr coreHandle = GetInitializedHandleForRealtimeMedia();
-        IntPtr error = NativeMethods.omni_dht_bootstrap_remove(coreHandle, addr);
+        IntPtr error = WithCoreHandle(coreHandle => NativeMethods.omni_dht_bootstrap_remove(coreHandle, addr));
         if (error != IntPtr.Zero)
         {
             throw new InvalidOperationException(NativeErrorReader.ReadAndFree(error));

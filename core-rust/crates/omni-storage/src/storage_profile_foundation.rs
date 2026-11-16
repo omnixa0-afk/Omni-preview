@@ -21,6 +21,8 @@ struct ProfileSecretsRow {
     password_verifier_hex: Option<String>,
     profile_master_key_protection_scheme: Option<String>,
     profile_master_key_blob_hex: Option<String>,
+    /// The profile master key is under the profile password too, inside this machine's seal.
+    profile_master_key_password_layer: bool,
     encrypted_profile_secrets_json: Option<String>,
 }
 
@@ -131,7 +133,8 @@ impl Storage {
                     password_verifier_hex,
                     profile_master_key_protection_scheme,
                     profile_master_key_blob_hex,
-                    encrypted_profile_secrets_json
+                    encrypted_profile_secrets_json,
+                    profile_master_key_password_layer
                 FROM profile_secrets
                 WHERE profile_id = ?1
                 ",
@@ -145,6 +148,7 @@ impl Storage {
                         profile_master_key_protection_scheme: row.get(4)?,
                         profile_master_key_blob_hex: row.get(5)?,
                         encrypted_profile_secrets_json: row.get(6)?,
+                        profile_master_key_password_layer: row.get::<_, i64>(7)? != 0,
                     })
                 },
             )
@@ -420,6 +424,7 @@ impl Storage {
                     profile_master_key_protection_scheme = excluded.profile_master_key_protection_scheme,
                     profile_master_key_blob_hex = excluded.profile_master_key_blob_hex,
                     encrypted_profile_secrets_json = excluded.encrypted_profile_secrets_json,
+                    profile_master_key_password_layer = 0,
                     restored_from_recovery = excluded.restored_from_recovery,
                     updated_at_unix_ms = excluded.updated_at_unix_ms
                 ",
@@ -506,9 +511,15 @@ impl Storage {
         // copied to another computer cannot open them — and does not need to: it acts for the
         // account through the working key, and the account's public identity comes from the
         // master PUBLIC key every device holds (docs/decisions/multi-device-equal-nodes.md).
-        let profile_secrets = load_profile_secrets_from_profile_secrets_row(&secrets_row)
-            .ok()
-            .flatten();
+        // A root under the profile password is held here but not opened: nothing in the snapshot
+        // needs it once the account has its key chain.
+        let stored_root = read_stored_profile_root(&secrets_row, None)
+            .unwrap_or(StoredProfileRoot::OtherMachine);
+        let root_held_here = matches!(
+            stored_root,
+            StoredProfileRoot::Open(_) | StoredProfileRoot::NeedsPassword
+        );
+        let profile_secrets = stored_root.open();
         let derived_public_identity = match (&profile_secrets, self.get_account_keys(&account_id)?) {
             (_, Some(keys)) => omni_identity::account_public_identity_from_master_public_key(
                 &keys.master_public_key.0,
@@ -530,7 +541,7 @@ impl Storage {
                 "stored profile secrets do not match persisted account identity".to_string(),
             ));
         }
-        let has_root_secret = profile_secrets.is_some();
+        let has_root_secret = root_held_here;
 
         Ok(Some(LocalAccountSnapshot {
             descriptor: PublicAccountDescriptor {

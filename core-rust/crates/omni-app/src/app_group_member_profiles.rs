@@ -42,11 +42,15 @@ pub(crate) fn own_member_profile(storage: &Storage) -> OmniResult<GroupMemberPro
         .map(|bytes| omni_storage::shrink_avatar_for_group_card(bytes, GROUP_MEMBER_AVATAR_MAX_BYTES))
         .filter(|bytes| !bytes.is_empty())
         .map(|bytes| B64.encode(bytes));
+    let (agent_of, agents) = crate::app_workspace::agents::own_card_fields(storage);
     Ok(GroupMemberProfileV1 {
         account_id: account.descriptor.account_id.0,
         version: profile.updated_at_unix_ms,
         display_name: profile.display_name,
         avatar_jpeg_b64: avatar,
+        agent_of,
+        agents,
+        agents_version: crate::app_workspace::agents::own_agents_version(storage),
     })
 }
 
@@ -60,6 +64,8 @@ fn say(storage: &Storage, group_id: &str, kind: GroupAppKindV1, body: String) ->
             body,
             authored_at_unix_ms: current_unix_ms(),
             signature_b64: None,
+            reply_to: None,
+            mentions: Vec::new(),
         },
     )
 }
@@ -94,13 +100,13 @@ pub(crate) fn broadcast_own_profile(storage: &Storage) {
 pub(crate) fn answer_profile_ask(storage: &Storage, group_id: &str) -> OmniResult<()> {
     let now = current_unix_ms();
     let last = storage
-        .get_app_meta(&answered_key(group_id))?
+        .get_profile_meta(&answered_key(group_id))?
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
     if now.saturating_sub(last) < PROFILE_ANSWER_EVERY_MS {
         return Ok(());
     }
-    storage.upsert_app_meta(&answered_key(group_id), &now.to_string())?;
+    storage.upsert_profile_meta(&answered_key(group_id), &now.to_string())?;
     send_own_profile(storage, group_id)
 }
 
@@ -123,5 +129,8 @@ pub(crate) fn receive_profile(storage: &Storage, sender: &MemberCard, body: &str
             .filter(|bytes| bytes.len() <= GROUP_MEMBER_AVATAR_MAX_BYTES && bytes.starts_with(&[0xFF, 0xD8])),
         None => None,
     };
-    storage.store_group_member_profile(&card.account_id, card.version, card.display_name.trim(), avatar.as_deref(), current_unix_ms())
+    // Who is whose agent rides on every card with a version of its own (it changes without a new
+    // name): taken only when newer than what we have.
+    let agents_changed = crate::app_workspace::agents::take_card(storage, &card)?;
+    Ok(storage.store_group_member_profile(&card.account_id, card.version, card.display_name.trim(), avatar.as_deref(), current_unix_ms())? || agents_changed)
 }

@@ -54,37 +54,55 @@ pub(crate) fn receive_offer(
     if offer.message_id != payload.message_id {
         return Err(OmniError::InvalidInput("group attachment offer names another message".into()));
     }
-    if storage.get_attachment_runtime_info(&offer.message_id)?.is_some() {
-        return Ok(()); // a re-sent offer (rolled-back epoch): we have it
+    if storage.get_attachment_runtime_info(&offer.message_id)?.is_some()
+        || storage.message_is_deleted(&offer.message_id)?
+        || crate::app_message_actions::message_id_taken_elsewhere(storage, &offer.message_id, &group.dialog_key)?
+        || storage.message_exists(&offer.message_id)?
+    {
+        return Ok(()); // a re-sent offer (rolled-back epoch), a file taken back, or the id is taken
     }
-    let record = storage.insert_incoming_message(
-        &offer.message_id,
-        &group.dialog_key,
-        &offer.body,
-        payload.authored_at_unix_ms,
-    )?;
-    storage.store_incoming_attachment_offer(
-        &offer.message_id,
-        &group.dialog_key,
-        &offer.file_name,
-        offer.file_size_bytes,
-        offer.mime_type.as_deref(),
-        &offer.content_id_hex,
-        offer.content_encryption.as_deref(),
-        offer.content_key_hex.as_deref(),
-        offer.content_nonce_seed_hex.as_deref(),
-        offer.content_chunk_size_bytes,
-        offer.created_at_unix_ms,
-    )?;
-    storage.insert_group_message_meta(
-        group_id,
-        &GroupMessageMeta {
-            message_id: offer.message_id.clone(),
-            sender_pub: Some(sender.member_pub.clone()),
-            sender_name: sender.display_name.clone(),
-            kind: "attachment".into(),
-        },
-    )?;
+    // The message and the rows of its file, as one: written apart, a failure between them left a
+    // message with no file to fetch, and the offer sent again was taken for one already here (blind
+    // audit 2026-11-12, pass 16).
+    // Shown at a time bounded by our clock, as a text line is: a file dated 2100 stood after every
+    // later line (blind audit 2026-11-12, pass 17).
+    let shown_at = crate::app_groups::shown_line_time(payload.authored_at_unix_ms, crate::current_unix_ms());
+    let record = storage.with_immediate_transaction("group attachment offer", |storage| {
+        let record = storage.insert_incoming_message(
+            &offer.message_id,
+            &group.dialog_key,
+            &offer.body,
+            shown_at,
+        )?;
+        storage.remember_received_message_reply(&offer.message_id, offer.reply_to.as_deref())?;
+        storage.store_incoming_attachment_offer(
+            &offer.message_id,
+            &group.dialog_key,
+            &offer.file_name,
+            offer.file_size_bytes,
+            offer.mime_type.as_deref(),
+            &offer.content_id_hex,
+            offer.content_encryption.as_deref(),
+            offer.content_key_hex.as_deref(),
+            offer.content_nonce_seed_hex.as_deref(),
+            offer.content_chunk_size_bytes,
+            offer.created_at_unix_ms,
+        )?;
+        storage.insert_group_message_meta(
+            group_id,
+            &GroupMessageMeta {
+                message_id: offer.message_id.clone(),
+                sender_pub: Some(sender.member_pub.clone()),
+                sender_name: sender.display_name.clone(),
+                kind: "attachment".into(),
+            },
+        )?;
+        Ok(record)
+    })?;
+    // Its author took it back before it came (a deletion that waited for it).
+    if crate::app_message_actions::apply_pending_message_deletes(storage, &offer.message_id)? {
+        return Ok(());
+    }
     // A photo asks for itself, within the bound of a 1:1 dialog (the pull below fetches it on the
     // next tick).
     crate::accept_received_attachment_presentation(storage, &offer)?;
@@ -160,15 +178,21 @@ fn seed(
     request: &GroupAttachmentPullV1,
     asker: MeshNodeAddress,
     linked: &dyn Fn(&MeshNodeAddress) -> bool,
+    blocks: u64,
 ) -> Vec<(u64, MeshNodeAddress)> {
     let now = current_unix_ms();
     let Ok(mut given) = given_out().lock() else {
         return Vec::new();
     };
+    // What is past its time goes for every file, not only this one: a file asked once kept its
+    // entries for good.
+    given.retain(|_, file| {
+        file.retain(|_, (_, at)| now - *at < SEED_NAMES_FOR_MS);
+        !file.is_empty()
+    });
     let file = given.entry((db_path.to_string(), request.message_id.clone())).or_default();
-    file.retain(|_, (_, at)| now - *at < SEED_NAMES_FOR_MS);
     let mut elsewhere = Vec::new();
-    for block in request.from_block..request.to_block {
+    for block in request.from_block..request.to_block.min(blocks) {
         match file.get(&block) {
             Some((member, _))
                 if !request.insist
@@ -202,15 +226,24 @@ fn unpack_blocks(bits: &[u8], blocks: usize) -> Vec<bool> {
 }
 
 /// Start the pull of `message_id` unless one runs or one failed too recently.
+/// How many files of a profile are pulled at once; the rest wait for the next tick. Each pull is a
+/// thread of its own, and a member who posts photos by the hundred had us start a thread for each
+/// (blind audit 2026-11-11, pass 13).
+const GROUP_PULLS_AT_ONCE: usize = 4;
+
 fn begin_pull(db_path: &str, message_id: &str, now: i64) -> bool {
     let Ok(mut pulls) = pulls().lock() else {
         return false;
     };
+    // A pull that failed is remembered only to space out its retry: past that, forgotten — the
+    // entries of files never fetched stayed until the profile stopped.
+    pulls.retain(|_, pull| pull.running || now - pull.ended_at_ms < PULL_RETRY_AFTER_MS);
     let key = (db_path.to_string(), message_id.to_string());
-    match pulls.get(&key) {
-        Some(pull) if pull.running => return false,
-        Some(pull) if now - pull.ended_at_ms < PULL_RETRY_AFTER_MS => return false,
-        _ => {}
+    if pulls.contains_key(&key) {
+        return false; // runs, or failed moments ago
+    }
+    if pulls.iter().filter(|((db, _), pull)| db == db_path && pull.running).count() >= GROUP_PULLS_AT_ONCE {
+        return false;
     }
     pulls.insert(key, PullState { running: true, ended_at_ms: 0, sources: 0 });
     true
@@ -369,6 +402,11 @@ where
     // When bytes last came: a pull that gets none for long gives up.
     let mut progress = (runtime.attachment.bytes_transferred, current_unix_ms());
     let wanted = |storage: &Storage| -> OmniResult<bool> {
+        // Still ours to fetch: we are in the group (removed, left or dissolved — the pull ends, A08,
+        // audit 2026-11-09 #6) and the profile is signed in.
+        if !storage.is_profile_signed_in()? || !storage.get_group(group_id)?.is_some_and(|g| g.my_status == "member") {
+            return Ok(false);
+        }
         let row = storage.get_attachment_runtime_info(message_id)?;
         Ok(row.is_some_and(|row| {
             matches!(
@@ -580,7 +618,7 @@ fn pull_range(
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let Some(frame) = stream.read_frame()? else {
+        let Some(frame) = stream.read_frame_within(HOLDER_ANSWERS_WITHIN)? else {
             // Its note was all of it: nothing of the file there yet.
             if !answering {
                 return Ok(());
@@ -614,11 +652,21 @@ fn block_on<F: std::future::Future>(future: F) -> OmniResult<F::Output> {
     Ok(runtime.block_on(future))
 }
 
+/// How long an ask waits for the holder's next bytes — its note, then each frame. A holder that
+/// took the stream and sent nothing held the ask's thread for good: the pull gave up and went on,
+/// its thread stayed, and every retry left one more (blind audit 2026-11-11, pass 14).
+const HOLDER_ANSWERS_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// A holder's note, read off the head of its answer (the four bytes, a u32 length, JSON).
 fn read_holder_note(recv: &mut Box<dyn tokio::io::AsyncRead + Send + Unpin>) -> OmniResult<GroupAttachmentHolderNoteV1> {
+    read_holder_note_within(recv, HOLDER_ANSWERS_WITHIN)
+}
+
+fn read_holder_note_within(recv: &mut Box<dyn tokio::io::AsyncRead + Send + Unpin>, wait: std::time::Duration) -> OmniResult<GroupAttachmentHolderNoteV1> {
     use tokio::io::AsyncReadExt as _;
     let mut head = [0_u8; 8];
-    block_on(async { recv.read_exact(&mut head).await })?
+    block_on(async { tokio::time::timeout(wait, recv.read_exact(&mut head)).await })?
+        .map_err(|_| OmniError::Transport("the holder sent no note in time".into()))?
         .map_err(|e| OmniError::Transport(format!("the holder closed the stream before its note: {e}")))?;
     if head[..4] != GROUP_ATTACHMENT_NOTE_MAGIC {
         return Err(OmniError::Transport("the holder's answer has no note".into()));
@@ -628,7 +676,8 @@ fn read_holder_note(recv: &mut Box<dyn tokio::io::AsyncRead + Send + Unpin>) -> 
         return Err(OmniError::InvalidInput("group attachment note size is invalid".into()));
     }
     let mut json = vec![0_u8; len];
-    block_on(async { recv.read_exact(&mut json).await })?
+    block_on(async { tokio::time::timeout(wait, recv.read_exact(&mut json)).await })?
+        .map_err(|_| OmniError::Transport("the holder's note did not come in time".into()))?
         .map_err(|e| OmniError::Transport(format!("group attachment note: {e}")))?;
     let note: GroupAttachmentHolderNoteV1 =
         serde_json::from_slice(&json).map_err(|e| OmniError::InvalidInput(format!("group attachment note: {e}")))?;
@@ -669,15 +718,31 @@ pub(crate) enum InboundBulk {
     GroupPull(GroupAttachmentPullV1, omni_mesh_runtime::BulkStream),
     /// A 1:1 transfer pushed to us; its first bytes are given back to the reader.
     Transfer(omni_mesh_runtime::BulkStream),
+    /// A member fetching a workspace repository (`app_git_bridge`); the magic is consumed.
+    Git(omni_mesh_runtime::BulkStream),
+    /// A member fetching an object of a files project whole (`app_workspace_content`); the magic is consumed.
+    Content(omni_mesh_runtime::BulkStream),
+    /// The same by blocks (`app_workspace_content::blocks`); the magic is consumed.
+    Blocks(omni_mesh_runtime::BulkStream),
 }
 
-/// Read the first four bytes of an inbound bulk stream to tell a group pull from a 1:1 transfer.
+/// Read the first four bytes of an inbound bulk stream to tell a group pull, a git fetch, a files
+/// project's content and a 1:1 transfer apart.
 pub(crate) fn classify_inbound_bulk(bulk: omni_mesh_runtime::BulkStream) -> OmniResult<InboundBulk> {
     use tokio::io::AsyncReadExt as _;
     let omni_mesh_runtime::BulkStream { send, mut recv } = bulk;
     let mut head = [0_u8; 4];
     block_on(async { recv.read_exact(&mut head).await })?
         .map_err(|e| OmniError::Transport(format!("bulk stream head: {e}")))?;
+    if head == crate::app_git_bridge::GIT_BRIDGE_MAGIC {
+        return Ok(InboundBulk::Git(omni_mesh_runtime::BulkStream { send, recv }));
+    }
+    if head == crate::app_workspace::content::CONTENT_MAGIC {
+        return Ok(InboundBulk::Content(omni_mesh_runtime::BulkStream { send, recv }));
+    }
+    if head == crate::app_workspace::content::blocks::BLOCKS_MAGIC {
+        return Ok(InboundBulk::Blocks(omni_mesh_runtime::BulkStream { send, recv }));
+    }
     if head != GROUP_ATTACHMENT_PULL_MAGIC {
         let recv: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(head.to_vec()).chain(recv));
@@ -737,6 +802,14 @@ pub(crate) fn serve_group_pull(
     let outcome = (|| -> OmniResult<()> {
         let storage = Storage::open(db_path)?;
         serve_allowed(&storage, &peer, &request)?;
+        // A range past the file ends at the file, before anything is noted for it: seeding noted a
+        // member for every block named — up to the protocol's whole limit, for a file of one block
+        // (blind audit 2026-11-10).
+        let blocks = storage
+            .get_attachment_runtime_info(&request.message_id)?
+            .map(|info| omni_crypto::content_block_count(info.attachment.file_size_bytes.max(0) as u64))
+            .unwrap_or(0);
+        let request = GroupAttachmentPullV1 { to_block: request.to_block.min(blocks), ..request.clone() };
         // The whole file, or the blocks of a download in progress.
         let whole = storage.attachment_serving_blob_path(&request.message_id).ok().flatten().is_some();
         let have = if whole {
@@ -752,10 +825,10 @@ pub(crate) fn serve_group_pull(
                 }
             }
         };
-        let Some(worker) = crate::reserve_attachment_send_worker(db_path, &request.transfer_id) else {
+        let Some(worker) = crate::reserve_attachment_send_worker(db_path, &request.transfer_id, &format!("node:{peer}")) else {
             return Err(OmniError::Transport("this transfer is already being served".into()));
         };
-        let elsewhere = if whole { seed(db_path, &request, peer, linked) } else { Vec::new() };
+        let elsewhere = if whole { seed(db_path, &request, peer, linked, blocks) } else { Vec::new() };
         let note = GroupAttachmentHolderNoteV1 {
             have_hex: have.as_deref().map(|have| hex::encode(pack_blocks(have))),
             elsewhere: elsewhere
@@ -773,7 +846,7 @@ pub(crate) fn serve_group_pull(
                 request.from_block,
                 request.to_block,
                 if whole { "whole" } else { "partial" },
-                std::path::Path::new(db_path).parent().and_then(|dir| dir.file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+                omni_storage::profile_folder_label(std::path::Path::new(db_path)),
                 skip.len(),
                 if request.insist { " (insisted)" } else { "" }
             ),
@@ -793,6 +866,7 @@ pub(crate) fn serve_group_pull(
                 },
                 None,
                 Some(&worker),
+                &mut || serve_allowed(&storage, &peer, &request),
                 || Ok(crate::AttachmentChunkSink::Single(stream)),
             )
         });
@@ -809,4 +883,68 @@ pub(crate) fn serve_group_pull(
             ),
         },
     );
+}
+
+#[cfg(test)]
+mod seeding_tests {
+    use super::*;
+
+    /// Blind audit 2026-11-11, pass 14: a holder that took the stream and sent nothing held the
+    /// ask's thread for good.
+    #[test]
+    fn an_ask_does_not_wait_for_a_silent_holder_for_good() {
+        let (near, _far_kept_open) = tokio::io::duplex(64);
+        let mut recv: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(near);
+        assert!(read_holder_note_within(&mut recv, std::time::Duration::from_millis(300)).is_err(), "no note: given up");
+        let mut stream = AttachmentTransferStream::from_halves(Box::new(tokio::io::sink()), recv).unwrap();
+        assert!(stream.read_frame_within(std::time::Duration::from_millis(200)).is_err(), "nor a frame");
+    }
+
+    /// Blind audit 2026-11-11, pass 13: every file asked for got a thread of its own at once, and a
+    /// pull that failed was remembered until the profile stopped.
+    #[test]
+    fn a_few_files_are_pulled_at_once_and_a_failed_pull_is_forgotten_in_time() {
+        let db = "test-db-pulls-at-once";
+        for i in 0..GROUP_PULLS_AT_ONCE {
+            assert!(begin_pull(db, &format!("m{i}"), 1_000));
+        }
+        assert!(!begin_pull(db, "one-more", 1_000), "waits for the next tick");
+        assert!(begin_pull("test-db-pulls-other", "m0", 1_000), "another profile has its own count");
+        end_pull("test-db-pulls-other", "m0", true);
+        end_pull(db, "m0", true);
+        assert!(begin_pull(db, "one-more", 1_000), "a place came free");
+        end_pull(db, "one-more", false);
+        let failed_at = current_unix_ms();
+        assert!(!begin_pull(db, "one-more", failed_at + 1), "not again at once");
+        let known = |id: &str| pulls().lock().unwrap().contains_key(&(db.to_string(), id.to_string()));
+        assert!(known("one-more"));
+        assert!(begin_pull(db, "m0", failed_at + PULL_RETRY_AFTER_MS + 1));
+        assert!(!known("one-more"), "its time is past: forgotten");
+        clear_group_attachment_pulls_for_db(db);
+    }
+
+    /// Blind audit 2026-11-10: a pull naming the protocol's whole block range for a file of one block
+    /// made seeding note a member for each of 131 072 blocks, and a file asked once kept its notes
+    /// for good. Only the file's blocks are noted, and what is past its time goes for every file.
+    #[test]
+    fn seeding_notes_only_the_files_blocks_and_forgets_old_ones_of_every_file() {
+        let db = "seeding-test-db";
+        let asker = MeshNodeAddress::from_bytes([7; 20]);
+        let request = |message: &str| GroupAttachmentPullV1 {
+            group_id: "g".into(),
+            message_id: message.into(),
+            transfer_id: "t".into(),
+            from_block: 0,
+            to_block: omni_protocol::GROUP_ATTACHMENT_PULL_BLOCKS_MAX,
+            insist: true,
+        };
+        given_out().lock().unwrap().insert(
+            (db.to_string(), "old".to_string()),
+            HashMap::from([(0, (asker, current_unix_ms() - 2 * SEED_NAMES_FOR_MS))]),
+        );
+        seed(db, &request("one-block"), asker, &|_| true, 1);
+        let given = given_out().lock().unwrap();
+        assert_eq!(given.get(&(db.to_string(), "one-block".to_string())).map(HashMap::len), Some(1));
+        assert!(!given.contains_key(&(db.to_string(), "old".to_string())), "a file asked once does not keep its notes");
+    }
 }

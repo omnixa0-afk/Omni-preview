@@ -17,13 +17,15 @@ internal sealed record CallVideoDeviceOption(string Key, string DisplayName);
 /// The concrete decision the media pipeline acts on after a user preference is
 /// resolved against the live capability probe. Either software, or a specific
 /// GPU identified by PCI <see cref="VendorId"/> (which the native encoder MFT
-/// filter / renderer adapter choice consume).
+/// filter / renderer adapter choice consume). <see cref="Explicit"/>: the person picked this
+/// card by name, so it must do the work even when another card would do a better codec.
 /// </summary>
-internal readonly record struct ResolvedVideoDevice(bool UseSoftware, uint VendorId, string Label)
+internal readonly record struct ResolvedVideoDevice(bool UseSoftware, uint VendorId, string Label, bool Explicit = false)
 {
     internal static ResolvedVideoDevice Software(string label) => new(true, 0, label);
 
-    internal static ResolvedVideoDevice Hardware(uint vendorId, string label) => new(false, vendorId, label);
+    internal static ResolvedVideoDevice Hardware(uint vendorId, string label, bool explicitChoice = false)
+        => new(false, vendorId, label, explicitChoice);
 }
 
 /// <summary>
@@ -59,12 +61,57 @@ internal static class CallVideoDeviceSelection
         => direction == CallVideoMediaDirection.Decode;
 
     /// <summary>
+    /// The codecs this card encodes in hardware, best compression last. H.264 comes from the card's
+    /// own test-encode; HEVC and AV1 are tested once per machine, on whichever encoder sets up
+    /// first, so a card is credited with them only when that verified encoder is its vendor's.
+    ///
+    /// Why it matters (live 2026-10-30): Intel UHD chosen explicitly, the passport still offered AV1
+    /// (proven on the RTX), the peer picked AV1 and the RTX encoded it — the choice was ignored
+    /// without a word. An explicit choice narrows the passport to this list instead.
+    /// </summary>
+    internal static IReadOnlyList<CallVideoCodecKind> HardwareEncodeCodecs(
+        uint vendorId,
+        bool canEncodeH264,
+        IReadOnlyDictionary<string, uint>? verifiedEncoderVendors)
+    {
+        List<CallVideoCodecKind> codecs = [];
+        if (canEncodeH264)
+        {
+            codecs.Add(CallVideoCodecKind.H264);
+        }
+
+        foreach (CallVideoCodecKind codec in new[] { CallVideoCodecKind.H265, CallVideoCodecKind.Av1 })
+        {
+            if (vendorId != 0 &&
+                verifiedEncoderVendors is not null &&
+                verifiedEncoderVendors.TryGetValue(CallVideoCodecFactory.FormatCodec(codec), out uint vendor) &&
+                vendor == vendorId)
+            {
+                codecs.Add(codec);
+            }
+        }
+
+        return codecs;
+    }
+
+    private static string CodecName(CallVideoCodecKind codec)
+        => codec switch
+        {
+            CallVideoCodecKind.H265 => "HEVC",
+            CallVideoCodecKind.Av1 => "AV1",
+            _ => "H.264",
+        };
+
+    /// <summary>
     /// Build the dropdown options for one direction: Auto, Software, then every GPU
     /// that can actually do that direction. No capable hardware -> just Auto + Software.
+    /// An encode entry names the codecs that card will encode when picked, because picking it
+    /// limits the call to them.
     /// </summary>
     internal static IReadOnlyList<CallVideoDeviceOption> BuildOptions(
         CallVideoMediaDirection direction,
-        IReadOnlyList<NativeVideoDevice> devices)
+        IReadOnlyList<NativeVideoDevice> devices,
+        IReadOnlyDictionary<string, uint>? verifiedEncoderVendors = null)
     {
         List<CallVideoDeviceOption> options = [new(AutoKey, "Авто")];
         if (SoftwareSelectable(direction))
@@ -80,6 +127,12 @@ internal static class CallVideoDeviceSelection
             }
 
             string suffix = device.Integrated ? " · встроенная" : " · дискретная";
+            if (direction == CallVideoMediaDirection.Encode)
+            {
+                suffix += " · " + string.Join(", ", HardwareEncodeCodecs(
+                    device.VendorId, device.CanEncodeH264, verifiedEncoderVendors).Select(CodecName));
+            }
+
             options.Add(new CallVideoDeviceOption(device.Description, device.Description + suffix));
         }
 
@@ -122,7 +175,7 @@ internal static class CallVideoDeviceSelection
                 string.Equals(device.Description, key, StringComparison.OrdinalIgnoreCase));
             if (match is not null)
             {
-                return ResolvedVideoDevice.Hardware(match.VendorId, match.Description);
+                return ResolvedVideoDevice.Hardware(match.VendorId, match.Description, explicitChoice: true);
             }
         }
 

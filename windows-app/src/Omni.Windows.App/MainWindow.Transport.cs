@@ -37,14 +37,34 @@ public sealed partial class MainWindow
 
         TransportDiscoveryRefreshPayload refresh = rustBridge.GetTransportDiscoveryRefreshPayload();
         lastQueueDiagnosticsSnapshot = refresh.QueueDiagnosticsSnapshot;
-        ApplyTransportRefreshPayload(new TransportRefreshPayload(refresh.TransportSnapshot));
+        ApplyTransportRefreshPayload(new TransportRefreshPayload(refresh.TransportSnapshot, ReadMeshConnectionState()));
+    }
+
+    /// A section switch: the snapshot read OFF the UI thread (50–130 ms held the switch).
+    private async void RefreshTransportStatusAsync()
+    {
+        if (!rustBridge.IsInitialized || windowState.Onboarding.ShellMode != AppShellMode.Authenticated)
+        {
+            RefreshTransportStatus();
+            return;
+        }
+
+        try
+        {
+            await RefreshTransportDiscoveryQueueAsync();
+        }
+        catch (Exception ex)
+        {
+            AppendNavRefreshLog("async.transport_status", ex);
+        }
     }
 
     private async Task RefreshTransportDiscoveryQueueAsync()
     {
-        TransportDiscoveryRefreshPayload refresh = await Task.Run(() => rustBridge.GetTransportDiscoveryRefreshPayload());
+        (TransportDiscoveryRefreshPayload refresh, MeshConnectionStateDto? mesh) = await Task.Run(
+            () => (rustBridge.GetTransportDiscoveryRefreshPayload(), ReadMeshConnectionState()));
         lastQueueDiagnosticsSnapshot = refresh.QueueDiagnosticsSnapshot;
-        ApplyTransportRefreshPayload(new TransportRefreshPayload(refresh.TransportSnapshot));
+        ApplyTransportRefreshPayload(new TransportRefreshPayload(refresh.TransportSnapshot, mesh));
         ApplyQueueDiagnosticsRefreshPayload(new QueueDiagnosticsRefreshPayload(
             refresh.QueueDiagnosticsSnapshot,
             GetResolvedCurrentDialogKey()));
@@ -55,17 +75,50 @@ public sealed partial class MainWindow
         lastTransportSnapshot = payload.Snapshot;
         cachedConfiguredTransportMode = TransportModeExtensions.FromDbValue(payload.Snapshot.TransportModeValue);
         BindCurrentPeerFromTransport(payload.Snapshot);
-        MeshConnectionStateDto? mesh = null;
+        TransportDiagnosticsTextBlock.Text = MainWindowPresentation.BuildTransportDiagnostics(lastTransportSnapshot, payload.Mesh);
+        if (windowState.CurrentSection == AuthenticatedShellSection.Diagnostics)
+        {
+            RenderHelpStatus(payload.Mesh);
+        }
+    }
+
+    // Read with the snapshot, off the UI thread: on the UI thread it held the window 40-120 ms on every
+    // transport tick while Contacts, Settings or Diagnostics were open.
+    private MeshConnectionStateDto? ReadMeshConnectionState()
+    {
         try
         {
-            mesh = rustBridge.MeshConnectionState();
+            MeshConnectionStateDto state = rustBridge.MeshConnectionState();
+            lastMeshReading = new MeshReading(state, System.Diagnostics.Stopwatch.GetTimestamp());
+            return state;
         }
         catch
         {
             // Mesh not started for this profile: the card says so from the snapshot alone.
+            return null;
+        }
+    }
+
+    private sealed record MeshReading(MeshConnectionStateDto State, long At);
+
+    private static readonly TimeSpan MeshReadingFreshFor = TimeSpan.FromMilliseconds(500);
+    private volatile MeshReading? lastMeshReading;
+
+    // The mesh state for drawing on the UI thread: one read costs 40-120 ms, and a single refresh of a
+    // screen asked for it several times. An off-thread read made just before applying (read AFTER the
+    // data it goes with, so what is drawn is never older than what decided to draw it) serves them all;
+    // without one this reads here, as before.
+    private MeshConnectionStateDto MeshStateForScreen()
+    {
+        if (lastMeshReading is { } reading &&
+            System.Diagnostics.Stopwatch.GetElapsedTime(reading.At) < MeshReadingFreshFor)
+        {
+            return reading.State;
         }
 
-        TransportDiagnosticsTextBlock.Text = MainWindowPresentation.BuildTransportDiagnostics(lastTransportSnapshot, mesh);
+        MeshConnectionStateDto state = rustBridge.MeshConnectionState();
+        lastMeshReading = new MeshReading(state, System.Diagnostics.Stopwatch.GetTimestamp());
+        return state;
     }
 
     // Honest node-status line, derived from the mesh connection-state DTO (Rust = truth): whether
@@ -75,7 +128,7 @@ public sealed partial class MainWindow
         string text;
         try
         {
-            var node = rustBridge.MeshConnectionState().Node;
+            var node = MeshStateForScreen().Node;
             text = node.Kind switch
             {
                 "online_reachable" => node.Endpoints is { Count: > 0 }

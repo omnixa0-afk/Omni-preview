@@ -160,6 +160,16 @@ fn apply_received_device_revocation(
             revocation.device_id.0, outcome.newly_applied, outcome.targets_local_device
         ),
     );
+    // A call with the device its account took back ends here (A26, audit 2026-11-09 #6): it is no
+    // longer that contact's device — a stolen laptop is not left talking. Nothing is said to it.
+    let db_path = storage.db_path().to_string_lossy().to_string();
+    if let Ok(Some(call)) = current_call_runtime(&db_path) {
+        if call.remote_account_id == revocation.account_id && call.remote_device_id == revocation.device_id {
+            if let Err(error) = end_runtime_call(storage, &db_path, CallOutcome::ConnectionLost, None, current_unix_ms()) {
+                omni_app_trace_log(trace, &format!("the call with the revoked device did not end: {error}"));
+            }
+        }
+    }
     if outcome.newly_applied {
         // Pass it on: our other devices and our contacts may not have heard.
         broadcast_device_revocation(storage, transport, revocation, from_dialog);
@@ -167,7 +177,12 @@ fn apply_received_device_revocation(
     if outcome.targets_local_device {
         // The account took THIS device back: it erases the profile it holds, at once
         // (docs/decisions/multi-device-equal-nodes.md, «Устройства»). The storage call re-checks
-        // that a verified revocation of this very device is on record.
+        // that a verified revocation of this very device is on record. What the profile keeps in
+        // the process goes first, and the mesh is stopped on its next tick (`take_taken_back`):
+        // only the rows went, and the mesh went on carrying the erased profile (pass 20).
+        crate::clear_profile_registries(storage);
+        transport.set_local_prekey_bundle_json(None);
+        TAKEN_BACK.get_or_init(Default::default).lock().map(|mut taken| taken.insert(db_path.clone())).ok();
         match storage.wipe_profile_if_taken_back() {
             Ok(erased) => omni_app_trace_log(
                 trace,
@@ -181,20 +196,12 @@ fn apply_received_device_revocation(
     }
 }
 
-/// A frame from a device the account took back is not listened to. The one thing it may still send
-/// is a revocation, which proves itself.
-fn sender_is_revoked_device(
-    storage: &Storage,
-    session: &omni_crypto::SessionRecord,
-    payload: &omni_types::WirePayloadV1,
-) -> OmniResult<bool> {
-    if matches!(
-        payload,
-        omni_types::WirePayloadV1::LogicalEvent(event)
-            if matches!(event.payload, omni_types::LogicalEventPayloadV1::DeviceRevocation(_))
-    ) {
-        return Ok(false);
-    }
+/// A frame from a device the account took back is not listened to — revocations included (V-17,
+/// review 2026-10-18). A revocation is signed by the working key, which a stolen device still holds:
+/// passing on "revocations" was the one voice left to a thief, and with it the thief could take the
+/// owner's other devices out of the account in its contacts' eyes. Whatever is genuine still reaches
+/// them from the account's devices that are in good standing.
+fn sender_is_revoked_device(storage: &Storage, session: &omni_crypto::SessionRecord) -> OmniResult<bool> {
     storage.is_device_revoked(
         &session.session_address.remote_account_id,
         &session.session_address.remote_device_id,
@@ -405,8 +412,26 @@ impl OmniApp {
         };
         self.storage.apply_device_revocation(&revocation, now_unix_ms)?;
         broadcast_device_revocation(&self.storage, &self.transport, &revocation, None);
+        // Out of every group we share with it: its own wipe is not to be relied on.
+        if crate::app_groups::remove_revoked_and_departed_from_groups(&self.storage) > 0 {
+            self.flush_group_feed();
+        }
         // The device itself is told by the reconcile pass: run it now.
         crate::request_reconcile_pass();
         Ok(())
     }
+}
+
+/// The databases whose profile its account took back from this device: the mesh stops on its next
+/// tick (it holds the mesh; the revocation is handled inside it). Cleared once taken, and when the
+/// profile stops.
+static TAKEN_BACK: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+/// Whether this database's profile was taken back since the last look (and forget it).
+pub(crate) fn take_taken_back(db_path: &str) -> bool {
+    TAKEN_BACK.get_or_init(Default::default).lock().map(|mut taken| taken.remove(db_path)).unwrap_or(false)
+}
+
+pub(crate) fn forget_taken_back(db_path: &str) {
+    let _ = take_taken_back(db_path);
 }

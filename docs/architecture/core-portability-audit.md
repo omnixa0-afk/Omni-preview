@@ -43,13 +43,13 @@ cannot learn this itself: on Windows WinRT provides it, on Android `Connectivity
   home Wi-Fi runs on Cubic: a loss of speed, not of money; the order of cost of the error
   was chosen deliberately.
 
-## Full list of platform points in the core (this is the entire surface)
+## Platform-specific sites covered by the original audit
 
 | # | Where | What | Portability status |
 |---|---|---|---|
-| C1 | `omni-crypto/crypto_local_protection.rs` | selector of the secret-protection scheme by OS | ✅ **ready**: win→DPAPI, android→PlatformWrappedV1, else→Plaintext (`:1-7`) |
+| C1 | `omni-crypto/crypto_local_protection.rs` | selector of the secret-protection scheme by OS | ✅ **ready**: Windows uses DPAPI. Other platforms default to a host-supplied wrapping key (see C3) |
 | C2 | `omni-crypto/internals_secret_protection.rs` | DPAPI (win) + `platform_wrap` AES-256-GCM | ✅ the android wrap is real (AES-GCM, `:27-67`); the key is host-injected/env (`:69-82`) |
-| C3 | `omni-crypto/crypto_local_protection.rs:62-66` | plaintext fallback | ✅ **fail-closed**: on android plaintext is **forbidden** (error), not silently insecure |
+| C3 | `omni-crypto/crypto_local_protection.rs` | plaintext fallback | ✅ **fail-closed** (2026-10-20): off Windows every platform uses the host-supplied wrap key (Linux/macOS too); plain hex only by explicit development opt-in (`OMNI_INSECURE_PLAINTEXT_SECRETS=1`), never on Windows or Android — `docs/decisions/local-secret-protection.md` |
 | S1 | `omni-storage/lib.rs:181-223` | system-path blocklist + normalization | ✅ full win (`\Windows`…) and unix (`/etc /usr`…) branches, `\\?\`+drive, `MAIN_SEPARATOR` |
 | S2 | `omni-storage/storage_attachments.rs:1831-1940` | free-space preflight + file pre-allocation | ✅ `not(windows)` = deliberate graceful fallback: free-space→`None`, pre-alloc→no-op (these are Windows-only **optimizations**, the feature works without them; optionally `statvfs`/`fallocate` later) |
 | A1 | `omni-app/lib.rs:813` | path case for comparison | ✅ lowercase **only** under `#[cfg(windows)]`; on non-win case is preserved (correct for Android/Linux) |

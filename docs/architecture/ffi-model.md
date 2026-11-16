@@ -106,7 +106,7 @@ FFI consumers do not implement crypto internals. Platform integration only provi
 
 - Windows target path:
   - DPAPI-backed
-- non-Windows dev/test target path:
-  - conservative plaintext fallback only for compatibility and tests
+- Android and other non-Windows hosts supply a wrapping key. Access fails if the required key is missing.
+- On development hosts other than Windows and Android, `OMNI_INSECURE_PLAINTEXT_SECRETS=1` explicitly enables plaintext local secrets. See the [scheme selector](../../core-rust/crates/omni-crypto/src/crypto_local_protection.rs).
 
 This keeps cryptographic decisions in Rust while allowing platform-safe secret handling.

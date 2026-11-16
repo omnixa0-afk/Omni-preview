@@ -32,28 +32,40 @@ internal sealed partial class RustBridge
             OmniJsonSerializerContext.Default.ListGroupMemberView,
             "groups_list_members") ?? new List<GroupMemberView>();
 
-    public void SendGroupText(string groupId, string body)
+    /// What leaving the group takes from this computer: its projects' history, and the projects
+    /// whose whole history only we keep.
+    public GroupLeaveNotice GetGroupLeaveNotice(string groupId)
+        => CallJson(
+            () => NativeMethods.omni_groups_leave_notice(
+                handle,
+                JsonSerializer.Serialize(
+                    new GroupIdRequest(groupId),
+                    OmniJsonSerializerContext.Default.GroupIdRequest)),
+            OmniJsonSerializerContext.Default.GroupLeaveNotice,
+            "groups_leave_notice") ?? new GroupLeaveNotice(new List<string>(), new List<string>());
+
+    public void SendGroupText(string groupId, string body, string? replyTo = null, List<string>? mentions = null)
     {
         const string operation = "groups_send_text";
         string payload = CallRaw(
             () => NativeMethods.omni_groups_send_text(
                 handle,
                 JsonSerializer.Serialize(
-                    new SendGroupTextRequest(groupId, body),
+                    new SendGroupTextRequest(groupId, body, replyTo, mentions),
                     OmniJsonSerializerContext.Default.SendGroupTextRequest)),
             operation);
         ThrowIfRustError(payload, operation);
     }
 
     /// A file or photo into the group (the core re-encodes a photo); `body` is its caption.
-    public void SendGroupAttachment(string groupId, string body, string sourcePath, string? displayName, bool asPhoto)
+    public void SendGroupAttachment(string groupId, string body, string sourcePath, string? displayName, bool asPhoto, string? replyTo = null, bool asVoice = false, bool asVideoNote = false)
     {
         const string operation = "groups_send_attachment";
         string payload = CallRaw(
             () => NativeMethods.omni_groups_send_attachment(
                 handle,
                 JsonSerializer.Serialize(
-                    new SendGroupAttachmentRequest(groupId, body, sourcePath, displayName, asPhoto),
+                    new SendGroupAttachmentRequest(groupId, body, sourcePath, displayName, asPhoto, replyTo, asVoice, asVideoNote),
                     OmniJsonSerializerContext.Default.SendGroupAttachmentRequest)),
             operation);
         ThrowIfRustError(payload, operation);
@@ -241,6 +253,21 @@ internal sealed partial class RustBridge
         ThrowIfRustError(payload, operation);
     }
 
+    // Our microphone level (the capture's smoothed RMS) for the core's active-speaker gating: it rides
+    // our frames and ranks us at forwarders. Called on the group call's tick.
+    public void SetGroupCallAudioLevel(string groupId, float level)
+    {
+        const string operation = "groups_set_call_audio_level";
+        string payload = CallRaw(
+            () => NativeMethods.omni_groups_set_call_audio_level(
+                handle,
+                JsonSerializer.Serialize(
+                    new SetGroupCallAudioLevelRequest(groupId, level),
+                    OmniJsonSerializerContext.Default.SetGroupCallAudioLevelRequest)),
+            operation);
+        ThrowIfRustError(payload, operation);
+    }
+
     public RealtimeMediaNegotiationSnapshot PublishGroupMediaCapabilities(RealtimeMediaCapabilities capabilities)
         => CallJson(
             () => NativeMethods.omni_groups_publish_media_capabilities(
@@ -260,14 +287,19 @@ internal sealed partial class RustBridge
 
     internal sealed record SendGroupTextRequest(
         [property: JsonPropertyName("group_id")] string GroupId,
-        [property: JsonPropertyName("body")] string Body);
+        [property: JsonPropertyName("body")] string Body,
+        [property: JsonPropertyName("reply_to")] string? ReplyTo = null,
+        [property: JsonPropertyName("mentions")] List<string>? Mentions = null);
 
     internal sealed record SendGroupAttachmentRequest(
         [property: JsonPropertyName("group_id")] string GroupId,
         [property: JsonPropertyName("body")] string Body,
         [property: JsonPropertyName("source_file_path")] string SourceFilePath,
         [property: JsonPropertyName("display_file_name")] string? DisplayFileName,
-        [property: JsonPropertyName("as_photo")] bool AsPhoto);
+        [property: JsonPropertyName("as_photo")] bool AsPhoto,
+        [property: JsonPropertyName("reply_to")] string? ReplyTo = null,
+        [property: JsonPropertyName("as_voice")] bool AsVoice = false,
+        [property: JsonPropertyName("as_video_note")] bool AsVideoNote = false);
 
     internal sealed record InviteToGroupRequest(
         [property: JsonPropertyName("group_id")] string GroupId,
@@ -295,6 +327,10 @@ internal sealed partial class RustBridge
         [property: JsonPropertyName("member_pub")] string MemberPub,
         [property: JsonPropertyName("admin")] bool Admin);
 
+    internal sealed record SetGroupCallAudioLevelRequest(
+        [property: JsonPropertyName("group_id")] string GroupId,
+        [property: JsonPropertyName("level")] float Level);
+
     internal sealed record SetGroupCallMediaStateRequest(
         [property: JsonPropertyName("group_id")] string GroupId,
         [property: JsonPropertyName("muted")] bool Muted,
@@ -320,7 +356,9 @@ internal sealed record GroupSummary(
     // Newcomers get the recent history (an admin's switch, on by default).
     [property: JsonPropertyName("newcomer_history")] bool NewcomerHistory = true,
     // Members' lines this device has not read.
-    [property: JsonPropertyName("unread_count")] int UnreadCount = 0);
+    [property: JsonPropertyName("unread_count")] int UnreadCount = 0,
+    // The group has git repositories (docs/decisions/omni-workspace-git.md).
+    [property: JsonPropertyName("is_workspace")] bool IsWorkspace = false);
 
 internal sealed record GroupCallNotice(
     [property: JsonPropertyName("group_id")] string GroupId,
@@ -353,7 +391,14 @@ internal sealed record GroupMessageView(
     [property: JsonPropertyName("body")] string Body,
     [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("created_at_unix_ms")] long CreatedAtUnixMs,
-    [property: JsonPropertyName("attachment")] AttachmentRecord? Attachment = null);
+    [property: JsonPropertyName("attachment")] AttachmentRecord? Attachment = null,
+    [property: JsonPropertyName("reply")] MessageReplyPreview? Reply = null,
+    [property: JsonPropertyName("reactions")] List<MessageReactionView>? Reactions = null,
+    [property: JsonPropertyName("pinned")] bool Pinned = false);
+
+internal sealed record GroupLeaveNotice(
+    [property: JsonPropertyName("projects")] List<string> Projects,
+    [property: JsonPropertyName("only_custodian_of")] List<string> OnlyCustodianOf);
 
 internal sealed record GroupMemberView(
     [property: JsonPropertyName("member_pub")] string MemberPub,

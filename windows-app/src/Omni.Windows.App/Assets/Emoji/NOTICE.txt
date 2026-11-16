@@ -1,0 +1,6 @@
+noto.ttf.gz: Noto Color Emoji (https://github.com/google/fonts, ofl/notocoloremoji), SIL Open Font
+License 1.1, Copyright 2013 Google LLC. The 'SVG ' table is removed: the app draws COLR, and it took 80% of the file.
+
+twemoji.ttf.gz: Twemoji Mozilla v0.7.0 (https://github.com/mozilla/twemoji-colr). Graphics by Twitter
+and other contributors, CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); the font build by
+the Mozilla Foundation, Apache License 2.0.

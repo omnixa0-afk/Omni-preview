@@ -183,6 +183,7 @@ public sealed partial class MainWindow
             CloseButtonText = "Отмена",
             DefaultButton = ContentDialogButton.Close,
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
         if (warning.Acknowledgement is not null)
         {

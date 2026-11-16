@@ -9,9 +9,8 @@
 
 /// Suffix of the key file next to the database (`omni.db` → `omni.db.keys`).
 const DB_KEY_SIDECAR_SUFFIX: &str = ".keys";
-/// The encrypted copy a plaintext database is exported to before it replaces the original.
-const DB_ENCRYPTING_SIDECAR_SUFFIX: &str = ".encrypting";
-/// The plaintext original, kept until the encrypted copy has replaced it, then wiped.
+/// The plaintext original the old in-place encryption set aside (gone since 2026-11-11): a leftover is
+/// wiped or put back on open (`recover_interrupted_encryption`).
 const DB_PLAINTEXT_SIDECAR_SUFFIX: &str = ".plaintext-old";
 const DB_KEY_FILE_VERSION: u32 = 1;
 const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -26,6 +25,11 @@ struct DbKeyFile {
     /// The key under each account's root-derived wrap key.
     #[serde(default)]
     accounts: Vec<DbKeyAccountWrap>,
+    /// The database next to this file is encrypted with its key. From then on a plaintext database
+    /// there is not ours (V-23): someone who can write to the folder put it there, and encrypting it
+    /// with our key would adopt it. Before this, a plaintext one is a migration not finished yet.
+    #[serde(default)]
+    database_encrypted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,76 +164,19 @@ fn account_wrap_aad(account_id: &str) -> Vec<u8> {
     format!("omni-db-dek-v1|{account_id}").into_bytes()
 }
 
-/// Overwrite a file's bytes before removing it (best effort; on an SSD the old blocks may survive).
-fn wipe_file_best_effort(path: &Path) {
-    if let Ok(metadata) = fs::metadata(path) {
-        if let Ok(mut file) = fs::OpenOptions::new().write(true).open(path) {
-            use std::io::Write as _;
-            let zeros = vec![0_u8; 64 * 1024];
-            let mut left = metadata.len();
-            while left > 0 {
-                let chunk = left.min(zeros.len() as u64) as usize;
-                if file.write_all(&zeros[..chunk]).is_err() {
-                    break;
-                }
-                left -= chunk as u64;
-            }
-            let _ = file.sync_all();
-        }
-    }
-    let _ = fs::remove_file(path);
-}
-
-/// Encrypt a plaintext database in place: export it into an encrypted sibling, swap the files, wipe the
-/// plaintext. Each step leaves a state the next open recovers from (`recover_interrupted_encryption`).
-fn encrypt_plaintext_database(path: &Path, key: &[u8; 32]) -> OmniResult<()> {
-    let encrypting = database_key_sidecar(path, DB_ENCRYPTING_SIDECAR_SUFFIX)?;
-    let plaintext_old = database_key_sidecar(path, DB_PLAINTEXT_SIDECAR_SUFFIX)?;
-    let _ = fs::remove_file(&encrypting);
-    {
-        let plain = Connection::open(path).map_err(map_sqlite_error)?;
-        plain.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(map_sqlite_error)?;
-        // sqlcipher_export copies schema and rows but not user_version: carry it by hand.
-        let user_version: i64 = plain
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(map_sqlite_error)?;
-        plain
-            .execute_batch(&format!(
-                "ATTACH DATABASE {} AS encrypted KEY \"x'{}'\";
-                 SELECT sqlcipher_export('encrypted');
-                 PRAGMA encrypted.user_version = {user_version};
-                 DETACH DATABASE encrypted;",
-                sqlite_string_literal(&encrypting),
-                hex::encode_upper(key),
-            ))
-            .map_err(map_sqlite_error)?;
-        // Fold the WAL back so no plaintext page outlives the swap in `-wal`.
-        let _ = plain.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    }
-    fs::rename(path, &plaintext_old).map_err(|error| {
-        OmniError::Storage(format!("failed to set aside plaintext database '{}': {error}", path.display()))
-    })?;
-    fs::rename(&encrypting, path).map_err(|error| {
-        OmniError::Storage(format!("failed to install encrypted database '{}': {error}", path.display()))
-    })?;
-    wipe_file_best_effort(&plaintext_old);
-    for suffix in ["-wal", "-shm", "-journal"] {
-        if let Ok(sidecar) = database_key_sidecar(path, suffix) {
-            wipe_file_best_effort(&sidecar);
-        }
-    }
-    Ok(())
-}
-
-/// A crash between the steps of `encrypt_plaintext_database` leaves the plaintext set aside: put it
-/// back when the encrypted copy never landed, wipe it when it did.
+/// A crash in the middle of the old in-place encryption of a plaintext database (gone since 2026-11-11)
+/// left the plaintext set aside: unlink it when the encrypted copy landed; otherwise put it back — and
+/// a plaintext database is not opened (`database_key_for_open`).
 fn recover_interrupted_encryption(path: &Path) -> OmniResult<()> {
     let plaintext_old = database_key_sidecar(path, DB_PLAINTEXT_SIDECAR_SUFFIX)?;
-    if !plaintext_old.exists() {
-        return Ok(());
+    match fs::symlink_metadata(&plaintext_old) {
+        Ok(meta) if meta.is_file() && !media_reparse_point(&meta) => {}
+        Ok(_) => return Err(OmniError::Storage("unexpected plaintext database sidecar type".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(OmniError::Storage(e.to_string())),
     }
     if database_file_kind(path)? == DatabaseFileKind::Encrypted {
-        wipe_file_best_effort(&plaintext_old);
+        fs::remove_file(&plaintext_old).map_err(|e| OmniError::Storage(e.to_string()))?;
     } else {
         let _ = fs::remove_file(path);
         fs::rename(&plaintext_old, path).map_err(|error| {
@@ -255,8 +202,15 @@ fn database_key_for_open(path: &Path) -> OmniResult<[u8; 32]> {
     recover_interrupted_encryption(path)?;
     let key_path = database_key_sidecar(path, DB_KEY_SIDECAR_SUFFIX)?;
     let kind = database_file_kind(path)?;
-    let key = match read_database_key_file(&key_path)? {
-        Some(file) => unwrap_database_key_with_dpapi(&file).ok_or_else(|| {
+    let key_file = read_database_key_file(&key_path)?;
+    if kind == DatabaseFileKind::Plaintext && key_file.as_ref().is_some_and(|file| file.database_encrypted) {
+        return Err(OmniError::Storage(format!(
+            "'{}' is not encrypted, but its key file says it was: not opening a replaced database",
+            path.display()
+        )));
+    }
+    let key = match &key_file {
+        Some(file) => unwrap_database_key_with_dpapi(file).ok_or_else(|| {
             OmniError::StorageLocked(
                 "this database's key is sealed to another machine or Windows account".to_string(),
             )
@@ -275,13 +229,27 @@ fn database_key_for_open(path: &Path) -> OmniResult<[u8; 32]> {
                     version: DB_KEY_FILE_VERSION,
                     dpapi: Some(protect_bytes(&key)?),
                     accounts: Vec::new(),
+                    database_encrypted: false,
                 },
             )?;
             key
         }
     };
+    // A plaintext database — from before encryption at rest (2026-10-17) — is not opened. Encrypting it
+    // in place left a full plaintext copy on the disk until the next start if the process stopped in
+    // the middle (blind audit 2026-11-11, H6); pre-1.0, an old format is not migrated (maintainers' decision
+    // 2026-11-11). The profile is made anew or restored from a backup.
     if kind == DatabaseFileKind::Plaintext {
-        encrypt_plaintext_database(path, &key)?;
+        return Err(OmniError::Storage(format!(
+            "'{}' is a database from before encryption at rest: it is not opened — make the profile anew or restore it from a backup",
+            path.display()
+        )));
+    }
+    // Mark the key file once the database is (or is about to be, for a new file) encrypted with it;
+    // a file from before this mark gets it on its first open.
+    if let Some(mut file) = read_database_key_file(&key_path)?.filter(|file| !file.database_encrypted) {
+        file.database_encrypted = true;
+        write_database_key_file(&key_path, &file)?;
     }
     database_key_cache()
         .lock()
@@ -322,6 +290,12 @@ impl Storage {
     /// `rusqlite::Connection::open`: without the key every read fails with "file is not a database".
     pub fn open_keyed_connection(path: impl AsRef<Path>) -> OmniResult<Connection> {
         let path = path.as_ref();
+        // Like `Storage::open`: a new database (and its key file) may be the first thing in its folder.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                OmniError::Storage(format!("failed to create storage directory '{}': {error}", parent.display()))
+            })?;
+        }
         let key = database_key_for_open(path)?;
         let connection = Connection::open(path).map_err(map_sqlite_error)?;
         apply_database_key(&connection, &key)?;
@@ -394,13 +368,26 @@ impl Storage {
     /// of the database key. Runs at startup (`migrate`) and after a profile is created, restored or
     /// unlocked by its phrase; writes the key file only when a wrap was missing.
     pub fn ensure_database_key_wraps(&self) -> OmniResult<()> {
+        self.add_database_key_wraps(self.openable_account_roots()?)
+    }
+
+    /// Add a recovery-phrase wrap of the database key for each of `roots` that has none. A root
+    /// under the profile password is not among the openable ones: its wrap is added here at the
+    /// password unlock.
+    fn add_database_key_wraps(
+        &self,
+        roots: Vec<(AccountId, omni_identity::AccountRootSecret)>,
+    ) -> OmniResult<()> {
+        if roots.is_empty() {
+            return Ok(());
+        }
         let key_path = database_key_sidecar(&self.db_path, DB_KEY_SIDECAR_SUFFIX)?;
         let Some(mut file) = read_database_key_file(&key_path)? else {
             return Ok(());
         };
         let key = database_key_for_open(&self.db_path)?;
         let mut changed = false;
-        for (account_id, root_secret) in self.openable_account_roots()? {
+        for (account_id, root_secret) in roots {
             if file.accounts.iter().any(|wrap| wrap.account_id == account_id.0) {
                 continue;
             }
@@ -417,8 +404,9 @@ impl Storage {
         Ok(())
     }
 
-    /// The account root of every profile in this file whose sealed secrets open on this machine. A
-    /// profile sealed to another machine is skipped: it gets its wrap after its phrase unlocks it.
+    /// The account root of every profile in this file whose sealed secrets open on this machine
+    /// without a password. A profile sealed to another machine is skipped (it gets its wrap after
+    /// its phrase unlocks it), and so is one under its password (at the password unlock).
     fn openable_account_roots(&self) -> OmniResult<Vec<(AccountId, omni_identity::AccountRootSecret)>> {
         let profile_ids: Vec<String> = {
             let mut statement = self
@@ -435,7 +423,7 @@ impl Storage {
             let Some(row) = self.get_profile_secrets_row(&LocalProfileId(profile_id))? else {
                 continue;
             };
-            if let Ok(Some(secrets)) = load_profile_secrets_from_profile_secrets_row(&row) {
+            if let Some(secrets) = read_stored_profile_root(&row, None).ok().and_then(StoredProfileRoot::open) {
                 roots.push((AccountId(row.account_id.clone()), secrets.root_secret));
             }
         }
@@ -456,6 +444,22 @@ impl Storage {
             return Ok(());
         };
         write_database_key_file(&database_key_sidecar(destination_db_path, DB_KEY_SIDECAR_SUFFIX)?, &file)
+    }
+
+    /// Leave in the key file of the database at `db_path` the recovery-phrase wrap of one account
+    /// (a copy made for that account names no other).
+    pub(crate) fn keep_one_account_key_wrap(db_path: &Path, account_id: &AccountId) -> OmniResult<()> {
+        let sidecar = database_key_sidecar(db_path, DB_KEY_SIDECAR_SUFFIX)?;
+        let Some(mut file) = read_database_key_file(&sidecar)? else {
+            return Ok(());
+        };
+        file.accounts.retain(|wrap| wrap.account_id == account_id.0);
+        write_database_key_file(&sidecar, &file)
+    }
+
+    /// A database file that is gone for good (a staged copy): its key leaves this process's cache.
+    pub(crate) fn forget_key_of_database(db_path: &Path) {
+        forget_database_key(db_path);
     }
 
     /// The key file name of a database file (`omni.db` → `omni.db.keys`), for code that packs a database

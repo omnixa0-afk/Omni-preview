@@ -284,6 +284,7 @@ impl crate::OmniApp {
     /// Set one publication's plan (`auto: true` — back to its preset). Applies at once: the rendezvous
     /// runtime restarts, as on a change of the courier set.
     pub fn set_publish_plan(&self, publication: Publication, plan: PublishPlanV1) -> OmniResult<PublishPlanViewV1> {
+        let _ = self.ensure_runtime_profile_active("set_publish_plan")?;
         let db_path = self.storage.db_path().to_string_lossy().to_string();
         let plan = plan.validated(publication)?;
         let mut plans = load_publish_plans(&db_path);

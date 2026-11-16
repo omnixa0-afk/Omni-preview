@@ -84,6 +84,12 @@ public sealed class RealtimeMediaContractTests
         Assert.Equal(
             "Ваше видео: AV1, 1920×1080, 30 к/с — лучший из возможных\nВидео собеседника: HEVC, 1280×720, 30 к/с — отправитель не кодирует AV1\n",
             text);
+        Assert.StartsWith(
+            "Ваше видео: H.264, 1280×720, 30 к/с; кодирует Intel® Quick Sync Video H.264 Encoder MFT\n",
+            CallVideoService.FormatVideoDirectionsForPeople(
+                new RealtimeVideoStream("me", "h264", 102, 1280, 720, 30, 2_000_000, null),
+                null,
+                "Intel® Quick Sync Video H.264 Encoder MFT"));
         Assert.Equal(string.Empty, CallVideoService.FormatVideoDirectionsForPeople(null, null));
         Assert.StartsWith("Ваше видео: не идёт", CallVideoService.FormatVideoDirectionsForPeople(null,
             new RealtimeVideoStream("peer", "h264", 102, 1280, 720, 30, 4_000_000, null)));
@@ -513,7 +519,7 @@ public sealed class RealtimeMediaContractTests
             receiver!.PushRtpPackets(batch.Buffer.AsSpan(0, batch.Length), batch.PacketCount);
             Assert.True(WaitForNativeI420Frame(receiver, out NativeWebRtcDecodedI420Frame decoded));
             Assert.Equal(320, decoded.Width);
-            Assert.Equal(180, decoded.Height);
+            Assert.Equal(EncodedSide(180), decoded.Height);
             Assert.True(DecodedI420ColorBarsArePlausible(decoded.Buffer, decoded.Width, decoded.Height));
 
             string diagnostics = receiver.GetDiagnosticsJson();
@@ -715,8 +721,8 @@ public sealed class RealtimeMediaContractTests
             receiver!.PushRtpPackets(batch.Buffer.AsSpan(0, batch.Length), batch.PacketCount);
             Assert.True(WaitForNativeBgraFrame(receiver, out NativeWebRtcDecodedBgraFrame decoded));
             Assert.Equal(320, decoded.Width);
-            Assert.Equal(180, decoded.Height);
-            Assert.Equal(checked(320 * 180 * 4), decoded.Buffer.Length);
+            Assert.Equal(EncodedSide(180), decoded.Height);
+            Assert.Equal(checked(320 * EncodedSide(180) * 4), decoded.Buffer.Length);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width / 6, decoded.Height / 2, DominantColor.Red);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width / 2, decoded.Height / 2, DominantColor.Green);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width * 5 / 6, decoded.Height / 2, DominantColor.Blue);
@@ -774,8 +780,8 @@ public sealed class RealtimeMediaContractTests
             receiver!.PushRtpPackets(batch.Buffer.AsSpan(0, batch.Length), batch.PacketCount);
             Assert.True(WaitForNativeBgraFrame(receiver, out NativeWebRtcDecodedBgraFrame decoded));
             Assert.Equal(320, decoded.Width);
-            Assert.Equal(180, decoded.Height);
-            Assert.Equal(checked(320 * 180 * 4), decoded.Buffer.Length);
+            Assert.Equal(EncodedSide(180), decoded.Height);
+            Assert.Equal(checked(320 * EncodedSide(180) * 4), decoded.Buffer.Length);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width / 6, decoded.Height / 2, DominantColor.Red);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width / 2, decoded.Height / 2, DominantColor.Green);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width * 5 / 6, decoded.Height / 2, DominantColor.Blue);
@@ -1191,7 +1197,7 @@ public sealed class RealtimeMediaContractTests
             receiver!.PushRtpPackets(batch.Buffer.AsSpan(0, batch.Length), batch.PacketCount);
             Assert.True(WaitForNativeI420Frame(receiver, out NativeWebRtcDecodedI420Frame decoded));
             Assert.Equal(320, decoded.Width);
-            Assert.Equal(180, decoded.Height);
+            Assert.Equal(EncodedSide(180), decoded.Height);
             Assert.True(DecodedI420ColorBarsArePlausible(decoded.Buffer, decoded.Width, decoded.Height));
 
             string diagnostics = receiver.GetDiagnosticsJson();
@@ -1269,7 +1275,7 @@ public sealed class RealtimeMediaContractTests
             receiver!.PushRtpPackets(batch.Buffer.AsSpan(0, batch.Length), batch.PacketCount);
             Assert.True(WaitForNativeBgraFrame(receiver, out NativeWebRtcDecodedBgraFrame decoded));
             Assert.Equal(320, decoded.Width);
-            Assert.Equal(180, decoded.Height);
+            Assert.Equal(EncodedSide(180), decoded.Height);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width / 6, decoded.Height / 2, DominantColor.Red);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width / 2, decoded.Height / 2, DominantColor.Green);
             AssertDominantColor(decoded.Buffer, decoded.Width, decoded.Height, decoded.Width * 5 / 6, decoded.Height / 2, DominantColor.Blue);
@@ -1341,7 +1347,7 @@ public sealed class RealtimeMediaContractTests
 
             Assert.True(WaitForNativeBgraFrame(receiver!, out NativeWebRtcDecodedBgraFrame decoded));
             Assert.Equal(320, decoded.Width);
-            Assert.Equal(180, decoded.Height);
+            Assert.Equal(EncodedSide(180), decoded.Height);
         }
     }
 
@@ -1906,6 +1912,14 @@ public sealed class RealtimeMediaContractTests
 
         return batch;
     }
+
+    /// <summary>Сторона кадра, которую видит приёмник: исходная, обрезанная вниз до кратной 16.</summary>
+    /// <remarks>
+    /// Аппаратный кодировщик просит стороны, кратные 16 (<c>requested_resolution_alignment</c>), и
+    /// источник сессии обрезает кадр по центру до такого размера — так 320x180 приходит как 320x176.
+    /// См. docs/bugs/hw-encoder-odd-frame-sizes.md.
+    /// </remarks>
+    private static int EncodedSide(int side) => side - (side % 16);
 
     /// <summary>Прочитать целое из диагностического JSON нативной сессии.</summary>
     private static long ReadDiagnosticsInt(string diagnostics, string key)

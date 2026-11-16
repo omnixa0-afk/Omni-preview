@@ -5,9 +5,13 @@
 //!
 //! - **The order of Commits without a server.** MLS needs exactly one Commit per epoch; a delivery
 //!   server usually sequences them. Our durable feeds deliver everything to everyone in any order, so
-//!   among Commits competing for epoch E the one with the smallest SHA-256 over its wire bytes wins —
-//!   everywhere, whatever the arrival order. Before merging a Commit a member snapshots the group's
-//!   rows; a stronger competitor arriving later restores the snapshot and merges the winner instead.
+//!   among Commits competing for epoch E the one with the smallest rank wins — everywhere, whatever the
+//!   arrival order ([`Engine::commit_rank_at`]): an admin's Commit before anyone else's, then a value
+//!   the committer cannot choose (from E's exporter secret and its own key). Before merging a Commit a
+//!   member snapshots the group's rows; a stronger competitor arriving later restores the snapshot and
+//!   merges the winner instead. The rank used to be the SHA-256 of the Commit's bytes, which the
+//!   committer picks: a member about to be removed made Commits until one ranked lower than the
+//!   admin's and undid its removal, every epoch (security review 2026-10-18, V-04).
 //! - **Who may do what.** Group name and admins live in a group-context extension; every member checks
 //!   a Commit against it BEFORE merging: anyone adds, admins remove others and change name/admins,
 //!   anyone leaves (a self-remove proposal that any member then commits).
@@ -40,8 +44,19 @@ pub const OMNI_GROUP_META_EXTENSION: u16 = 0xff0a;
 /// arriving just after it (store-and-forward reorders freely) still opens.
 const MAX_PAST_EPOCHS: usize = 8;
 
-/// Epochs of our branch remembered by Commit rank (see `omni_mls_commit_log`).
+/// How far ahead of ours a message may say its epoch is and still wait for it. Its epoch is read
+/// before anything about it is checked: one "from" epoch 2^63 waited forever and took the place of
+/// honest ones (blind audit 2026-11-13, pass 19). A gap wider than this is repaired by rejoining.
+const MAX_FUTURE_EPOCHS: u64 = 256;
+
+/// Epochs of our branch remembered by Commit rank (see `omni_mls_group_commit_log`).
 const COMMIT_LOG_EPOCHS: i64 = 256;
+
+/// Epochs whose state we keep (`omni_mls_group_snapshots`): a Commit for one of them is ranked on it. A
+/// Commit older than that — another branch that split further back on our side — cannot be ranked
+/// and is ignored (its rank needs the committer and the epoch's exporter, both behind that epoch's
+/// keys; ranking it by its bytes instead let a member undo its removal, V-04).
+const SNAPSHOT_EPOCHS: i64 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GroupError {
@@ -70,7 +85,17 @@ pub struct MemberCard {
     pub member_pub: String,
     pub account_id: String,
     pub display_name: String,
+    /// The device's certificate chain (master → working key → device), compact, base64: what makes
+    /// `account_id` more than a claim. Checked by the app's [`CardCheck`]; a card without it is taken
+    /// only for a leaf already in a group from before the chain was carried (audit 2026-11-09, F01).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_chain: String,
 }
+
+/// The app's check of a member card against the key that signs its leaf: the card's device chain
+/// holds, its device key is that key, and its `account_id` is the chain's account. This crate holds no
+/// account keys, so the app supplies it ([`Engine::with_card_check`]).
+pub type CardCheck = fn(card: &MemberCard, signature_key: &[u8]) -> std::result::Result<(), String>;
 
 /// Group name and admins — what every member authorizes Commits against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +147,8 @@ pub struct AddOutput {
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
     pub added: Vec<MemberCard>,
+    /// The Commit's rank in its epoch ([`Engine::branch_rank`] tells later whether it stood).
+    pub rank: [u8; 32],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -146,6 +173,9 @@ pub enum Inbound {
     Commit { outcome: CommitOutcome, view: GroupView, put_back: Vec<String> },
     /// For an epoch we have not reached: keep the bytes, offer them again after the next Commit.
     Future { epoch: u64 },
+    /// Of an epoch further ahead of ours than a message may wait for ([`MAX_FUTURE_EPOCHS`]): not
+    /// kept, and not taken as handled — it is to come again once we are nearer.
+    TooFarAhead { epoch: u64, current: u64 },
     /// A Commit for an epoch we passed long ago, not the one we merged there: the group went on in
     /// two branches (a network split, two devices apart). `ours_wins` — our Commit at `epoch` ranks
     /// lower (wins by the same rule as a competitor one epoch back); otherwise our branch lost and we
@@ -159,9 +189,28 @@ pub enum Inbound {
     Ignored(String),
 }
 
-/// SHA-256 rank of a Commit's wire bytes: the smaller wins its epoch.
-pub fn commit_rank(commit_wire: &[u8]) -> [u8; 32] {
-    Sha256::digest(commit_wire).into()
+/// Exporter label of the per-epoch key behind Commit ranks.
+const COMMIT_RANK_EXPORTER_LABEL: &str = "omni commit rank";
+
+/// A Commit processed against a group state, checked against the rules, not merged yet.
+enum Staged {
+    Ready {
+        group: MlsGroup,
+        staged: Box<StagedCommit>,
+        rank: [u8; 32],
+        before: Vec<TableRows>,
+        put_back: Vec<String>,
+    },
+    Rejected(String),
+    NotCommit,
+}
+
+fn protocol_message(bytes: &[u8]) -> Option<ProtocolMessage> {
+    match MlsMessageIn::tls_deserialize_exact(bytes).ok()?.extract() {
+        MlsMessageBodyIn::PublicMessage(message) => Some(ProtocolMessage::from(message)),
+        MlsMessageBodyIn::PrivateMessage(message) => Some(ProtocolMessage::from(message)),
+        _ => None,
+    }
 }
 
 fn wire(message: &MlsMessageOut) -> Result<Vec<u8>> {
@@ -250,6 +299,7 @@ pub struct Engine<'c, C: Codec> {
     provider: Provider<'c, C>,
     signer: SignatureKeyPair,
     me: MemberCard,
+    card_check: Option<CardCheck>,
 }
 
 impl<'c, C: Codec> Engine<'c, C> {
@@ -258,15 +308,20 @@ impl<'c, C: Codec> Engine<'c, C> {
         SqliteStorageProvider::<C, &mut Connection>::new(conn)
             .run_migrations()
             .map_err(mls)?;
+        // Snapshots and the commit log were keyed by the bare group id: two profiles of one database
+        // in one group shared their rows. Now they are keyed like OpenMLS's own rows, by the codec's
+        // key (per profile, blind audit 2026-11-12, pass 17); the old tables rank nothing that way.
+        conn.execute_batch("DROP TABLE IF EXISTS omni_mls_snapshots; DROP TABLE IF EXISTS omni_mls_commit_log;")?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS omni_mls_snapshots (
-                group_id BLOB PRIMARY KEY NOT NULL,
+            "CREATE TABLE IF NOT EXISTS omni_mls_group_snapshots (
+                group_id BLOB NOT NULL,
                 epoch INTEGER NOT NULL,
                 merged_rank BLOB NOT NULL,
                 ours INTEGER NOT NULL,
-                rows TEXT NOT NULL
+                rows TEXT NOT NULL,
+                PRIMARY KEY (group_id, epoch)
             );
-            CREATE TABLE IF NOT EXISTS omni_mls_commit_log (
+            CREATE TABLE IF NOT EXISTS omni_mls_group_commit_log (
                 group_id BLOB NOT NULL,
                 epoch INTEGER NOT NULL,
                 rank BLOB NOT NULL,
@@ -292,7 +347,15 @@ impl<'c, C: Codec> Engine<'c, C> {
             },
             signer,
             me,
+            card_check: None,
         }
+    }
+
+    /// Check every new member's card with `check` (see [`CardCheck`]): without it a card's account is
+    /// only what the card says.
+    pub fn with_card_check(mut self, check: CardCheck) -> Self {
+        self.card_check = Some(check);
+        self
     }
 
     fn credential(&self) -> Result<CredentialWithKey> {
@@ -358,7 +421,7 @@ impl<'c, C: Codec> Engine<'c, C> {
     }
 
     /// The card must belong to the key that signs the leaf — otherwise anyone could claim a name.
-    fn check_card(credential: &Credential, signature_key: &[u8]) -> Result<MemberCard> {
+    fn card_of_key(credential: &Credential, signature_key: &[u8]) -> Result<MemberCard> {
         let card = Self::card_of(credential).ok_or_else(|| GroupError::Invalid("unreadable member card".into()))?;
         let claimed = base64_decode(&card.member_pub)
             .ok_or_else(|| GroupError::Invalid("member_pub is not base64".into()))?;
@@ -366,6 +429,57 @@ impl<'c, C: Codec> Engine<'c, C> {
             return Err(GroupError::Invalid("member card does not match its signing key".into()));
         }
         Ok(card)
+    }
+
+    /// A newcomer's card: its key, and — with a [`CardCheck`] — its device chain, which it must carry.
+    /// Without the chain a member could put any account in its card (an admin's, and pass for them
+    /// where the app trusts the account; the server's own, and get what only its own devices get).
+    fn check_card(&self, credential: &Credential, signature_key: &[u8]) -> Result<MemberCard> {
+        let card = Self::card_of_key(credential, signature_key)?;
+        if let Some(check) = self.card_check {
+            if card.device_chain.is_empty() {
+                return Err(GroupError::Invalid("member card carries no device certificate".into()));
+            }
+            check(&card, signature_key).map_err(GroupError::Invalid)?;
+        }
+        Ok(card)
+    }
+
+    /// A card already in the tree (a Welcome shows them all): checked like a newcomer's when it carries
+    /// a chain; one from before chains were carried is taken as it is, and its account is not trusted
+    /// for anything the account alone decides ([`Self::verified_account`]).
+    fn check_tree_card(&self, credential: &Credential, signature_key: &[u8]) -> Result<MemberCard> {
+        let card = Self::card_of_key(credential, signature_key)?;
+        if let (Some(check), false) = (self.card_check, card.device_chain.is_empty()) {
+            check(&card, signature_key).map_err(GroupError::Invalid)?;
+        }
+        Ok(card)
+    }
+
+    /// A member's leaf replaced by its own Commit or Update: same key; a card with a device chain is
+    /// checked like a newcomer's; one without may only stay what it was (no new account, no dropped chain).
+    fn check_updated_card(&self, old: Option<&MemberCard>, credential: &Credential, signature_key: &[u8]) -> std::result::Result<(), String> {
+        let new = Self::card_of_key(credential, signature_key).map_err(|e| e.to_string())?;
+        let Some(old) = old else {
+            return Err("an updated leaf of no member".into());
+        };
+        if new.member_pub != old.member_pub {
+            return Err("a member changed its key".into());
+        }
+        if !new.device_chain.is_empty() {
+            return self.check_card(credential, signature_key).map(|_| ()).map_err(|e| e.to_string());
+        }
+        if !old.device_chain.is_empty() || new.account_id != old.account_id {
+            return Err("a member changed its card without a device chain".into());
+        }
+        Ok(())
+    }
+
+    /// The account of a member's card, only when its device chain proves it.
+    fn verified_account(&self, card: &MemberCard) -> Option<String> {
+        let check = self.card_check?;
+        let key = base64_decode(&card.member_pub)?;
+        (!card.device_chain.is_empty() && check(card, &key).is_ok()).then(|| card.account_id.clone())
     }
 
     /// Create a group with us as its only member and admin.
@@ -426,7 +540,7 @@ impl<'c, C: Codec> Engine<'c, C> {
                 .map_err(mls)?
                 .validate(self.provider.crypto(), ProtocolVersion::Mls10)
                 .map_err(mls)?;
-            added.push(Self::check_card(
+            added.push(self.check_card(
                 kp.leaf_node().credential(),
                 kp.leaf_node().signature_key().as_slice(),
             )?);
@@ -436,35 +550,17 @@ impl<'c, C: Codec> Engine<'c, C> {
         let before = self.snapshot_rows(group_id)?;
         let (commit, welcome, _info) =
             group.add_members(&self.provider, &self.signer, &kps).map_err(mls)?;
-        group.merge_pending_commit(&self.provider).map_err(mls)?;
         let commit = wire(&commit)?;
-        self.save_snapshot(group_id, group.epoch().as_u64(), &commit_rank(&commit), true, &before)?;
-        Ok(AddOutput { commit, welcome: wire(&welcome)?, added })
+        let rank = self.commit_rank_at(&group, Some(&self.me), &commit)?;
+        group.merge_pending_commit(&self.provider).map_err(mls)?;
+        self.save_snapshot(group_id, group.epoch().as_u64(), &rank, true, &before)?;
+        Ok(AddOutput { commit, welcome: wire(&welcome)?, added, rank })
     }
 
-    /// Join from a Welcome; returns the group id.
+    /// Join from a Welcome; returns the group id. Every leaf's card must match its signing key — a
+    /// forged card in the tree is refused, and nothing of the attempt stays (it used to stay joined).
     pub fn join(&self, welcome: &[u8]) -> Result<Vec<u8>> {
-        let welcome = match MlsMessageIn::tls_deserialize_exact(welcome).map_err(mls)?.extract() {
-            MlsMessageBodyIn::Welcome(welcome) => welcome,
-            _ => return Err(GroupError::Invalid("not a Welcome".into())),
-        };
-        let config = MlsGroupJoinConfig::builder()
-            .use_ratchet_tree_extension(true)
-            .max_past_epochs(MAX_PAST_EPOCHS)
-            .build();
-        let group = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
-            .map_err(mls)?
-            .into_group(&self.provider)
-            .map_err(mls)?;
-        // Every leaf's card must match its signing key — a forged card in the tree is refused.
-        for member in group.members() {
-            Self::check_card(&member.credential, &member.signature_key)?;
-        }
-        Self::meta_of(&group)?;
-        let group_id = group.group_id().as_slice().to_vec();
-        self.conn
-            .execute("DELETE FROM omni_mls_snapshots WHERE group_id = ?1", params![group_id])?;
-        Ok(group_id)
+        self.join_replacing(welcome, None)
     }
 
     fn admin_check(&self, group: &MlsGroup) -> Result<GroupMeta> {
@@ -475,27 +571,101 @@ impl<'c, C: Codec> Engine<'c, C> {
         Ok(meta)
     }
 
-    /// Remove members (admins only). Returns the Commit.
+    /// Remove members: an admin anyone, any member another device of its own account (a revoked one —
+    /// both cards' device chains must prove the account). Returns the Commit.
     pub fn remove_members(&self, group_id: &[u8], member_pubs: &[String]) -> Result<Vec<u8>> {
         let mut group = self.load(group_id)?;
-        let mut meta = self.admin_check(&group)?;
-        let indices: Vec<LeafNodeIndex> = group
+        let targets: Vec<(LeafNodeIndex, MemberCard)> = group
             .members()
-            .filter(|m| Self::card_of(&m.credential).is_some_and(|c| member_pubs.contains(&c.member_pub)))
-            .map(|m| m.index)
+            .filter_map(|m| Self::card_of(&m.credential).map(|card| (m.index, card)))
+            .filter(|(_, card)| member_pubs.contains(&card.member_pub))
             .collect();
-        if indices.is_empty() {
+        if targets.is_empty() {
             return Err(GroupError::Invalid("no such member".into()));
         }
-        // A removed admin stops being one.
-        meta.admins.retain(|a| !member_pubs.contains(a));
+        let indices: Vec<LeafNodeIndex> = targets.iter().map(|(index, _)| *index).collect();
         let before = self.snapshot_rows(group_id)?;
-        let (commit, _welcome, _info) =
-            group.remove_members(&self.provider, &self.signer, &indices).map_err(mls)?;
+        let commit = if self.admin_check(&group).is_ok() {
+            let (commit, _welcome, _info) =
+                group.remove_members(&self.provider, &self.signer, &indices).map_err(mls)?;
+            wire(&commit)?
+        } else {
+            let mine = self.verified_account(&self.me);
+            let all_mine = targets.iter().all(|(_, card)| {
+                card.member_pub != self.me.member_pub && mine.is_some() && self.verified_account(card) == mine
+            });
+            if !all_mine {
+                return Err(GroupError::NotAllowed("only an admin may do this"));
+            }
+            // A revoked admin of our own account: we take its place in the same Commit, or a group
+            // whose only admin it was would be left with none.
+            let meta = Self::meta_of(&group)?;
+            let removed: Vec<String> = targets.iter().map(|(_, card)| card.member_pub.clone()).collect();
+            let takeover = Self::admin_takeover(&meta, &removed, &self.me.member_pub);
+            let mut builder = group.commit_builder().propose_removals(indices);
+            if let Some(new_meta) = takeover {
+                builder = builder.propose_group_context_extensions(Self::context_extensions(&new_meta)?).map_err(mls)?;
+            }
+            let bundle = builder
+                .load_psks(self.provider.storage())
+                .map_err(mls)?
+                .build(self.provider.rand(), self.provider.crypto(), &self.signer, |_| true)
+                .map_err(mls)?
+                .stage_commit(&self.provider)
+                .map_err(mls)?;
+            wire(bundle.commit())?
+        };
+        let rank = self.commit_rank_at(&group, Some(&self.me), &commit)?;
         group.merge_pending_commit(&self.provider).map_err(mls)?;
-        let commit = wire(&commit)?;
-        self.save_snapshot(group_id, group.epoch().as_u64(), &commit_rank(&commit), true, &before)?;
+        self.save_snapshot(group_id, group.epoch().as_u64(), &rank, true, &before)?;
         Ok(commit)
+    }
+
+    /// The meta after a member takes out admins of its own account (`removed`): those admins go and
+    /// `taker` is one. `None` when none of the removed was an admin — the meta stays.
+    fn admin_takeover(meta: &GroupMeta, removed: &[String], taker: &str) -> Option<GroupMeta> {
+        if !meta.admins.iter().any(|admin| removed.contains(admin)) {
+            return None;
+        }
+        let mut next = meta.clone();
+        next.admins.retain(|admin| !removed.contains(admin));
+        if !next.admins.iter().any(|admin| admin == taker) {
+            next.admins.push(taker.to_string());
+        }
+        Some(next)
+    }
+
+    /// The meta a Commit proposes, if it proposes one.
+    fn proposed_meta(staged: &StagedCommit) -> Option<GroupMeta> {
+        staged.queued_proposals().find_map(|queued| match queued.proposal() {
+            Proposal::GroupContextExtensions(proposal) => proposal
+                .extensions()
+                .unknown(OMNI_GROUP_META_EXTENSION)
+                .and_then(|ext| serde_json::from_slice(&ext.0).ok()),
+            _ => None,
+        })
+    }
+
+    /// Our leaf in the group carries a card without the device chain we carry now (the group was
+    /// joined before cards carried chains): put our card in with a Commit of our own. Until then the
+    /// members do not take our account as proven ([`Self::verified_account`]). `None` — nothing to do.
+    pub fn refresh_own_card(&self, group_id: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut group = self.load(group_id)?;
+        if self.me.device_chain.is_empty() || !group.is_active() {
+            return Ok(None);
+        }
+        let current = group.own_leaf_node().and_then(|leaf| Self::card_of(leaf.credential()));
+        if current.as_ref().is_some_and(|card| !card.device_chain.is_empty()) {
+            return Ok(None);
+        }
+        let before = self.snapshot_rows(group_id)?;
+        let params = LeafNodeParameters::builder().with_credential_with_key(self.credential()?).build();
+        let bundle = group.self_update(&self.provider, &self.signer, params).map_err(mls)?;
+        let commit = wire(bundle.commit())?;
+        let rank = self.commit_rank_at(&group, Some(&self.me), &commit)?;
+        group.merge_pending_commit(&self.provider).map_err(mls)?;
+        self.save_snapshot(group_id, group.epoch().as_u64(), &rank, true, &before)?;
+        Ok(Some(commit))
     }
 
     /// Change the group name and/or admins (admins only). Returns the Commit.
@@ -514,9 +684,10 @@ impl<'c, C: Codec> Engine<'c, C> {
                 &self.signer,
             )
             .map_err(mls)?;
-        group.merge_pending_commit(&self.provider).map_err(mls)?;
         let commit = wire(&commit)?;
-        self.save_snapshot(group_id, group.epoch().as_u64(), &commit_rank(&commit), true, &before)?;
+        let rank = self.commit_rank_at(&group, Some(&self.me), &commit)?;
+        group.merge_pending_commit(&self.provider).map_err(mls)?;
+        self.save_snapshot(group_id, group.epoch().as_u64(), &rank, true, &before)?;
         Ok(commit)
     }
 
@@ -547,9 +718,9 @@ impl<'c, C: Codec> Engine<'c, C> {
             group.delete(self.provider.storage()).map_err(mls)?;
         }
         self.conn
-            .execute("DELETE FROM omni_mls_snapshots WHERE group_id = ?1", params![group_id])?;
+            .execute("DELETE FROM omni_mls_group_snapshots WHERE group_id = ?1", params![Self::group_key(group_id)?])?;
         self.conn
-            .execute("DELETE FROM omni_mls_commit_log WHERE group_id = ?1", params![group_id])?;
+            .execute("DELETE FROM omni_mls_group_commit_log WHERE group_id = ?1", params![Self::group_key(group_id)?])?;
         Ok(())
     }
 
@@ -558,8 +729,8 @@ impl<'c, C: Codec> Engine<'c, C> {
         let rank: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT rank FROM omni_mls_commit_log WHERE group_id = ?1 AND epoch = ?2",
-                params![group_id, epoch as i64],
+                "SELECT rank FROM omni_mls_group_commit_log WHERE group_id = ?1 AND epoch = ?2",
+                params![Self::group_key(group_id)?, epoch as i64],
                 |row| row.get(0),
             )
             .optional()?;
@@ -584,7 +755,7 @@ impl<'c, C: Codec> Engine<'c, C> {
             .map_err(mls)?
             .validate(self.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(mls)?;
-        let card = Self::check_card(kp.leaf_node().credential(), kp.leaf_node().signature_key().as_slice())?;
+        let card = self.check_card(kp.leaf_node().credential(), kp.leaf_node().signature_key().as_slice())?;
         let mut group = self.load(group_id)?;
         let old: Vec<LeafNodeIndex> = group
             .members()
@@ -596,11 +767,12 @@ impl<'c, C: Codec> Engine<'c, C> {
         }
         let before = self.snapshot_rows(group_id)?;
         let messages = group.swap_members(&self.provider, &self.signer, &old, &[kp]).map_err(mls)?;
-        group.merge_pending_commit(&self.provider).map_err(mls)?;
         let (commit, welcome) = (messages.commit, messages.welcome);
         let commit = wire(&commit)?;
-        self.save_snapshot(group_id, group.epoch().as_u64(), &commit_rank(&commit), true, &before)?;
-        Ok(AddOutput { commit, welcome: wire(&welcome)?, added: vec![card] })
+        let rank = self.commit_rank_at(&group, Some(&self.me), &commit)?;
+        group.merge_pending_commit(&self.provider).map_err(mls)?;
+        self.save_snapshot(group_id, group.epoch().as_u64(), &rank, true, &before)?;
+        Ok(AddOutput { commit, welcome: wire(&welcome)?, added: vec![card], rank })
     }
 
     /// Who a KeyPackage would bring in — its card checked against the leaf's signing key.
@@ -609,7 +781,7 @@ impl<'c, C: Codec> Engine<'c, C> {
             .map_err(mls)?
             .validate(self.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(mls)?;
-        Self::check_card(kp.leaf_node().credential(), kp.leaf_node().signature_key().as_slice())
+        self.check_card(kp.leaf_node().credential(), kp.leaf_node().signature_key().as_slice())
     }
 
     /// Whether the member this KeyPackage is for is already in the group with it (somebody put it
@@ -633,6 +805,17 @@ impl<'c, C: Codec> Engine<'c, C> {
     /// Come back into the group from a Welcome that puts us back (our branch lost). Our old state of
     /// the group goes only if the Welcome is really for us; otherwise nothing changes.
     pub fn rejoin(&self, welcome: &[u8]) -> Result<Vec<u8>> {
+        self.join_replacing(welcome, None)
+    }
+
+    /// Join `group_id` from a Welcome, replacing what we hold of it: the Welcome must be for us and
+    /// for this group, and our old state goes only once the join held up (V-15: it used to be deleted
+    /// before the Welcome was even opened, so a junk Welcome threw a member out).
+    pub fn join_group_from_welcome(&self, group_id: &[u8], welcome: &[u8]) -> Result<()> {
+        self.join_replacing(welcome, Some(group_id)).map(|_| ())
+    }
+
+    fn join_replacing(&self, welcome: &[u8], expected_group: Option<&[u8]>) -> Result<Vec<u8>> {
         let welcome = match MlsMessageIn::tls_deserialize_exact(welcome).map_err(mls)?.extract() {
             MlsMessageBodyIn::Welcome(welcome) => welcome,
             _ => return Err(GroupError::Invalid("not a Welcome".into())),
@@ -645,6 +828,9 @@ impl<'c, C: Codec> Engine<'c, C> {
         // before anything is touched.
         let processed = ProcessedWelcome::new_from_welcome(&self.provider, &config, welcome).map_err(mls)?;
         let group_id = processed.unverified_group_info().group_id().as_slice().to_vec();
+        if expected_group.is_some_and(|expected| expected != group_id.as_slice()) {
+            return Err(GroupError::Invalid("the Welcome is for another group".into()));
+        }
         // OpenMLS refuses a Welcome into a group it holds: keep our state aside, drop it, join — and
         // put our state back if the Welcome does not hold up.
         let before = self.snapshot_rows(&group_id)?;
@@ -657,7 +843,7 @@ impl<'c, C: Codec> Engine<'c, C> {
             .and_then(|staged| staged.into_group(&self.provider).map_err(mls))
             .and_then(|group| {
                 for member in group.members() {
-                    Self::check_card(&member.credential, &member.signature_key)?;
+                    self.check_tree_card(&member.credential, &member.signature_key)?;
                 }
                 Self::meta_of(&group)?;
                 Ok(group)
@@ -665,9 +851,9 @@ impl<'c, C: Codec> Engine<'c, C> {
         match joined {
             Ok(_) => {
                 self.conn
-                    .execute("DELETE FROM omni_mls_snapshots WHERE group_id = ?1", params![group_id])?;
+                    .execute("DELETE FROM omni_mls_group_snapshots WHERE group_id = ?1", params![Self::group_key(&group_id)?])?;
                 self.conn
-                    .execute("DELETE FROM omni_mls_commit_log WHERE group_id = ?1", params![group_id])?;
+                    .execute("DELETE FROM omni_mls_group_commit_log WHERE group_id = ?1", params![Self::group_key(&group_id)?])?;
                 Ok(group_id)
             }
             Err(error) => {
@@ -702,39 +888,44 @@ impl<'c, C: Codec> Engine<'c, C> {
                 return self.merge_commit(group, message, bytes, CommitOutcome::Merged);
             }
             if epoch + 1 == current {
-                // A competitor for the epoch we already merged into.
+                // A competitor for the epoch we already merged into. Its rank needs the state it was
+                // made in (the committer and E's exporter are behind E's keys), so it is processed
+                // on the snapshot of E. Keep where we are unless it wins: a "competitor" from a
+                // branch that split earlier does not build on our parent either, and must not leave
+                // us rolled back (it is told apart by the Commit of the epoch the branches split at,
+                // see `older_commit`).
                 let Some((merged_rank, ours, rows)) = self.load_snapshot(group_id, current)? else {
                     return self.older_commit(group_id, epoch, current, bytes);
                 };
-                let rank = commit_rank(bytes);
-                if rank == merged_rank {
-                    return Ok(Inbound::Ignored("the commit we already merged".into()));
-                }
-                if rank > merged_rank {
-                    return Ok(Inbound::Commit {
+                let where_we_are = self.snapshot_rows(group_id)?;
+                self.restore_rows(group_id, &rows)?;
+                let parent = self.load(group_id)?;
+                let staged = match self.stage_commit(parent, message, bytes)? {
+                    Staged::Ready { group, staged, rank, before, put_back } if rank < merged_rank => {
+                        let outcome = CommitOutcome::ReplacedLoser { our_commit_lost: ours };
+                        return self.finish_merge(group, *staged, &rank, &before, put_back, outcome);
+                    }
+                    other => other,
+                };
+                self.restore_rows(group_id, &where_we_are)?;
+                let group = self.load(group_id)?;
+                return Ok(match staged {
+                    Staged::Ready { rank, .. } if rank == merged_rank => {
+                        Inbound::Ignored("the commit we already merged".into())
+                    }
+                    Staged::Ready { .. } => Inbound::Commit {
                         outcome: CommitOutcome::LostIgnored,
                         view: self.view_of(&group)?,
                         put_back: Vec::new(),
-                    });
-                }
-                // Keep where we are: a "competitor" from a branch that split earlier does not build on
-                // our parent either, and must not leave us rolled back (it is told apart by the
-                // Commit of the epoch the branches split at, see `older_commit`).
-                let where_we_are = self.snapshot_rows(group_id)?;
-                self.restore_rows(group_id, &rows)?;
-                let group = self.load(group_id)?;
-                let merged = self.merge_commit(
-                    group,
-                    message,
-                    bytes,
-                    CommitOutcome::ReplacedLoser { our_commit_lost: ours },
-                )?;
-                if let Inbound::Commit { outcome: CommitOutcome::Rejected(reason), .. } = &merged {
-                    let reason = reason.clone();
-                    self.restore_rows(group_id, &where_we_are)?;
-                    return Ok(Inbound::Ignored(format!("a competitor that does not build on our parent: {reason}")));
-                }
-                return Ok(merged);
+                    },
+                    Staged::Rejected(reason) => {
+                        Inbound::Ignored(format!("a competitor that does not build on our parent: {reason}"))
+                    }
+                    Staged::NotCommit => Inbound::Ignored("not a commit".into()),
+                });
+            }
+            if epoch > current.saturating_add(MAX_FUTURE_EPOCHS) {
+                return Ok(Inbound::TooFarAhead { epoch, current });
             }
             if epoch > current {
                 return Ok(Inbound::Future { epoch });
@@ -742,6 +933,9 @@ impl<'c, C: Codec> Engine<'c, C> {
             // Older than our snapshot window: if it is not what our branch merged at that epoch, the
             // group went on in two branches — who wins is decided at the epoch they split.
             return self.older_commit(group_id, epoch, current, bytes);
+        }
+        if epoch > current.saturating_add(MAX_FUTURE_EPOCHS) {
+            return Ok(Inbound::TooFarAhead { epoch, current });
         }
         if epoch > current {
             return Ok(Inbound::Future { epoch });
@@ -765,14 +959,26 @@ impl<'c, C: Codec> Engine<'c, C> {
         }
     }
 
-    /// A Commit for an epoch we passed, beyond rolling back.
+    /// A Commit for an epoch we passed, beyond rolling back: ranked on the snapshot of that epoch,
+    /// by the same rule as a competitor one epoch back (a Commit withheld until the group moved on
+    /// must not win by a weaker rule).
     fn older_commit(&self, group_id: &[u8], epoch: u64, current: u64, bytes: &[u8]) -> Result<Inbound> {
-        let rank = commit_rank(bytes);
-        match self.branch_rank(group_id, epoch)? {
-            Some(ours) if ours == rank => Ok(Inbound::Ignored("a commit of our own branch".into())),
-            Some(ours) => Ok(Inbound::ForkSeen { epoch, ours_wins: ours < rank }),
-            None => Ok(Inbound::Ignored(format!("commit for epoch {epoch}, we are at {current}"))),
-        }
+        let Some((ours, _, rows)) = self.load_snapshot(group_id, epoch + 1)? else {
+            return Ok(Inbound::Ignored(format!("commit for epoch {epoch}, we are at {current}")));
+        };
+        let Some(message) = protocol_message(bytes) else {
+            return Ok(Inbound::Ignored("not a protocol message".into()));
+        };
+        let where_we_are = self.snapshot_rows(group_id)?;
+        self.restore_rows(group_id, &rows)?;
+        let staged = self.load(group_id).and_then(|parent| self.stage_commit(parent, message, bytes));
+        self.restore_rows(group_id, &where_we_are)?;
+        Ok(match staged? {
+            Staged::Ready { rank, .. } if rank == ours => Inbound::Ignored("a commit of our own branch".into()),
+            Staged::Ready { rank, .. } => Inbound::ForkSeen { epoch, ours_wins: ours < rank },
+            Staged::Rejected(reason) => Inbound::Ignored(format!("an old commit that breaks the rules: {reason}")),
+            Staged::NotCommit => Inbound::Ignored("not a commit".into()),
+        })
     }
 
     /// A KeyPackage on the feed: a member asking to be put back. Only a current member of this group
@@ -781,7 +987,7 @@ impl<'c, C: Codec> Engine<'c, C> {
         let Ok(kp) = key_package.validate(self.provider.crypto(), ProtocolVersion::Mls10) else {
             return Ok(Inbound::Ignored("an invalid key package".into()));
         };
-        let Ok(card) = Self::check_card(kp.leaf_node().credential(), kp.leaf_node().signature_key().as_slice()) else {
+        let Ok(card) = self.check_card(kp.leaf_node().credential(), kp.leaf_node().signature_key().as_slice()) else {
             return Ok(Inbound::Ignored("a key package with a forged card".into()));
         };
         let group = self.load(group_id)?;
@@ -795,23 +1001,41 @@ impl<'c, C: Codec> Engine<'c, C> {
         Ok(Inbound::RejoinRequest { card, key_package })
     }
 
+    /// Merge a Commit for our current epoch.
     fn merge_commit(
         &self,
-        mut group: MlsGroup,
+        group: MlsGroup,
         message: ProtocolMessage,
         bytes: &[u8],
         outcome: CommitOutcome,
     ) -> Result<Inbound> {
         let group_id = group.group_id().as_slice().to_vec();
+        match self.stage_commit(group, message, bytes)? {
+            Staged::Ready { group, staged, rank, before, put_back } => {
+                self.finish_merge(group, *staged, &rank, &before, put_back, outcome)
+            }
+            Staged::Rejected(reason) => {
+                let group = self.load(&group_id)?;
+                Ok(Inbound::Commit {
+                    outcome: CommitOutcome::Rejected(reason),
+                    view: self.view_of(&group)?,
+                    put_back: Vec::new(),
+                })
+            }
+            Staged::NotCommit => Ok(Inbound::Ignored("not a commit".into())),
+        }
+    }
+
+    /// Process a Commit against `group`'s state, check it against the rules and rank it — without
+    /// merging. A rejected Commit leaves the store as it was.
+    fn stage_commit(&self, mut group: MlsGroup, message: ProtocolMessage, bytes: &[u8]) -> Result<Staged> {
+        let group_id = group.group_id().as_slice().to_vec();
         let before = self.snapshot_rows(&group_id)?;
         let processed = match group.process_message(&self.provider, message) {
             Ok(processed) => processed,
             Err(error) => {
-                return Ok(Inbound::Commit {
-                    outcome: CommitOutcome::Rejected(format!("process: {error}")),
-                    view: self.view_of(&group)?,
-                    put_back: Vec::new(),
-                })
+                self.restore_rows(&group_id, &before)?;
+                return Ok(Staged::Rejected(format!("process: {error}")));
             }
         };
         let committer = match processed.sender() {
@@ -819,31 +1043,43 @@ impl<'c, C: Codec> Engine<'c, C> {
             _ => None,
         };
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
-            return Ok(Inbound::Ignored("not a commit".into()));
+            self.restore_rows(&group_id, &before)?;
+            return Ok(Staged::NotCommit);
         };
         if let Err(reason) = self.authorize(&group, committer.as_ref(), &staged) {
             // Restore what processing staged (nothing merged yet, but keep the store clean).
             self.restore_rows(&group_id, &before)?;
-            let group = self.load(&group_id)?;
-            return Ok(Inbound::Commit {
-                outcome: CommitOutcome::Rejected(reason),
-                view: self.view_of(&group)?,
-                put_back: Vec::new(),
-            });
+            return Ok(Staged::Rejected(reason));
+        }
+        // A committer that updates its own leaf may not swap its card for one with another key, nor
+        // name another account than a device chain proves: a Commit's path used to change the card
+        // unchecked (the same hole as a forged newcomer's card).
+        if let Some(leaf) = staged.update_path_leaf_node() {
+            if let Err(reason) = self.check_updated_card(committer.as_ref(), leaf.credential(), leaf.signature_key().as_slice()) {
+                self.restore_rows(&group_id, &before)?;
+                return Ok(Staged::Rejected(reason));
+            }
+        }
+        for update in staged.update_proposals() {
+            let leaf = update.update_proposal().leaf_node();
+            let owner = match update.sender() {
+                Sender::Member(index) => group.member(*index).and_then(Self::card_of),
+                _ => None,
+            };
+            if let Err(reason) = self.check_updated_card(owner.as_ref(), leaf.credential(), leaf.signature_key().as_slice()) {
+                self.restore_rows(&group_id, &before)?;
+                return Ok(Staged::Rejected(reason));
+            }
         }
         // New members' cards must match their keys.
         for add in staged.add_proposals() {
             let leaf = add.add_proposal().key_package().leaf_node();
-            if let Err(error) = Self::check_card(leaf.credential(), leaf.signature_key().as_slice()) {
+            if let Err(error) = self.check_card(leaf.credential(), leaf.signature_key().as_slice()) {
                 self.restore_rows(&group_id, &before)?;
-                let group = self.load(&group_id)?;
-                return Ok(Inbound::Commit {
-                    outcome: CommitOutcome::Rejected(error.to_string()),
-                    view: self.view_of(&group)?,
-                    put_back: Vec::new(),
-                });
+                return Ok(Staged::Rejected(error.to_string()));
             }
         }
+        let rank = self.commit_rank_at(&group, committer.as_ref(), bytes)?;
         let removed_pubs: Vec<String> = staged
             .remove_proposals()
             .filter_map(|remove| group.member(remove.remove_proposal().removed()).and_then(Self::card_of))
@@ -855,9 +1091,57 @@ impl<'c, C: Codec> Engine<'c, C> {
             .map(|card| card.member_pub)
             .filter(|member| removed_pubs.contains(member))
             .collect();
-        group.merge_staged_commit(&self.provider, *staged).map_err(mls)?;
-        self.save_snapshot(&group_id, group.epoch().as_u64(), &commit_rank(bytes), false, &before)?;
+        Ok(Staged::Ready { group, staged, rank, before, put_back })
+    }
+
+    fn finish_merge(
+        &self,
+        mut group: MlsGroup,
+        staged: StagedCommit,
+        rank: &[u8; 32],
+        before: &[TableRows],
+        put_back: Vec<String>,
+        outcome: CommitOutcome,
+    ) -> Result<Inbound> {
+        let group_id = group.group_id().as_slice().to_vec();
+        group.merge_staged_commit(&self.provider, staged).map_err(mls)?;
+        self.save_snapshot(&group_id, group.epoch().as_u64(), rank, false, before)?;
         Ok(Inbound::Commit { outcome, view: self.view_of(&group)?, put_back })
+    }
+
+    /// The rank of a Commit made in `group`'s current epoch E by `committer` (smaller wins E):
+    ///
+    /// - byte 0: 0 for an admin of E, 1 for another member, 2 for no member — an admin's Commit
+    ///   (a removal among them) always beats a member's;
+    /// - bytes 1..24: `SHA-256("omni.mls.commit-rank|" ‖ exporter_E ‖ committer)` — fixed for a
+    ///   committer in an epoch and unknown before E, so no committer can choose it;
+    /// - bytes 24..32: SHA-256 of the Commit's bytes — only orders Commits of one committer.
+    pub(crate) fn commit_rank_at(
+        &self,
+        group: &MlsGroup,
+        committer: Option<&MemberCard>,
+        bytes: &[u8],
+    ) -> Result<[u8; 32]> {
+        let meta = Self::meta_of(group)?;
+        let class = match committer {
+            Some(card) if meta.admins.contains(&card.member_pub) => 0u8,
+            Some(_) => 1,
+            None => 2,
+        };
+        let key = group
+            .export_secret(self.provider.crypto(), COMMIT_RANK_EXPORTER_LABEL, &[], 32)
+            .map_err(mls)?;
+        let mut tag = Sha256::new();
+        tag.update(b"omni.mls.commit-rank|");
+        tag.update(&key);
+        tag.update(committer.map(|card| card.member_pub.as_bytes()).unwrap_or_default());
+        let tag = tag.finalize();
+        let bytes_hash = Sha256::digest(bytes);
+        let mut rank = [0u8; 32];
+        rank[0] = class;
+        rank[1..24].copy_from_slice(&tag[..23]);
+        rank[24..].copy_from_slice(&bytes_hash[..8]);
+        Ok(rank)
     }
 
     /// The group's rules, checked before a Commit is merged: anyone adds; removing someone else and
@@ -876,6 +1160,7 @@ impl<'c, C: Codec> Engine<'c, C> {
             .filter_map(|add| Self::card_of(add.add_proposal().key_package().leaf_node().credential()))
             .map(|card| card.member_pub)
             .collect();
+        let mut own_account_removed: Vec<String> = Vec::new();
         for remove in staged.remove_proposals() {
             let removed = remove.remove_proposal().removed();
             let by = match remove.sender() {
@@ -883,19 +1168,30 @@ impl<'c, C: Codec> Engine<'c, C> {
                 _ => None,
             };
             let self_removal = by == Some(removed);
-            let put_back = group
-                .member(removed)
-                .and_then(Self::card_of)
-                .is_some_and(|card| readded.contains(&card.member_pub));
-            if !self_removal && !put_back && !is_admin(committer) {
+            let removed_card = group.member(removed).and_then(Self::card_of);
+            let put_back = removed_card.as_ref().is_some_and(|card| readded.contains(&card.member_pub));
+            // Another device of the committer's own account (one it revoked): both chains prove it.
+            let own_account = match (committer.and_then(|c| self.verified_account(c)), removed_card.as_ref()) {
+                (Some(account), Some(card)) => self.verified_account(card).as_deref() == Some(account.as_str()),
+                _ => false,
+            };
+            if !self_removal && !put_back && !own_account && !is_admin(committer) {
                 return Err("a non-admin removed a member".into());
+            }
+            if let (true, Some(card)) = (own_account, removed_card) {
+                own_account_removed.push(card.member_pub);
             }
         }
         let changes_meta = staged
             .queued_proposals()
             .any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_)));
         if changes_meta && !is_admin(committer) {
-            return Err("a non-admin changed the group name or admins".into());
+            // The one change a non-admin may make: taking the place of the admins of its own account
+            // it takes out in this Commit.
+            let takeover = committer.and_then(|c| Self::admin_takeover(&meta, &own_account_removed, &c.member_pub));
+            if takeover.is_none() || Self::proposed_meta(staged) != takeover {
+                return Err("a non-admin changed the group name or admins".into());
+            }
         }
         Ok(())
     }
@@ -934,28 +1230,36 @@ impl<'c, C: Codec> Engine<'c, C> {
         Ok(TableRows { table: table.to_string(), columns, rows })
     }
 
+    /// Put the rows back as one step. A savepoint, not a transaction: the engine runs on the app's
+    /// connection, inside the app's transaction when the step is part of one.
     fn restore_rows(&self, group_id: &[u8], tables: &[TableRows]) -> Result<()> {
         let key = Self::group_key(group_id)?;
-        let tx = self.conn.unchecked_transaction()?;
-        for t in tables {
-            let shared = t.table == SHARED_KEY_TABLE;
-            if !shared {
-                tx.execute(&format!("DELETE FROM {} WHERE group_id = ?1", t.table), params![key])?;
+        self.conn.execute_batch("SAVEPOINT omni_mls_restore_rows")?;
+        let restored = (|| -> Result<()> {
+            for t in tables {
+                let shared = t.table == SHARED_KEY_TABLE;
+                if !shared {
+                    self.conn.execute(&format!("DELETE FROM {} WHERE group_id = ?1", t.table), params![key])?;
+                }
+                let placeholders: Vec<String> = (1..=t.columns.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "INSERT {} INTO {} ({}) VALUES ({})",
+                    if shared { "OR IGNORE" } else { "" },
+                    t.table,
+                    t.columns.join(", "),
+                    placeholders.join(", ")
+                );
+                for row in &t.rows {
+                    self.conn.execute(&sql, rusqlite::params_from_iter(row.iter()))?;
+                }
             }
-            let placeholders: Vec<String> = (1..=t.columns.len()).map(|i| format!("?{i}")).collect();
-            let sql = format!(
-                "INSERT {} INTO {} ({}) VALUES ({})",
-                if shared { "OR IGNORE" } else { "" },
-                t.table,
-                t.columns.join(", "),
-                placeholders.join(", ")
-            );
-            for row in &t.rows {
-                tx.execute(&sql, rusqlite::params_from_iter(row.iter()))?;
-            }
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => self.conn.execute_batch("RELEASE omni_mls_restore_rows")?,
+            Err(_) => self.conn.execute_batch("ROLLBACK TO omni_mls_restore_rows; RELEASE omni_mls_restore_rows")?,
         }
-        tx.commit()?;
-        Ok(())
+        restored
     }
 
     fn save_snapshot(
@@ -968,20 +1272,25 @@ impl<'c, C: Codec> Engine<'c, C> {
     ) -> Result<()> {
         let json = serde_json::to_string(rows).map_err(mls)?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO omni_mls_snapshots (group_id, epoch, merged_rank, ours, rows)
+            "INSERT OR REPLACE INTO omni_mls_group_snapshots (group_id, epoch, merged_rank, ours, rows)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![group_id, epoch_after as i64, rank.to_vec(), ours, json],
+            params![Self::group_key(group_id)?, epoch_after as i64, rank.to_vec(), ours, json],
         )?;
         // The branch we are on, by the rank of the Commit merged at each epoch — what tells another
         // branch's Commit apart later, long after the snapshot window.
         let epoch = epoch_after.saturating_sub(1) as i64;
         self.conn.execute(
-            "INSERT OR REPLACE INTO omni_mls_commit_log (group_id, epoch, rank) VALUES (?1, ?2, ?3)",
-            params![group_id, epoch, rank.to_vec()],
+            "INSERT OR REPLACE INTO omni_mls_group_commit_log (group_id, epoch, rank) VALUES (?1, ?2, ?3)",
+            params![Self::group_key(group_id)?, epoch, rank.to_vec()],
         )?;
         self.conn.execute(
-            "DELETE FROM omni_mls_commit_log WHERE group_id = ?1 AND epoch < ?2",
-            params![group_id, epoch - COMMIT_LOG_EPOCHS],
+            "DELETE FROM omni_mls_group_commit_log WHERE group_id = ?1 AND epoch < ?2",
+            params![Self::group_key(group_id)?, epoch - COMMIT_LOG_EPOCHS],
+        )?;
+        // A late Commit is ranked on the snapshot of its epoch (`older_commit`): keep that many.
+        self.conn.execute(
+            "DELETE FROM omni_mls_group_snapshots WHERE group_id = ?1 AND epoch <= ?2",
+            params![Self::group_key(group_id)?, epoch_after as i64 - SNAPSHOT_EPOCHS],
         )?;
         Ok(())
     }
@@ -991,8 +1300,8 @@ impl<'c, C: Codec> Engine<'c, C> {
         let row: Option<(Vec<u8>, bool, String)> = self
             .conn
             .query_row(
-                "SELECT merged_rank, ours, rows FROM omni_mls_snapshots WHERE group_id = ?1 AND epoch = ?2",
-                params![group_id, epoch_after as i64],
+                "SELECT merged_rank, ours, rows FROM omni_mls_group_snapshots WHERE group_id = ?1 AND epoch = ?2",
+                params![Self::group_key(group_id)?, epoch_after as i64],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;

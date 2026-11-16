@@ -5,6 +5,10 @@ internal static partial class NativeMethods
     private static void LoadChatDeviceExports()
     {
         LoadExport(ref omniChatSendText, nameof(omni_chat_send_text));
+        LoadExport(ref omniMessageReact, nameof(omni_message_react));
+        LoadExport(ref omniMessageDelete, nameof(omni_message_delete));
+        LoadExport(ref omniMessagePin, nameof(omni_message_pin));
+        LoadExport(ref omniMessageActions, nameof(omni_message_actions));
         LoadExport(ref omniChatSendAttachment, nameof(omni_chat_send_attachment));
         LoadExport(ref omniChatRequestAttachmentDownload, nameof(omni_chat_request_attachment_download));
         LoadExport(ref omniChatRevokeAttachmentAccess, nameof(omni_chat_revoke_attachment_access));

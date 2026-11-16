@@ -62,6 +62,14 @@ pub fn group_dialog_key(group_id: &str) -> String {
     format!("group:{group_id}")
 }
 
+/// The most messages one group may hold that we cannot read yet (`push_group_pending_inbound`).
+/// Between an accepted invitation and its Welcome, or a commit and the next, a few arrive.
+pub const GROUP_PENDING_INBOUND_MAX_ROWS: i64 = 512;
+/// The most bytes of them per group: 64 messages of the largest a feed item carries.
+pub const GROUP_PENDING_INBOUND_MAX_BYTES: i64 = 16 * 1024 * 1024;
+/// The most bytes of them for all groups of a profile together.
+pub const GROUP_PENDING_INBOUND_MAX_TOTAL_BYTES: i64 = 64 * 1024 * 1024;
+
 impl Storage {
     pub fn upsert_group(&self, record: &GroupRecord) -> OmniResult<()> {
         let profile_id = self.require_active_profile_id()?;
@@ -105,6 +113,32 @@ impl Storage {
             )
             .optional()
             .map_err(map_sqlite_error)
+    }
+
+    /// The members this node last told what newcomers need to hear, in the caller's own terms.
+    pub fn group_newcomers_told(&self, group_id: &str) -> OmniResult<Option<String>> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .query_row(
+                "SELECT newcomers_told FROM groups WHERE profile_id = ?1 AND group_id = ?2",
+                params![profile_id.0, group_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)
+            .map(Option::flatten)
+    }
+
+    /// `None`: they are to be told again at the next look.
+    pub fn set_group_newcomers_told(&self, group_id: &str, told: Option<&str>) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "UPDATE groups SET newcomers_told = ?3 WHERE profile_id = ?1 AND group_id = ?2",
+                params![profile_id.0, group_id, told],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
     }
 
     pub fn get_group_by_dialog_key(&self, dialog_key: &str) -> OmniResult<Option<GroupRecord>> {
@@ -154,7 +188,26 @@ impl Storage {
                 "group_own_changes",
                 "group_sent_invites",
                 "group_message_meta",
+                "group_message_arrivals",
                 "group_invites",
+            ],
+        )?;
+        self.delete_group_workspace_rows(group_id)
+    }
+
+    /// What the profile knew of the group's projects (their records, branches, rules, approvals,
+    /// events): gone with the projects' data when we are no longer in the group.
+    pub fn delete_group_workspace_rows(&self, group_id: &str) -> OmniResult<()> {
+        self.delete_group_tables(
+            group_id,
+            &[
+                "workspace_repos",
+                "workspace_member_refs",
+                "workspace_main_rules",
+                "workspace_approvals",
+                "workspace_repo_files",
+                "workspace_file_events",
+                "workspace_file_local",
             ],
         )
     }
@@ -396,8 +449,65 @@ impl Storage {
 
     // --- MLS messages for an epoch we have not reached -----------------------------------------
 
-    pub fn push_group_pending_inbound(&self, group_id: &str, epoch: u64, mls: &[u8], now: i64) -> OmniResult<()> {
+    /// Keep a group message we cannot read yet (before the group's Welcome, or of an epoch not
+    /// reached). `false` when it was not kept: its author cannot be checked until then, so anyone
+    /// naming the group could send them, and they were kept without end — the disk filled and the
+    /// Welcome had all of them loaded at once (blind audit 2026-11-10). Bounded per group by
+    /// [`GROUP_PENDING_INBOUND_MAX_ROWS`] / [`GROUP_PENDING_INBOUND_MAX_BYTES`] and for all groups
+    /// of the profile by [`GROUP_PENDING_INBOUND_MAX_TOTAL_BYTES`].
+    pub fn push_group_pending_inbound(&self, group_id: &str, epoch: u64, mls: &[u8], now: i64) -> OmniResult<bool> {
         let profile_id = self.require_active_profile_id()?;
+        let (rows, bytes): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(mls)), 0) FROM group_pending_inbound
+                 WHERE profile_id = ?1 AND group_id = ?2",
+                params![profile_id.0, group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(map_sqlite_error)?;
+        let total: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(length(mls)), 0) FROM group_pending_inbound WHERE profile_id = ?1",
+                params![profile_id.0],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let size = mls.len() as i64;
+        let (mut rows, mut bytes, mut total) = (rows, bytes, total);
+        // Full, the message waiting for the farthest epoch makes room for one nearer: the epoch of a
+        // message not yet open is anyone's to write (it is checked only once it opens), so one far
+        // ahead may be junk, and junk filling the queue turned honest messages of the next epoch
+        // away (blind audit 2026-11-13, pass 19). Nearer ones are what comes next.
+        while rows >= GROUP_PENDING_INBOUND_MAX_ROWS
+            || bytes + size > GROUP_PENDING_INBOUND_MAX_BYTES
+            || total + size > GROUP_PENDING_INBOUND_MAX_TOTAL_BYTES
+        {
+            let farthest: Option<(i64, Vec<u8>)> = self
+                .connection
+                .query_row(
+                    "SELECT epoch, mls FROM group_pending_inbound WHERE profile_id = ?1 AND group_id = ?2
+                     ORDER BY epoch DESC, received_at_unix_ms DESC LIMIT 1",
+                    params![profile_id.0, group_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?;
+            let Some((far_epoch, far_mls)) = farthest.filter(|(far_epoch, _)| *far_epoch > epoch as i64) else {
+                return Ok(false);
+            };
+            let _ = far_epoch;
+            self.connection
+                .execute(
+                    "DELETE FROM group_pending_inbound WHERE profile_id = ?1 AND group_id = ?2 AND mls = ?3",
+                    params![profile_id.0, group_id, far_mls],
+                )
+                .map_err(map_sqlite_error)?;
+            rows -= 1;
+            bytes -= far_mls.len() as i64;
+            total -= far_mls.len() as i64;
+        }
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO group_pending_inbound (profile_id, group_id, epoch, mls, received_at_unix_ms)
@@ -405,31 +515,54 @@ impl Storage {
                 params![profile_id.0, group_id, epoch as i64, mls, now],
             )
             .map_err(map_sqlite_error)?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Take (and delete) the pending messages of a group, oldest epoch first.
-    pub fn take_group_pending_inbound(&self, group_id: &str) -> OmniResult<Vec<Vec<u8>>> {
+    /// The pending messages of a group, oldest epoch first, each with the epoch it waits for — left
+    /// in place: each goes in the step that handles it ([`Self::delete_group_pending_inbound`]).
+    /// Taken all at once before they were handled, a crash on the way lost them (blind audit
+    /// 2026-11-13, pass 18).
+    pub fn list_group_pending_inbound(&self, group_id: &str) -> OmniResult<Vec<(u64, Vec<u8>)>> {
         let profile_id = self.require_active_profile_id()?;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT mls FROM group_pending_inbound WHERE profile_id = ?1 AND group_id = ?2
+                "SELECT epoch, mls FROM group_pending_inbound WHERE profile_id = ?1 AND group_id = ?2
                  ORDER BY epoch, received_at_unix_ms",
             )
             .map_err(map_sqlite_error)?;
         let rows = statement
-            .query_map(params![profile_id.0, group_id], |row| row.get::<_, Vec<u8>>(0))
+            .query_map(params![profile_id.0, group_id], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(1)?)))
             .map_err(map_sqlite_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)?;
+        Ok(rows)
+    }
+
+    /// One pending message off the queue. Whether it was there.
+    pub fn delete_group_pending_inbound(&self, group_id: &str, mls: &[u8]) -> OmniResult<bool> {
+        let profile_id = self.require_active_profile_id()?;
+        let removed = self
+            .connection
+            .execute(
+                "DELETE FROM group_pending_inbound WHERE profile_id = ?1 AND group_id = ?2 AND mls = ?3",
+                params![profile_id.0, group_id, mls],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(removed > 0)
+    }
+
+    /// Take (and delete) the pending messages of a group, oldest epoch first.
+    pub fn take_group_pending_inbound(&self, group_id: &str) -> OmniResult<Vec<Vec<u8>>> {
+        let rows = self.list_group_pending_inbound(group_id)?;
+        let profile_id = self.require_active_profile_id()?;
         self.connection
             .execute(
                 "DELETE FROM group_pending_inbound WHERE profile_id = ?1 AND group_id = ?2",
                 params![profile_id.0, group_id],
             )
             .map_err(map_sqlite_error)?;
-        Ok(rows)
+        Ok(rows.into_iter().map(|(_, mls)| mls).collect())
     }
 
     // --- our own messages / changes per epoch (re-sent after a rollback) ----------------------
@@ -488,6 +621,53 @@ impl Storage {
         Ok(())
     }
 
+    /// Our change kept for `epoch_after`, left in place: it goes when made again
+    /// ([`Self::drop_group_own_change`]). Taken first, a crash on the way lost it (pass 19).
+    pub fn get_group_own_change(&self, group_id: &str, epoch_after: u64) -> OmniResult<Option<String>> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .query_row(
+                "SELECT change_json FROM group_own_changes WHERE profile_id = ?1 AND group_id = ?2 AND epoch_after = ?3",
+                params![profile_id.0, group_id, epoch_after as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)
+    }
+
+    /// Our changes kept for the epochs after `epoch`, oldest first, left in place.
+    pub fn list_group_own_changes_after(&self, group_id: &str, epoch: u64) -> OmniResult<Vec<(u64, String)>> {
+        let profile_id = self.require_active_profile_id()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT epoch_after, change_json FROM group_own_changes
+                 WHERE profile_id = ?1 AND group_id = ?2 AND epoch_after > ?3 ORDER BY epoch_after",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(params![profile_id.0, group_id, epoch as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        Ok(rows)
+    }
+
+    /// The kept change `change_json` of `epoch_after` is made: it goes (one made since under the same
+    /// epoch with other contents stays).
+    pub fn drop_group_own_change(&self, group_id: &str, epoch_after: u64, change_json: &str) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "DELETE FROM group_own_changes WHERE profile_id = ?1 AND group_id = ?2 AND epoch_after = ?3 AND change_json = ?4",
+                params![profile_id.0, group_id, epoch_after as i64, change_json],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
     pub fn take_group_own_change(&self, group_id: &str, epoch_after: u64) -> OmniResult<Option<String>> {
         let profile_id = self.require_active_profile_id()?;
         let change: Option<String> = self
@@ -510,7 +690,23 @@ impl Storage {
 
     // --- who wrote what -----------------------------------------------------------------------
 
+    /// Who wrote a line that came now (its place in the order lines come in is taken too).
     pub fn insert_group_message_meta(&self, group_id: &str, meta: &GroupMessageMeta) -> OmniResult<()> {
+        self.insert_group_history_message_meta(group_id, meta)?;
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO group_message_arrivals (profile_id, group_id, message_id, arrived_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![profile_id.0, group_id, meta.message_id, current_unix_ms()],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Who wrote a line of the group's past (a newcomer's history): it takes no place in the order
+    /// lines come in.
+    pub fn insert_group_history_message_meta(&self, group_id: &str, meta: &GroupMessageMeta) -> OmniResult<()> {
         let profile_id = self.require_active_profile_id()?;
         self.connection
             .execute(
@@ -520,6 +716,24 @@ impl Storage {
             )
             .map_err(map_sqlite_error)?;
         Ok(())
+    }
+
+    /// The group's lines in the order they came here, after `after_seq`: `(seq, message_id,
+    /// arrived_at_unix_ms)` — the time is our clock's.
+    pub fn list_group_message_arrivals(&self, group_id: &str, after_seq: i64) -> OmniResult<Vec<(i64, String, i64)>> {
+        let profile_id = self.require_active_profile_id()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT seq, message_id, arrived_at_unix_ms FROM group_message_arrivals
+                 WHERE profile_id = ?1 AND group_id = ?2 AND seq > ?3
+                 ORDER BY seq",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(params![profile_id.0, group_id, after_seq], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(map_sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_error)
     }
 
     /// The author/kind of one line (the chat-list preview needs only the latest one).
@@ -646,28 +860,97 @@ impl Storage {
         Ok(removed > 0)
     }
 
-    // --- the key that encrypts MLS state at rest ------------------------------------------------
+    /// Keep the Welcome made for the invitee behind `dialog_key` (its account `account_id`) until it is
+    /// heard in the group; it replaces one kept before.
+    pub fn put_group_invitee_welcome(
+        &self,
+        group_id: &str,
+        dialog_key: &str,
+        account_id: &str,
+        welcome_json: &str,
+        now: i64,
+    ) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO group_invitee_welcomes
+                 (profile_id, group_id, dialog_key, account_id, welcome_json, made_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![profile_id.0, group_id, dialog_key, account_id, welcome_json, now],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
 
-    /// Wipe all MLS state of this database (OpenMLS's own tables, our epoch snapshots, the wrapped
-    /// at-rest key). Run when the LAST profile is deleted: the MLS rows are not profile-scoped, and
-    /// leaving them would keep a deleted account's group secrets on disk. Tables that were never
-    /// created (no group was ever touched) are simply absent. Returns rows removed.
-    pub fn wipe_mls_state(&self) -> OmniResult<usize> {
-        let tables: Vec<String> = self
+    /// The Welcomes kept for the invitee behind `dialog_key` (in `group_id`, or in any group), made no
+    /// earlier than `since`: (group_id, welcome_json). Older ones are let go here.
+    pub fn group_invitee_welcomes_for(
+        &self,
+        dialog_key: &str,
+        group_id: Option<&str>,
+        since: i64,
+    ) -> OmniResult<Vec<(String, String)>> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "DELETE FROM group_invitee_welcomes WHERE profile_id = ?1 AND made_at_unix_ms < ?2",
+                params![profile_id.0, since],
+            )
+            .map_err(map_sqlite_error)?;
+        let mut stmt = self
             .connection
             .prepare(
-                "SELECT name FROM sqlite_master WHERE type = 'table' \
-                 AND (name LIKE 'openmls\\_%' ESCAPE '\\' OR name IN ('omni_mls_snapshots', 'mls_storage_key')) \
-                 AND name <> 'openmls_sqlite_storage_migrations'",
+                "SELECT group_id, welcome_json FROM group_invitee_welcomes
+                 WHERE profile_id = ?1 AND dialog_key = ?2 AND (?3 IS NULL OR group_id = ?3)",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = stmt
+            .query_map(params![profile_id.0, dialog_key, group_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(map_sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(map_sqlite_error)
+    }
+
+    /// The invitee of `account_id` was heard in `group_id`: its Welcome arrived, let it go.
+    pub fn drop_group_invitee_welcomes_of(&self, group_id: &str, account_id: &str) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute(
+                "DELETE FROM group_invitee_welcomes WHERE profile_id = ?1 AND group_id = ?2 AND account_id = ?3",
+                params![profile_id.0, group_id, account_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    // --- the key that encrypts MLS state at rest ------------------------------------------------
+
+    /// The tables MLS state lives in: OpenMLS's own and our epoch snapshots and commit log. Tables
+    /// never created (no group was ever touched) are simply absent.
+    fn mls_state_tables(&self) -> OmniResult<Vec<String>> {
+        self.connection
+            .prepare(
+                r"SELECT name FROM sqlite_master WHERE type = 'table'
+                  AND (name LIKE 'openmls\_%' ESCAPE '\' OR name LIKE 'vc\_%' ESCAPE '\'
+                       OR name LIKE 'registered\_vc\_%' ESCAPE '\' OR name LIKE 'omni\_mls\_%' ESCAPE '\')
+                  AND name <> 'openmls_sqlite_storage_migrations'",
             )
             .and_then(|mut statement| {
                 statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()
             })
-            .map_err(map_sqlite_error)?;
+            .map_err(map_sqlite_error)
+    }
+
+    /// Wipe all MLS state of this database (OpenMLS's own tables, our epoch snapshots, the wrapped
+    /// at-rest keys). Run when the device binding changes: the state is this device's. Returns rows
+    /// removed.
+    pub fn wipe_mls_state(&self) -> OmniResult<usize> {
         let mut removed = 0;
-        for table in tables {
+        for table in self.mls_state_tables()?.into_iter().chain(["mls_storage_key".to_string(), "mls_storage_keys".to_string()]) {
+            if !self.table_exists(&table)? {
+                continue;
+            }
             removed += self
                 .connection
                 .execute(&format!("DELETE FROM \"{table}\""), [])
@@ -676,20 +959,126 @@ impl Storage {
         Ok(removed)
     }
 
-    /// The protected (platform-wrapped) MLS storage key, as the app stored it — one per database (the
-    /// OpenMLS tables are not profile-scoped).
+    /// Keep only the MLS rows `keep` says are kept: it gets each row's blob values (a row of a
+    /// profile is sealed with that profile's key — see the app's codec). The rows of one profile go
+    /// when it is deleted, the others' when a copy is made for one (blind audit 2026-11-12, pass 17).
+    /// Returns rows removed.
+    pub fn retain_mls_rows(&self, keep: &dyn Fn(&[Vec<u8>]) -> bool) -> OmniResult<usize> {
+        // As one: a failure half way left a profile with part of its MLS state (pass 18).
+        self.with_immediate_transaction("retain_mls_rows", |storage| storage.retain_mls_rows_now(keep))
+    }
+
+    fn retain_mls_rows_now(&self, keep: &dyn Fn(&[Vec<u8>]) -> bool) -> OmniResult<usize> {
+        let mut removed = 0;
+        for table in self.mls_state_tables()? {
+            let gone: Vec<i64> = {
+                let mut statement = self
+                    .connection
+                    .prepare(&format!("SELECT rowid, * FROM \"{table}\""))
+                    .map_err(map_sqlite_error)?;
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        let rowid: i64 = row.get(0)?;
+                        let mut blobs = Vec::new();
+                        for at in 1..columns {
+                            if let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(at)? {
+                                blobs.push(blob.to_vec());
+                            }
+                        }
+                        Ok((rowid, blobs))
+                    })
+                    .map_err(map_sqlite_error)?;
+                let mut gone = Vec::new();
+                for row in rows {
+                    let (rowid, blobs) = row.map_err(map_sqlite_error)?;
+                    if !keep(&blobs) {
+                        gone.push(rowid);
+                    }
+                }
+                gone
+            };
+            for rowid in gone {
+                removed += self
+                    .connection
+                    .execute(&format!("DELETE FROM \"{table}\" WHERE rowid = ?1"), params![rowid])
+                    .map_err(map_sqlite_error)?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// The protected (platform-wrapped) MLS storage key of the active profile. The database's old
+    /// key, from when there was one per database, goes to every profile here: the groups each had
+    /// were sealed with it, and given to the first that asked, the others' could no longer be read
+    /// (blind audit 2026-11-13, pass 18). Their new groups get keys of their own.
     pub fn get_mls_storage_key_protected(&self) -> OmniResult<Option<String>> {
+        let profile_id = self.require_active_profile_id()?;
+        self.mls_storage_key_protected_of(&profile_id)
+    }
+
+    /// The protected MLS storage key of `profile_id`, active or not (a profile's deletion, a copy).
+    pub fn mls_storage_key_protected_of(&self, profile_id: &LocalProfileId) -> OmniResult<Option<String>> {
+        let own = self
+            .connection
+            .query_row(
+                "SELECT protected_json FROM mls_storage_keys WHERE profile_id = ?1",
+                params![profile_id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        if own.is_some() || !self.table_exists("mls_storage_key")? {
+            return Ok(own);
+        }
+        self.with_immediate_transaction("adopt_mls_storage_key", |storage| {
+            storage
+                .connection
+                .execute(
+                    "INSERT OR IGNORE INTO mls_storage_keys (profile_id, protected_json)
+                     SELECT p.profile_id, k.protected_json FROM mls_storage_key k,
+                         (SELECT ?1 AS profile_id UNION SELECT profile_id FROM profile_registry) p
+                     WHERE k.id = 1",
+                    params![profile_id.0],
+                )
+                .map_err(map_sqlite_error)?;
+            storage
+                .connection
+                .execute("DELETE FROM mls_storage_key", [])
+                .map_err(map_sqlite_error)?;
+            Ok(())
+        })?;
         self.connection
-            .query_row("SELECT protected_json FROM mls_storage_key WHERE id = 1", [], |row| row.get(0))
+            .query_row(
+                "SELECT protected_json FROM mls_storage_keys WHERE profile_id = ?1",
+                params![profile_id.0],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(map_sqlite_error)
     }
 
+    /// Whether another profile here holds the same MLS key as `profile_id` (the database's old one,
+    /// handed to each): then the rows it seals are not this profile's alone.
+    pub fn mls_storage_key_shared_with_another_profile(&self, profile_id: &LocalProfileId) -> OmniResult<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM mls_storage_keys mine JOIN mls_storage_keys other
+                       ON other.protected_json = mine.protected_json AND other.profile_id <> mine.profile_id
+                     WHERE mine.profile_id = ?1)",
+                params![profile_id.0],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)
+    }
+
     pub fn set_mls_storage_key_protected(&self, protected_json: &str) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
         self.connection
             .execute(
-                "INSERT OR IGNORE INTO mls_storage_key (id, protected_json) VALUES (1, ?1)",
-                params![protected_json],
+                "INSERT OR IGNORE INTO mls_storage_keys (profile_id, protected_json) VALUES (?1, ?2)",
+                params![profile_id.0, protected_json],
             )
             .map_err(map_sqlite_error)?;
         Ok(())
@@ -732,6 +1121,10 @@ pub struct GroupSignedLine {
     pub body: String,
     pub authored_at_unix_ms: i64,
     pub signature_b64: String,
+    /// The line this text answers, signed with it. A file's offer, in `body`, says it itself.
+    pub reply_to: Option<String>,
+    /// The accounts this text names, signed with it.
+    pub mentions: Vec<String>,
 }
 
 impl Storage {
@@ -760,21 +1153,26 @@ impl Storage {
     }
 
     /// The latest `limit` signed lines of a group whose message is still in the chat, newest first.
-    pub fn list_recent_group_signed_lines(&self, group_id: &str, limit: usize) -> OmniResult<Vec<GroupSignedLine>> {
+    /// Only `sender_pub`'s, when given: chosen in the query, before the limit — after it, another
+    /// member's latest lines left none of theirs (blind audit 2026-11-12, pass 16).
+    pub fn list_recent_group_signed_lines(&self, group_id: &str, limit: usize, sender_pub: Option<&str>) -> OmniResult<Vec<GroupSignedLine>> {
         let profile_id = self.require_active_profile_id()?;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT l.message_id, l.kind, l.sender_pub, l.sender_name, l.body, l.authored_at_unix_ms, l.signature_b64
+                "SELECT l.message_id, l.kind, l.sender_pub, l.sender_name, l.body, l.authored_at_unix_ms, l.signature_b64,
+                        CASE l.kind WHEN 'text' THEN (SELECT r.reply_to FROM message_replies r WHERE r.message_id = l.message_id AND r.profile_id = l.profile_id) END,
+                        (SELECT n.accounts_json FROM message_mentions n WHERE n.message_id = l.message_id AND n.profile_id = l.profile_id)
                  FROM group_signed_lines l
                  WHERE l.profile_id = ?1 AND l.group_id = ?2
-                   AND EXISTS (SELECT 1 FROM messages m WHERE m.id = l.message_id)
+                   AND (?4 IS NULL OR l.sender_pub = ?4)
+                   AND EXISTS (SELECT 1 FROM messages m WHERE m.id = l.message_id AND m.profile_id = l.profile_id)
                  ORDER BY l.authored_at_unix_ms DESC, l.message_id DESC
                  LIMIT ?3",
             )
             .map_err(map_sqlite_error)?;
         let rows = statement
-            .query_map(params![profile_id.0, group_id, limit as i64], |row| {
+            .query_map(params![profile_id.0, group_id, limit as i64, sender_pub], |row| {
                 Ok(GroupSignedLine {
                     message_id: row.get(0)?,
                     kind: row.get(1)?,
@@ -783,6 +1181,11 @@ impl Storage {
                     body: row.get(4)?,
                     authored_at_unix_ms: row.get(5)?,
                     signature_b64: row.get(6)?,
+                    reply_to: row.get(7)?,
+                    mentions: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|json| serde_json::from_str(&json).ok())
+                        .unwrap_or_default(),
                 })
             })
             .map_err(map_sqlite_error)?;
@@ -960,31 +1363,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Our own Commits after `epoch` (oldest first), taken out: to be made again on the winning branch.
-    pub fn take_group_own_changes_after(&self, group_id: &str, epoch: u64) -> OmniResult<Vec<(u64, String)>> {
-        let profile_id = self.require_active_profile_id()?;
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT epoch_after, change_json FROM group_own_changes
-                 WHERE profile_id = ?1 AND group_id = ?2 AND epoch_after > ?3 ORDER BY epoch_after",
-            )
-            .map_err(map_sqlite_error)?;
-        let rows = statement
-            .query_map(params![profile_id.0, group_id, epoch as i64], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
-            })
-            .map_err(map_sqlite_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(map_sqlite_error)?;
-        self.connection
-            .execute(
-                "DELETE FROM group_own_changes WHERE profile_id = ?1 AND group_id = ?2 AND epoch_after > ?3",
-                params![profile_id.0, group_id, epoch as i64],
-            )
-            .map_err(map_sqlite_error)?;
-        Ok(rows)
-    }
 }
 
 /// A Welcome for a member we put back, held until our Commit is sure to stand.

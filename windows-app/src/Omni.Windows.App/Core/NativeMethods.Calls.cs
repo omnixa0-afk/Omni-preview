@@ -16,6 +16,7 @@ internal static partial class NativeMethods
     private static OmniCallsGetRealtimeMediaNegotiationDelegate? omniCallsGetRealtimeMediaNegotiation;
     private static OmniCallsClearRealtimeMediaNegotiationDelegate? omniCallsClearRealtimeMediaNegotiation;
     private static OmniCallsWaitChangeDelegate? omniCallsWaitChange;
+    private static OmniCallsMediaUnopenedTotalDelegate? omniCallsMediaUnopenedTotal;
 
     private static void LoadCallExports()
     {
@@ -30,6 +31,15 @@ internal static partial class NativeMethods
         LoadExport(ref omniCallsGetRealtimeMediaNegotiation, nameof(omni_calls_get_realtime_media_negotiation));
         LoadExport(ref omniCallsClearRealtimeMediaNegotiation, nameof(omni_calls_clear_realtime_media_negotiation));
         LoadExport(ref omniCallsWaitChange, nameof(omni_calls_wait_change));
+        LoadExport(ref omniCallsMediaUnopenedTotal, nameof(omni_calls_media_unopened_total));
+    }
+
+    /// Call datagrams (1:1 and group) dropped since the process started because they did not open
+    /// with the sender's key or were replays.
+    internal static ulong omni_calls_media_unopened_total()
+    {
+        EnsureLoaded();
+        return omniCallsMediaUnopenedTotal!();
     }
 
     /// Blocks up to <paramref name="timeoutMs"/> until a call changed after <paramref name="since"/>;
@@ -130,6 +140,9 @@ internal static partial class NativeMethods
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong OmniCallsWaitChangeDelegate(ulong since, uint timeoutMs);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate ulong OmniCallsMediaUnopenedTotalDelegate();
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr OmniCallsPublishRealtimeMediaCapabilitiesDelegate(

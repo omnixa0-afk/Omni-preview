@@ -205,7 +205,10 @@ def build_app_assets():
     }
     for name, img in plan.items():
         img.save(os.path.join(assets, name))
-    ico = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+    # Every size the shell asks for at 100-200 % scaling (small 16/20/24/28/32, medium 32/40/48/60/64,
+    # large 48/72/96...): without its own frame Windows shrinks the next larger one, and the thin
+    # broken ring came out jagged on a 150 % laptop (128 -> 72).
+    ico = [16, 20, 24, 28, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 128, 256]
     master(256).save(os.path.join(assets, 'Omni.ico'), sizes=[(s, s) for s in ico],
                      append_images=[master(s) for s in ico[:-1]])
     return list(plan) + ['Omni.ico']

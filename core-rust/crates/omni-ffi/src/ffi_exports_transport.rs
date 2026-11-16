@@ -37,6 +37,70 @@ pub extern "C" fn omni_chat_send_text(
 }
 
 #[no_mangle]
+pub extern "C" fn omni_message_delete(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        message_delete_impl(handle, request_json)
+    })) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn omni_message_pin(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        message_pin_impl(handle, request_json)
+    })) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn omni_message_actions(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        message_actions_impl(handle, request_json)
+    })) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn omni_message_react(
+    handle: *mut OmniAppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        message_react_impl(handle, request_json)
+    })) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn omni_chat_send_attachment(
     handle: *mut OmniAppHandle,
     request_json: *const c_char,
@@ -143,6 +207,43 @@ pub extern "C" fn omni_queue_diagnostics(handle: *mut OmniAppHandle) -> *mut c_c
 #[no_mangle]
 pub extern "C" fn omni_media_read_file(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
     match catch_unwind(AssertUnwindSafe(|| media_read_file_impl(handle, request_json))) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+/// A recording into a file `send … as_voice` takes (`{"packets_b64","waveform_b64"}` → `{"path"}`).
+#[no_mangle]
+pub extern "C" fn omni_voice_stage(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| voice_stage_impl(handle, request_json))) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+/// A video message's recording into a file `send … as_video_note` takes
+/// (`{"video_b64","preview_b64"}` → `{"path"}`).
+#[no_mangle]
+pub extern "C" fn omni_video_note_stage(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| video_note_stage_impl(handle, request_json))) {
+        Ok(payload) => payload,
+        Err(_) => to_c_string_payload(&ErrorEnvelope {
+            ok: false,
+            error: OmniError::Internal("panic crossed FFI boundary".to_string()),
+        }),
+    }
+}
+
+/// A voice message's sound for the shell's decoder (`{"path"}` → `{"packets_b64","duration_ms"}`).
+#[no_mangle]
+pub extern "C" fn omni_voice_read(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| voice_read_impl(handle, request_json))) {
         Ok(payload) => payload,
         Err(_) => to_c_string_payload(&ErrorEnvelope {
             ok: false,

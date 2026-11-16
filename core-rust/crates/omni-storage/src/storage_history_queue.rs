@@ -34,6 +34,37 @@ impl Storage {
             .ok_or_else(|| OmniError::Storage("failed to persist local_instance_id".to_string()))
     }
 
+    /// A value of the active profile's own. `app_meta` is the install's: a profile's key carries the
+    /// profile's id and goes with the profile — a profile made after a deleted one does not inherit
+    /// what it was (an agent, a recovery under way).
+    pub fn get_profile_meta(&self, key: &str) -> OmniResult<Option<String>> {
+        let profile_id = self.require_active_profile_id()?;
+        self.get_app_meta(&profile_meta_key(&profile_id, key))
+    }
+
+    pub fn upsert_profile_meta(&self, key: &str, value: &str) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.upsert_app_meta(&profile_meta_key(&profile_id, key), value)
+    }
+
+    /// Forget one value of the active profile's own.
+    pub fn remove_profile_meta(&self, key: &str) -> OmniResult<()> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .execute("DELETE FROM app_meta WHERE key = ?1", params![profile_meta_key(&profile_id, key)])
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Every value of the profile's own.
+    pub(crate) fn delete_profile_meta(&self, profile_id: &LocalProfileId) -> OmniResult<()> {
+        let prefix = profile_meta_key(profile_id, "");
+        self.connection
+            .execute("DELETE FROM app_meta WHERE substr(key, 1, length(?1)) = ?1", params![prefix])
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
     pub fn get_app_meta(&self, key: &str) -> OmniResult<Option<String>> {
         self.connection
             .query_row(
@@ -510,7 +541,7 @@ impl Storage {
                     created_at_unix_ms,
                     updated_at_unix_ms
                 FROM messages
-                WHERE id IN (
+                WHERE profile_id = ?1 AND id IN (
                     -- One step per dialog down the (profile, dialog, created, id) index: the next
                     -- dialog key, then that dialog's newest message. Reading every message of the
                     -- profile to rank it (a window function) grew with the whole history.
@@ -832,8 +863,8 @@ impl Storage {
             last_dialog_link_updated_at_unix_ms,
             last_public_profile_updated_at_unix_ms,
             last_message_updated_at_unix_ms: max_option_i64(
-                last_message_updated_at_unix_ms,
-                last_call_updated_at_unix_ms,
+                max_option_i64(last_message_updated_at_unix_ms, last_call_updated_at_unix_ms),
+                self.message_actions_mark()?,
             ),
             last_attachment_updated_at_unix_ms,
             last_read_mark_updated_at_unix_ms: self.last_read_mark_updated_at_unix_ms()?,
@@ -927,19 +958,22 @@ impl Storage {
 
         let message = self.get_message_by_id(id)?;
         if message.direction == ChatDirection::Outgoing {
-            let queue_metadata = self.queue_metadata_for_message(id)?;
-            self.upsert_outbound_queue(
-                &message.id,
-                &message.dialog_key,
-                message.status,
-                queue_metadata.attempt_count,
-                queue_metadata.last_attempt_unix_ms,
-                None,
-                queue_metadata.last_failure_kind,
-                queue_metadata.last_failure_message.as_deref(),
-                message.created_at_unix_ms,
-                updated_at_unix_ms,
-            )?;
+            // Not for a group line: see `insert_group_outgoing_message`.
+            if !message.dialog_key.starts_with("group:") {
+                let queue_metadata = self.queue_metadata_for_message(id)?;
+                self.upsert_outbound_queue(
+                    &message.id,
+                    &message.dialog_key,
+                    message.status,
+                    queue_metadata.attempt_count,
+                    queue_metadata.last_attempt_unix_ms,
+                    None,
+                    queue_metadata.last_failure_kind,
+                    queue_metadata.last_failure_message.as_deref(),
+                    message.created_at_unix_ms,
+                    updated_at_unix_ms,
+                )?;
+            }
 
             if let Some(remote_delivered_at_unix_ms) = message.remote_delivered_at_unix_ms {
                 self.connection
@@ -953,7 +987,7 @@ impl Storage {
                             profile_id
                         )
                         VALUES (?1, ?2, ?3, ?4, ?5)
-                        ON CONFLICT(message_id) DO UPDATE SET
+                        ON CONFLICT(profile_id, message_id) DO UPDATE SET
                             delivered_at_unix_ms = excluded.delivered_at_unix_ms,
                             recorded_at_unix_ms = excluded.recorded_at_unix_ms
                         ",

@@ -16,6 +16,7 @@ impl OmniApp {
     pub fn transport_discovery_refresh_snapshot(
         &self,
     ) -> OmniResult<TransportDiscoveryRefreshSnapshot> {
+        let _ = self.ensure_runtime_profile_active("transport_discovery_refresh_snapshot")?;
         let transport_snapshot = self.transport.snapshot();
         let queue_diagnostics = self
             .storage
@@ -27,10 +28,12 @@ impl OmniApp {
     }
 
     pub fn outbound_queue_snapshot(&self) -> OmniResult<OutboundQueueSnapshot> {
+        let _ = self.ensure_runtime_profile_active("outbound_queue_snapshot")?;
         self.storage.outbound_queue_snapshot()
     }
 
     pub fn queue_diagnostics(&self) -> OmniResult<QueueDiagnosticsSnapshot> {
+        let _ = self.ensure_runtime_profile_active("queue_diagnostics")?;
         self.storage
             .queue_diagnostics(self.transport.snapshot().last_error.clone())
     }

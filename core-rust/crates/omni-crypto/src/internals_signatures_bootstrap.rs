@@ -202,3 +202,66 @@ fn derive_rendezvous_pair_secret(shared_secret: &[u8; 32]) -> OmniResult<[u8; 32
 pub fn derive_rendezvous_bootstrap_secret(invite_nonce: &[u8; 32]) -> OmniResult<[u8; 32]> {
     hkdf_expand(None, invite_nonce, b"omni-rendezvous-bootstrap-secret-v1")
 }
+
+/// The inviter's X25519 key for answers to one invite: importers seal their beacons on the invite's
+/// topic to its public half (carried in the invite), so one importer cannot read another's addresses
+/// the way it reads the topic. Derived from the inviter's identity signing seed and the invite's
+/// nonce — re-derivable from the persisted nonce, never stored, a different key per invite, and not
+/// the identity key itself (that one only signs). Returns `(secret, public)`.
+/// See docs/decisions/invite-bootstrap-rendezvous.md.
+pub fn derive_invite_reply_key(
+    identity_signing_seed: &[u8; 32],
+    invite_nonce: &[u8; 32],
+) -> OmniResult<([u8; 32], [u8; 32])> {
+    let secret = hkdf_expand(Some(invite_nonce), identity_signing_seed, b"omni-invite-reply-key-v1")?;
+    let public = X25519PublicKey::from(&StaticSecret::from(secret)).to_bytes();
+    Ok((secret, public))
+}
+
+/// A findable device's X25519 key for knocks: someone who found it by Omni-ID and wants a TCP hole
+/// punch seals its own punch address to the public half (carried in the signed identity beacon), so
+/// only this device reads where the finder is. Derived from the device's identity signing seed —
+/// stable across restarts, never stored, not the identity key itself. Returns `(secret, public)`.
+/// See docs/decisions/tcp-hole-punch.md.
+pub fn derive_knock_key(identity_signing_seed: &[u8; 32]) -> OmniResult<([u8; 32], [u8; 32])> {
+    let secret = hkdf_expand(None, identity_signing_seed, b"omni-tcp-punch-knock-key-v1")?;
+    let public = X25519PublicKey::from(&StaticSecret::from(secret)).to_bytes();
+    Ok((secret, public))
+}
+
+/// The importer's proof, carried in its contact request, that it holds the invite with this nonce:
+/// a PRF of the nonce over the request's own identity signing key and ephemeral key (HKDF-Expand is
+/// HMAC underneath). Bound to those keys, so whoever sees one request (a durable holder, a relay)
+/// cannot move the claim into a request of their own — only someone holding the nonce can make it.
+/// The inviter accepts the first valid claim as the invite's answer (docs/decisions/pairing-over-mesh-adoption.md).
+pub fn invite_claim(
+    invite_nonce: &[u8; 32],
+    initiator_identity_signing_public_key: &str,
+    initiator_ephemeral_public_key: &str,
+) -> OmniResult<[u8; 32]> {
+    let key = hkdf_expand(None, invite_nonce, b"omni-invite-claim-key-v1")?;
+    let mut info = b"omni-invite-claim-v1\0".to_vec();
+    info.extend_from_slice(initiator_identity_signing_public_key.as_bytes());
+    info.push(0);
+    info.extend_from_slice(initiator_ephemeral_public_key.as_bytes());
+    hkdf_expand(None, &key, &info)
+}
+
+/// Whether `claim_hex` is the [`invite_claim`] of this nonce for these keys. Compared in constant
+/// time: the claim comes from the network, and an early exit would tell a forger how many leading
+/// bytes it got right.
+pub fn invite_claim_matches(
+    invite_nonce: &[u8; 32],
+    initiator_identity_signing_public_key: &str,
+    initiator_ephemeral_public_key: &str,
+    claim_hex: &str,
+) -> bool {
+    let Ok(expected) = invite_claim(invite_nonce, initiator_identity_signing_public_key, initiator_ephemeral_public_key)
+    else {
+        return false;
+    };
+    let Ok(claim) = hex::decode(claim_hex.trim()) else {
+        return false;
+    };
+    claim.len() == expected.len() && claim.iter().zip(expected.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}

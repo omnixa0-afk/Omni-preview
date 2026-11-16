@@ -36,11 +36,16 @@ const HISTORY_RECOVERY_CONTACTS_PER_ROUND: usize = 8;
 
 const HISTORY_BUCKET_COUNT: usize = omni_protocol::HISTORY_SYNC_BUCKETS;
 
+/// How far ahead of our clock a line's author time may be (clock skew between devices).
+const HISTORY_CLOCK_SKEW_MS: i64 = 10 * 60 * 1000;
+
 /// Per profile, in memory: when each device was last given a summary, when a chat's buckets last
 /// went to it.
 #[derive(Default)]
 struct HistorySyncState {
     summary_at_unix_ms: HashMap<String, i64>,
+    /// The newest deletion each device was told.
+    deletions_told: HashMap<String, i64>,
     buckets_at_unix_ms: HashMap<(String, String), i64>,
 }
 
@@ -240,6 +245,15 @@ fn history_sync_round(storage: &Storage, transport: &TransportManager, now_unix_
                 break;
             }
         }
+        // What we deleted goes first in effect: the fingerprints then agree without handing lines over.
+        if let Ok((newest, message_ids)) = storage.recent_chat_deletions() {
+            let told = with_history_sync_state(&db_path, |state| state.deletions_told.get(&device_id.0).copied().unwrap_or(0));
+            if newest > told
+                && send_history_message(storage, transport, &own_account_id, &dialog_key, omni_types::HistorySyncMessageV1::Deleted { message_ids }).is_ok()
+            {
+                with_history_sync_state(&db_path, |state| state.deletions_told.insert(device_id.0.clone(), newest));
+            }
+        }
         if sent {
             with_history_sync_state(&db_path, |state| state.summary_at_unix_ms.insert(device_id.0.clone(), now_unix_ms));
             omni_app_trace_log("history/sync", &format!("device={} summary of {} chat(s)", device_id.0, chats.len()));
@@ -363,6 +377,16 @@ fn handle_incoming_history_sync(
             send_history_lines(storage, transport, from, &receive_context.dialog_key, &peer, &chat, &differing);
             if *answer {
                 send_history_buckets(storage, transport, &db_path, from, &receive_context.dialog_key, &peer, &digest, false, now_unix_ms);
+            }
+            Ok(())
+        }
+        omni_types::HistorySyncMessageV1::Deleted { message_ids } => {
+            // Only our own device speaks for what we deleted.
+            let own = storage.get_local_account().ok().flatten().is_some_and(|a| a.descriptor.account_id == from.remote_account_id);
+            if own && storage.is_own_other_device(&from.remote_account_id, &from.remote_device_id).unwrap_or(false) {
+                if let Err(error) = crate::app_message_actions::receive_own_device_deletions(storage, message_ids, now_unix_ms) {
+                    omni_app_trace_log("history/sync", &format!("deletions not taken: {error}"));
+                }
             }
             Ok(())
         }
@@ -526,7 +550,49 @@ fn merge_history_lines(
     } else {
         from.remote_device_id.clone()
     };
+    // What a contact may add to our copy of the chat (V-19): its own lines, always; lines it says
+    // are ours, only while this device is being restored — the contact's copy is then the only way
+    // our side of the talk comes back, and such lines stay marked «со слов собеседника» and are
+    // checked against the passport's fingerprint. At any other time a line "by us" that we do not
+    // have is one we never wrote: our own devices hand us what we wrote.
+    //
+    // And only up to the time the passport counted the chat: a line «by us» after it is checked
+    // against nothing, so a contact made one up and it showed as ours unflagged (blind audit
+    // 2026-11-13, pass 22). Our last minutes before the loss are the price.
+    let ours_from_contact_through = if peer.from_contact {
+        load_account_recovery(storage)
+            .filter(|recovery| account_recovery_active(recovery, now_unix_ms))
+            .and_then(|recovery| {
+                recovery.chat_fingerprints.iter().find(|(account, ..)| account == &peer.contact_account_id.0).map(|f| f.3)
+            })
+    } else {
+        None
+    };
+    let mut refused_as_ours = 0usize;
+    let floor = storage.chat_history_floor(&peer.contact_account_id).unwrap_or(i64::MIN);
     for line in lines {
+        // Forgotten with the contact: no copy brings it back.
+        if line.created_at_unix_ms <= floor {
+            continue;
+        }
+        // Deleted here: no copy brings it back.
+        if storage.message_is_deleted(&line.message_id).unwrap_or(false) {
+            continue;
+        }
+        // Nobody's line is dated in the future (beyond clock skew).
+        if line.created_at_unix_ms > now_unix_ms + HISTORY_CLOCK_SKEW_MS {
+            continue;
+        }
+        let ours_from_contact_allowed = ours_from_contact_through.is_some_and(|through| line.created_at_unix_ms <= through);
+        if peer.from_contact && line.author_account_id == peer.own_account_id.0 && !ours_from_contact_allowed {
+            // Still news when we have it: the contact got what we sent.
+            if storage.message_exists(&line.message_id).unwrap_or(false) {
+                let _ = storage.mark_message_delivered_if_sent(&line.message_id, now_unix_ms);
+            } else {
+                refused_as_ours += 1;
+            }
+            continue;
+        }
         if storage.message_exists(&line.message_id).unwrap_or(false) {
             if peer.from_contact && line.author_account_id == peer.own_account_id.0 {
                 // The contact has what we sent: it was delivered.
@@ -547,13 +613,15 @@ fn merge_history_lines(
                 .insert_incoming_message(&line.message_id, &chat.chat_dialog_key, &line.body, line.created_at_unix_ms)
                 .and_then(|record| {
                     // Talk coming back from another copy of the chat, not news: it does not light the counter.
-                    storage.mark_dialog_read_through(&record.dialog_key, line.created_at_unix_ms)?;
+                    storage.mark_dialog_read_through_history_line(&record.dialog_key, line.created_at_unix_ms, &record.id)?;
                     Ok(true)
                 })
         } else {
             continue;
         };
         match inserted {
+            // The contact took it back before it came here (a deletion that waited for it).
+            Ok(true) if crate::app_message_actions::apply_pending_message_deletes(storage, &line.message_id).unwrap_or(false) => {}
             Ok(true) => {
                 added += 1;
                 if let Some(offer) = line.attachment.as_ref().filter(|offer| offer.message_id == line.message_id) {
@@ -568,6 +636,15 @@ fn merge_history_lines(
             Ok(false) => {}
             Err(error) => omni_app_trace_log("history/sync", &format!("line {} not taken: {error}", line.message_id)),
         }
+    }
+    if refused_as_ours > 0 {
+        omni_app_trace_log(
+            "history/sync",
+            &format!(
+                "chat={} {refused_as_ours} line(s) the contact says are ours not taken: not being restored, or past what the passport counted",
+                peer.contact_account_id.0
+            ),
+        );
     }
     added
 }
@@ -647,11 +724,15 @@ fn passport_chat_fingerprints(storage: &Storage, own_account_id: &AccountId, now
         let Some(chat) = local_chat(storage, account_id) else {
             continue;
         };
-        if chat.lines.is_empty() {
-            continue;
-        }
+        // An empty chat is counted too: left out, the restored device had nothing to hold a contact's
+        // copy against, and lines «by us» it made up for a chat that had none showed unmarked
+        // (blind audit 2026-11-11, M1).
         let digest = local_chat_digest(own_account_id, &chat);
-        out.push((account_id.0.clone(), digest.count, hex::encode(digest.root), now_unix_ms));
+        // Through the latest line counted, if it is dated past our clock (the clock was set back):
+        // a «through» of now left such a line counted but past it, and a restore took it from no one
+        // (blind audit 2026-11-13, pass 23).
+        let through = chat.lines.iter().map(|line| line.created_at_unix_ms).max().unwrap_or(now_unix_ms).max(now_unix_ms);
+        out.push((account_id.0.clone(), digest.count, hex::encode(digest.root), through));
     }
     out.sort();
     out

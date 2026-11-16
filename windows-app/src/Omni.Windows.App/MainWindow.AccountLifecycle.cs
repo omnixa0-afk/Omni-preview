@@ -78,16 +78,6 @@ public sealed partial class MainWindow
            windowState.CurrentSection is AuthenticatedShellSection.Settings or
                AuthenticatedShellSection.Diagnostics;
 
-    private void RefreshCurrentProfileFootprintIfVisible()
-    {
-        if (!ShouldRefreshCurrentProfileFootprintImmediately())
-        {
-            return;
-        }
-
-        ApplyFootprintRefreshPayload(FetchFootprintRefreshPayload(GetCurrentProfileId()));
-    }
-
     private LifecycleRefreshPayload FetchLifecycleRefreshPayload(bool _includeFootprint)
     {
         try
@@ -291,6 +281,9 @@ public sealed partial class MainWindow
             !IsAuthenticatedRefreshLoopRunning())
         {
             StartAuthenticatedRefreshLoop();
+            // The core stops the mesh with the profile's runtime before signing out or deleting; when
+            // that did not complete, the profile stays and needs its mesh back (no-op if it runs).
+            TryStartMeshOverlay();
         }
     }
 
@@ -362,6 +355,7 @@ public sealed partial class MainWindow
             PrimaryButtonText = primaryButtonText,
             CloseButtonText = "Отмена",
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
 
         bool confirmed = await dialog.ShowAsync() == ContentDialogResult.Primary;
@@ -833,6 +827,7 @@ public sealed partial class MainWindow
                 CloseButtonText = "Выйти",
                 DefaultButton = ContentDialogButton.Primary,
                 XamlRoot = Content.XamlRoot,
+                RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
             };
             bootLockDialog = dialog;
             bootLockPhraseBox = phraseBox;
@@ -872,6 +867,7 @@ public sealed partial class MainWindow
                     CloseButtonText = "Назад",
                     DefaultButton = ContentDialogButton.Close,
                     XamlRoot = Content.XamlRoot,
+                    RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
                 };
                 if (await confirm.ShowAsync() != ContentDialogResult.Primary)
                 {

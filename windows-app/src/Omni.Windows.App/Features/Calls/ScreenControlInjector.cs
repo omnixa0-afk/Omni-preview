@@ -38,6 +38,10 @@ internal sealed class ScreenControlInjector : IDisposable
     private long refusedBatches;
     private long releases;
     private (int X, int Y)? lastPointer;
+    private SharedMonitor? lastMonitor;
+    private SharedMonitor? desktop;
+    private int monitorCount;
+    private long desktopReadMs;
 
     internal ScreenControlInjector(Func<SharedMonitor?> sharedMonitor)
     {
@@ -58,8 +62,15 @@ internal sealed class ScreenControlInjector : IDisposable
             lock (sync)
             {
                 string pointer = lastPointer is { } p ? $"{p.X},{p.Y}" : "none";
+                // Where the pointer is mapped: the shared monitor, the desktop around it (and the
+                // system's own idea of it, to see the two disagree), how many monitors look alike.
+                static string Rect(SharedMonitor? r) => r is { } m ? $"{m.Left},{m.Top} {m.Width}x{m.Height}" : "none";
+                string metrics = $"{GetSystemMetrics(SmXVirtualScreen)},{GetSystemMetrics(SmYVirtualScreen)} " +
+                                 $"{GetSystemMetrics(SmCxVirtualScreen)}x{GetSystemMetrics(SmCyVirtualScreen)}";
                 return $"injected={injectedBatches} refused={refusedBatches} yielded={yieldedBatches} releases={releases} " +
-                       $"guard={(localInput.IsArmed ? "armed" : "off")} pointer={pointer}";
+                       $"guard={(localInput.IsArmed ? "armed" : "off")} pointer={pointer} monitor={Rect(lastMonitor)} " +
+                       $"desktop={Rect(desktop)} monitors={monitorCount} metrics={metrics} " +
+                       $"lookalikes={ScreenShareCaptureSource.LastMatches}";
             }
         }
     }
@@ -157,17 +168,27 @@ internal sealed class ScreenControlInjector : IDisposable
     {
         int px = monitor.Left + (int)((long)x * Math.Max(monitor.Width - 1, 0) / 65535);
         int py = monitor.Top + (int)((long)y * Math.Max(monitor.Height - 1, 0) / 65535);
-        int vx = GetSystemMetrics(SmXVirtualScreen);
-        int vy = GetSystemMetrics(SmYVirtualScreen);
-        int vw = Math.Max(GetSystemMetrics(SmCxVirtualScreen) - 1, 1);
-        int vh = Math.Max(GetSystemMetrics(SmCyVirtualScreen) - 1, 1);
-        Send(Mouse(
-            (int)((long)(px - vx) * 65535 / vw),
-            (int)((long)(py - vy) * 65535 / vh),
-            0,
-            MouseMove | MouseAbsolute | MouseVirtualDesk));
+        // The desktop from the monitors' own rectangles, not GetSystemMetrics: one source for both
+        // (owner, 2026-10-30: on a PC with two screens the pointer landed right of the viewer's).
+        // Read again at most once a second — a monitor plugged in mid-share moves the desktop.
+        long now = Environment.TickCount64;
+        if (desktop is null || now - desktopReadMs > 1_000)
+        {
+            (desktop, monitorCount) = ScreenShareCaptureSource.VirtualDesktop();
+            desktopReadMs = now;
+        }
+
+        SharedMonitor desk = desktop.Width > 0 ? desktop : monitor;
+        Send(Mouse(ToAbsolute(px - desk.Left, desk.Width), ToAbsolute(py - desk.Top, desk.Height), 0, MouseMove | MouseAbsolute | MouseVirtualDesk));
         lastPointer = (px, py);
+        lastMonitor = monitor;
     }
+
+    /// A pixel `offset` across a desktop `span` pixels wide → SendInput's 0..65535. Windows puts an
+    /// absolute value n at pixel ⌊n·span/65536⌋, so the value is rounded up to land on `offset` itself
+    /// (the old ·65535/(span−1) drifted a pixel off towards the far edge).
+    internal static int ToAbsolute(int offset, int span) =>
+        span <= 0 ? 0 : (int)Math.Clamp(((long)offset * 65536 + span - 1) / span, 0, 65535);
 
     private void Inject(Held state, ScreenInputEventDto input)
     {

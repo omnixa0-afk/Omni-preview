@@ -451,7 +451,6 @@ pub(crate) fn clear_runtime_contact_ephemera_for_active_profile(
     let prefix = format!("{db_path}::");
     lock_public_profile_sync_registry()?.retain(|key, _| !key.starts_with(&prefix));
     lock_relay_set_push_registry()?.retain(|key, _| !key.starts_with(&prefix));
-    clear_inbound_bootstrap_marks_for_profile(&db_path);
     Ok(())
 }
 

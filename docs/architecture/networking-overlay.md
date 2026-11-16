@@ -29,7 +29,8 @@ right long-term architecture instead of repairing workarounds.
 
 The Omni network is a **self-organizing, self-healing mesh** with cryptographic
 addresses, a link-layer abstraction (QUIC today, potentially LoRa/serial/etc.
-later), announce-based routing without a DHT, and optional volunteer help from
+later), announce-based routing (no routing DHT; the Mainline DHT is only one of the rendezvous
+couriers, on by default since 2026-10-10), and optional volunteer help from
 nodes that have a public IP. The network **works even when no node has a public
 IP** (via LAN mDNS plus invite-based bootstrap) and **becomes more reliable with
 every new node**, especially every new volunteer with a public IP that provides
@@ -45,7 +46,7 @@ implementation is **Rust-native**, with no Python dependency.
 **Self-organizing**: each node periodically broadcasts a signed announce
 ("I exist, my identity is X, hop count from me = 0"). Neighbors cache it and
 forward it with an increment. After a few rounds the network knows who is where,
-with no central coordinator and no DHT.
+with no central coordinator and no routing DHT.
 
 **Self-healing**: routes are soft state with a TTL. When a node drops, its
 announces stop arriving, routes through it expire, and the network re-routes
@@ -69,7 +70,7 @@ implementation. QUIC over TCP, LoRa and serial can be added later; routing,
 identity and announces do not depend on the transport.
 
 **Identity unchanged**: the existing X3DH + Double Ratchet crypto stays as is.
-The network address is `blake3(pubkey)[:16]`, derived from the existing identity.
+The network address is `blake3(pubkey)[:20]`, derived from the existing identity.
 This is backward-compatible with contacts already in the database.
 
 ## Architecture layers (top-down)
@@ -84,7 +85,7 @@ This is backward-compatible with contacts already in the database.
 │  unchanged. This is the project's own value-add.           │
 ├────────────────────────────────────────────────────────────┤
 │  Virtual link layer:                                       │
-│  - opens by destination address (= blake3(pubkey)[:16])    │
+│  - opens by destination address (= blake3(pubkey)[:20])    │
 │  - encrypted to destination using established crypto       │
 │  - resilient: if the path changes, automatic reroute       │
 │  - persistent: survives temporary network changes          │
@@ -118,7 +119,7 @@ This is backward-compatible with contacts already in the database.
 
 ### Destination = address
 
-In this model a peer's **address** is `blake3(pubkey)[:16]` (16 bytes = 128 bits
+In this model a peer's **address** is `blake3(pubkey)[:20]` (20 bytes = 160 bits
 of identity space, more than enough for billions of peers).
 
 Property: **an address cannot be forged**. Any node can verify that a peer
@@ -132,13 +133,13 @@ at different levels of abstraction.
 
 ### Announce protocol
 
-Each node periodically (every ~5-15 minutes, adaptive: less often when the
-network is stable, more often when topology changes) sends an **announce** over
-each of its active links:
+Each node periodically (every 20 s, ±25 % jitter — `DEFAULT_ANNOUNCE_INTERVAL` in
+`omni-mesh-runtime`) sends an **announce** over each of its active links. Announces go one hop;
+farther peers are found with a `PathRequest` (TTL 4):
 
 ```rust
 struct Announce {
-    destination: [u8; 16],          // hash of pubkey
+    destination: [u8; 20],          // hash of pubkey
     pubkey: PublicKey,               // raw pubkey (to validate destination)
     advertised_addresses: Vec<SocketAddr>,  // directly reachable (if any)
     hop_count: u8,                   // 0 = the originator, incremented on forwarding
@@ -149,7 +150,7 @@ struct Announce {
 
 On receipt a node:
 1. Verifies the signature (otherwise drops).
-2. Checks that `blake3(pubkey)[:16] == destination` (otherwise drops).
+2. Checks that `blake3(pubkey)[:20] == destination` (otherwise drops).
 3. If the destination is unknown, adds it to the path table:
    `destination → (next-hop = the link it arrived on, cost = hop_count+1, ttl)`
 4. If the destination is known and the new announce is shorter or fresher than
@@ -418,8 +419,7 @@ Landed in `omni-network`:
   connection. Data from an unverified or mismatched neighbor is dropped
   (anti-spoof); `Data` that races the handshake is buffered and flushed on
   verification.
-- ⏳ **Not yet**: integration into `omni-transport`/`omni-app` (a new Connection
-  over Link). The old signaling stays frozen until then.
+- Application integration followed this phase. The [mesh startup code](../../core-rust/crates/omni-app/src/app_mesh.rs) starts the networked runtime. See the [network behavior map](network-behavior-map.md) for carriers and discovery.
 
 ### Phase β: hole punching + multi-hop routing
 
@@ -485,7 +485,7 @@ All open questions are resolved; see the "Locked decisions" table in
 
 Summary:
 - **Address**: 20 bytes (`blake3(pubkey)[:20]`)
-- **Announce frequency**: static 5 min in Phase α, adaptive later
+- **Announce frequency**: 20 s ± 25 %, one hop; `PathRequest` beyond
 - **Bootstrap list**: hardcoded const + community PRs, empty in α
 - **"Help the network" default**: tiered (cheap forwarding for everyone; bulk relay only on desktop)
 - **Backward compat for invites**: hard break, the importer accepts only the new format (no production users, so no migration burden)

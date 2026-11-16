@@ -12,11 +12,10 @@ namespace Omni.Windows.App;
 // the self-contained ConnectionPrivacy partial: resolves its own elements via the section accessor and
 // drives the RustBridge network-node FFI, touching no other partial beyond one Initialize call site.
 // Live per-node reachability is added in step 5 (when the mesh actually dials these entry points).
-// See docs/notes/roadmap-CONTINUE.md (Always-connect epic).
+// See docs/decisions/community-volunteer-nodes.md.
 public sealed partial class MainWindow
 {
     private bool networkNodesAddWired;
-    private bool networkNodesVisibilityWired;
     private string selfSeedAddresses = string.Empty;
 
     private StackPanel SettingsRelaysListPanel =>
@@ -52,26 +51,9 @@ public sealed partial class MainWindow
             networkNodesAddWired = true;
         }
 
-        if (!networkNodesVisibilityWired)
-        {
-            // Runs once (post-sign-in), often before the core is warm — re-read on section-show so the
-            // list + self-seed address populate reliably (same pattern as the rendezvous card).
-            SettingsSectionRoot.RegisterPropertyChangedCallback(
-                UIElement.VisibilityProperty, OnSettingsVisibilityChangedForNetworkNodes);
-            networkNodesVisibilityWired = true;
-        }
-
+        // Runs once (post-sign-in), often before the core is warm; the page re-reads when shown
+        // (MainWindow.SettingsPages.cs).
         RefreshNetworkNodes();
-    }
-
-    private void OnSettingsVisibilityChangedForNetworkNodes(DependencyObject sender, DependencyProperty dp)
-    {
-        if (SettingsSectionRoot.Visibility != Visibility.Visible)
-        {
-            return;
-        }
-
-        DispatcherQueue.TryEnqueue(RefreshNetworkNodes);
     }
 
     private void RefreshNetworkNodes()
@@ -95,7 +77,7 @@ public sealed partial class MainWindow
         {
             list.Children.Add(new TextBlock
             {
-                Text = "Список пуст. Связь по локальной сети и приглашению работает и без узлов.",
+                Text = "Список пуст.",
                 Style = (Style)Application.Current.Resources["SettingCaptionTextStyle"],
                 TextWrapping = TextWrapping.WrapWholeWords,
             });

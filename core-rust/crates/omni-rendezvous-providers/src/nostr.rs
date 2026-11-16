@@ -10,25 +10,23 @@
 //! satisfy the relay's "events must be signed" rule; it carries NO Omni identity, and we fetch by the
 //! topic tag, not by author. See docs/decisions/serverless-bootstrap-rendezvous.md.
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use k256::schnorr::{Signature, SigningKey};
 use omni_rendezvous::{ChannelError, RendezvousChannel, Topic};
 use sha2::{Digest, Sha256};
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket};
 
-use crate::{from_hex, to_hex};
+use crate::nostr_link::{LinkConfig, RelayLink, MAX_EVENTS, TIMINGS};
+#[cfg(test)]
+use crate::from_hex;
+use crate::to_hex;
 
 /// NIP-78 application-data kind (parameterized-replaceable range) the sealed beacon rides under. The
 /// blinded topic is the `d` tag, so a fetch filters `{"kinds":[30078],"#d":[<topic>]}` and gets EVERY
 /// writer's beacon back (multi-writer, fetch-all — the courier contract).
-const RENDEZVOUS_KIND: u16 = 30078;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-const IO_TIMEOUT: Duration = Duration::from_secs(8);
-/// Cap events read per fetch — a hostile relay can't stream us forever.
-const MAX_EVENTS: usize = 64;
+pub(crate) const RENDEZVOUS_KIND: u16 = 30078;
 /// Default free public relay (write-permissive). One of several — operator/user-addable like all
 /// providers; the resilience comes from N-of-many across independent relays, not this single default.
 const DEFAULT_RELAY: &str = "wss://nos.lol";
@@ -36,6 +34,12 @@ const DEFAULT_RELAY: &str = "wss://nos.lol";
 /// A [`RendezvousChannel`] over a Nostr relay (default [`DEFAULT_RELAY`]).
 pub struct NostrChannel {
     relay_url: String,
+    /// Connect only to a public address — a courier someone else named (V-13).
+    public_only: bool,
+    /// Connections opened so far ([`RendezvousChannel::connections_opened`]).
+    connections: Arc<AtomicU64>,
+    /// The relay connection, started on first use (`nostr_link`).
+    link: OnceLock<RelayLink>,
 }
 
 impl NostrChannel {
@@ -46,31 +50,26 @@ impl NostrChannel {
 
     /// Point at a specific relay (`wss://…` or `ws://…`) — user/operator-addable, like every provider.
     pub fn with_relay(relay_url: impl Into<String>) -> Self {
-        Self { relay_url: relay_url.into() }
+        Self { relay_url: relay_url.into(), public_only: false, connections: Arc::default(), link: OnceLock::new() }
     }
 
-    fn connect(&self) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ChannelError> {
-        let (host, port, tls) = parse_ws_url(&self.relay_url)?;
-        // Resolve + connect with an explicit timeout, and set read/write timeouts on the socket BEFORE
-        // the handshake — so a hung relay can never block the (sandboxed) helper thread forever.
-        let addr = (host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| ChannelError(format!("nostr resolve {host}: {e}")))?
-            .next()
-            .ok_or_else(|| ChannelError(format!("nostr resolve {host}: no address")))?;
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-            .map_err(|e| ChannelError(format!("nostr connect {addr}: {e}")))?;
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let url = self.relay_url.as_str();
-        let (ws, _resp) = if tls {
-            tungstenite::client_tls(url, stream)
-                .map_err(|e| ChannelError(format!("nostr ws handshake: {e}")))?
-        } else {
-            tungstenite::client(url, MaybeTlsStream::Plain(stream))
-                .map_err(|e| ChannelError(format!("nostr ws handshake: {e}")))?
-        };
-        Ok(ws)
+    /// The same relay, reached only at a public address (checked where the name is resolved): for
+    /// a courier a contact named, which must not make us reach into our own network (V-13).
+    pub fn public_only(mut self) -> Self {
+        self.public_only = true;
+        self
+    }
+
+    /// The relay's connection, started the first time this courier is used.
+    fn link(&self) -> &RelayLink {
+        self.link.get_or_init(|| {
+            RelayLink::start(LinkConfig {
+                url: self.relay_url.clone(),
+                public_only: self.public_only,
+                timings: TIMINGS,
+                connections: Arc::clone(&self.connections),
+            })
+        })
     }
 }
 
@@ -81,52 +80,13 @@ impl Default for NostrChannel {
 }
 
 impl NostrChannel {
+    /// Publish under `topic`, signed by `signing`, and wait for the relay's `OK`. A relay that refuses
+    /// anonymous writes (NIP-42 auth / payment) answers `OK false` with its reason — surfaced so the
+    /// fan-out moves to the next courier and the breaker tells a quota from a breakdown.
     fn publish_signed_by(&self, signing: &SigningKey, topic: &Topic, blob: &[u8], ttl_secs: u32) -> Result<(), ChannelError> {
         let event = signed_event_by(signing, &topic.id(), &to_hex(blob), now_unix_secs() + u64::from(ttl_secs));
-        let mut ws = self.connect()?;
-        let frame = serde_json::json!(["EVENT", event]).to_string();
-        ws.send(Message::Text(frame))
-            .map_err(|e| ChannelError(format!("nostr publish: {e}")))?;
-        // Read frames until the relay's `["OK", id, accepted, msg]` ack (or a few non-OK frames /
-        // timeout), so the event is durably committed before we drop the connection. A relay that
-        // refuses anonymous writes (NIP-42 auth / payment) answers `["OK", id, false, "auth-required…"]`
-        // or just closes — we surface that as an error so the N-of-many fan-out moves to the next.
-        let mut accepted = false;
-        // Причину отказа НАДО донести. NIP-01 задаёт машиночитаемые префиксы в четвёртом поле
-        // (`rate-limited:`, `auth-required:`, `blocked:`, `invalid:`, `pow:`, `error:`), и без них
-        // «релей нас лимитирует» неотличимо от «релей сломан» — предохранитель обходится с ними
-        // одинаково, а лог не говорит ничего. Ровно эта же болезнь была у ntfy
-        // (docs/bugs/ntfy-courier-out-of-quota.md), только там код состояния прятал `ureq`.
-        let mut reason = String::new();
-        for _ in 0..4 {
-            match ws.read() {
-                Ok(Message::Text(t)) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-                        if v.get(0).and_then(|x| x.as_str()) == Some("OK") {
-                            accepted = v.get(2).and_then(|x| x.as_bool()).unwrap_or(false);
-                            reason = v
-                                .get(3)
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            break;
-                        }
-                    }
-                }
-                Ok(Message::Ping(p)) => {
-                    let _ = ws.send(Message::Pong(p));
-                }
-                _ => break,
-            }
-        }
-        let _ = ws.close(None);
-        if accepted {
-            Ok(())
-        } else if reason.is_empty() {
-            Err(ChannelError("nostr publish: relay did not accept the event".to_string()))
-        } else {
-            Err(ChannelError(format!("nostr publish: {reason}")))
-        }
+        let id = event["id"].as_str().unwrap_or_default().to_string();
+        self.link().publish(event, id)
     }
 }
 
@@ -146,29 +106,18 @@ impl RendezvousChannel for NostrChannel {
         self.fetch_many(std::slice::from_ref(topic))
     }
 
-    /// One connection, one `REQ` per topic in turn: each topic keeps its own `limit` (the relay
-    /// directory spreads over shelves exactly because of it), and the relay sees one handshake.
+    /// One `REQ` per topic in turn, on the relay's one connection: each topic keeps its own `limit`
+    /// (the relay directory spreads over shelves exactly because of it).
     fn fetch_many(&self, topics: &[Topic]) -> Result<Vec<Vec<u8>>, ChannelError> {
-        let mut ws = self.connect()?;
         let mut out = Vec::new();
-        for (n, topic) in topics.iter().enumerate() {
-            let sub = format!("omni{n}");
+        for topic in topics {
             let filter = serde_json::json!({
                 "kinds": [RENDEZVOUS_KIND],
                 "#d": [topic.id()],
                 "limit": MAX_EVENTS,
             });
-            let req = serde_json::json!(["REQ", sub, filter]).to_string();
-            ws.send(Message::Text(req))
-                .map_err(|e| ChannelError(format!("nostr req: {e}")))?;
-            let (blobs, open) = read_stored_events(&mut ws, &sub);
-            out.extend(blobs);
-            let _ = ws.send(Message::Text(serde_json::json!(["CLOSE", sub]).to_string()));
-            if !open {
-                break;
-            }
+            out.extend(self.link().query(filter)?);
         }
-        let _ = ws.close(None);
         Ok(out)
     }
 
@@ -176,70 +125,28 @@ impl RendezvousChannel for NostrChannel {
         true
     }
 
-    /// A NIP-01 `REQ` with `since = now`, held open past `EOSE`: the relay pushes every matching
-    /// event published from then on.
+    /// A NIP-01 `REQ` held open past `EOSE` on the relay's connection — and between calls: what is
+    /// published while no call waits is kept for the next one (`RelayLink::watch`).
     fn watch(&self, topics: &[Topic], wait: Duration) -> Result<Vec<Vec<u8>>, ChannelError> {
-        let deadline = std::time::Instant::now() + wait;
-        let mut ws = self.connect()?;
-        let sub = "omni-watch";
         let ids: Vec<String> = topics.iter().map(Topic::id).collect();
-        let filter = serde_json::json!({
-            "kinds": [RENDEZVOUS_KIND],
-            "#d": ids,
-            "since": now_unix_secs(),
-        });
-        ws.send(Message::Text(serde_json::json!(["REQ", sub, filter]).to_string()))
-            .map_err(|e| ChannelError(format!("nostr req: {e}")))?;
-        let mut out = Vec::new();
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            set_ws_read_timeout(&ws, remaining);
-            let text = match ws.read() {
-                Ok(Message::Text(text)) => text,
-                Ok(Message::Ping(payload)) => {
-                    let _ = ws.send(Message::Pong(payload));
-                    continue;
-                }
-                Ok(Message::Close(_)) | Err(_) => break, // closed, or the wait ran out
-                Ok(_) => continue,
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-            let Some(parts) = value.as_array() else { continue };
-            match parts.first().and_then(|v| v.as_str()) {
-                Some("EVENT") => {
-                    if let Some(bytes) = parts
-                        .get(2)
-                        .and_then(|e| e.get("content"))
-                        .and_then(|c| c.as_str())
-                        .and_then(from_hex)
-                    {
-                        out.push(bytes);
-                        break;
-                    }
-                }
-                // Stored events end here; the live ones follow — keep waiting.
-                Some("EOSE") => {}
-                Some("CLOSED") | Some("NOTICE") => break,
-                _ => {}
-            }
+        self.link().watch(&ids, wait)
+    }
+
+    fn release_watch(&self, topics: &[Topic]) {
+        if let Some(link) = self.link.get() {
+            let ids: Vec<String> = topics.iter().map(Topic::id).collect();
+            link.release(&ids);
         }
-        let _ = ws.send(Message::Text(serde_json::json!(["CLOSE", sub]).to_string()));
-        let _ = ws.close(None);
-        Ok(out)
+    }
+
+    fn connections_opened(&self) -> Option<u64> {
+        Some(self.connections.load(Ordering::Relaxed))
     }
 }
 
-/// Bound the next blocking read on the websocket's TCP socket.
-fn set_ws_read_timeout(ws: &WebSocket<MaybeTlsStream<TcpStream>>, timeout: Duration) {
-    let socket = match ws.get_ref() {
-        MaybeTlsStream::Plain(socket) => socket,
-        MaybeTlsStream::Rustls(stream) => stream.get_ref(),
-        _ => return,
-    };
-    let _ = socket.set_read_timeout(Some(timeout.max(Duration::from_millis(1))));
+#[cfg(test)]
+fn signed_event(topic_d: &str, content: &str, expires_at: u64) -> serde_json::Value {
+    signed_event_by(&ephemeral_signing_key(), topic_d, content, expires_at)
 }
 
 /// Build + sign a NIP-01 event carrying `content` under the `d`-tag `topic_d`, with a FRESH ephemeral
@@ -249,58 +156,6 @@ fn set_ws_read_timeout(ws: &WebSocket<MaybeTlsStream<TcpStream>>, timeout: Durat
 /// `expires_at` (unix seconds) goes into a NIP-40 `expiration` tag: a relay that supports it stops
 /// serving the event then and may delete it — a beacon does not pile up on the relay, or in its
 /// public archive, after it stopped meaning anything.
-/// The stored events a `REQ` under `sub` returns, up to its end (`EOSE`). `false` with them: the
-/// connection is gone (closed, timed out), so no further `REQ` can go over it.
-fn read_stored_events(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, sub: &str) -> (Vec<Vec<u8>>, bool) {
-    let mut out = Vec::new();
-    for _ in 0..(MAX_EVENTS + 8) {
-        let msg = match ws.read() {
-            Ok(m) => m,
-            Err(_) => return (out, false), // read timeout / closed → done
-        };
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Ping(p) => {
-                let _ = ws.send(Message::Pong(p));
-                continue;
-            }
-            Message::Close(_) => return (out, false),
-            _ => continue,
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        let Some(parts) = value.as_array() else { continue };
-        // Another subscription's late message (an EVENT after we stopped at the limit): not ours.
-        if parts.get(1).and_then(|v| v.as_str()).is_some_and(|got| got != sub) {
-            continue;
-        }
-        match parts.first().and_then(|v| v.as_str()) {
-            Some("EVENT") => {
-                if let Some(bytes) = parts
-                    .get(2)
-                    .and_then(|e| e.get("content"))
-                    .and_then(|c| c.as_str())
-                    .and_then(from_hex)
-                {
-                    out.push(bytes);
-                    if out.len() >= MAX_EVENTS {
-                        return (out, true);
-                    }
-                }
-            }
-            // End of stored events (NIP-15) — we have everything the relay holds.
-            Some("EOSE") | Some("CLOSED") => return (out, true),
-            Some("NOTICE") => return (out, false),
-            _ => {}
-        }
-    }
-    (out, true)
-}
-
-#[cfg(test)]
-fn signed_event(topic_d: &str, content: &str, expires_at: u64) -> serde_json::Value {
-    signed_event_by(&ephemeral_signing_key(), topic_d, content, expires_at)
-}
-
 fn signed_event_by(signing: &SigningKey, topic_d: &str, content: &str, expires_at: u64) -> serde_json::Value {
     let pubkey = to_hex(&signing.verifying_key().to_bytes());
     let created_at = now_unix_secs();
@@ -368,7 +223,7 @@ fn now_unix_secs() -> u64 {
 }
 
 /// Parse `wss://host[:port][/path]` / `ws://…` into `(host, port, is_tls)` (default port 443/80).
-fn parse_ws_url(url: &str) -> Result<(String, u16, bool), ChannelError> {
+pub(crate) fn parse_ws_url(url: &str) -> Result<(String, u16, bool), ChannelError> {
     let (tls, rest) = if let Some(r) = url.strip_prefix("wss://") {
         (true, r)
     } else if let Some(r) = url.strip_prefix("ws://") {
@@ -451,6 +306,7 @@ mod tests {
             node: [3u8; 20],
             reflexive: vec!["198.51.100.9:7777".into()],
             tcp_direct: vec![],
+            tcp_punch: None,
             nat_type: NatType::Public,
             ts_ms: now,
             ttl_secs: 300,

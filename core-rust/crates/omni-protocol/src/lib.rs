@@ -3,6 +3,7 @@ pub(crate) use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 mod crypto;
 mod group_call;
 mod group_wire;
+mod workspace_files;
 mod identity;
 mod screen_control;
 mod validation_attachments;
@@ -14,6 +15,7 @@ mod versions;
 pub use crypto::*;
 pub use group_call::*;
 pub use group_wire::*;
+pub use workspace_files::*;
 pub use identity::*;
 pub use screen_control::*;
 pub use omni_types::SessionBootstrapMessageV1;
@@ -341,6 +343,7 @@ mod tests {
     #[test]
     fn stage8_chat_text_rejects_oversized_fields() {
         let oversized_id = ChatTextV1 {
+            reply_to: None,
             message_id: "a".repeat(CHAT_MESSAGE_ID_MAX_BYTES + 1),
             body: "ok".to_string(),
             created_at_unix_ms: 1_000,
@@ -349,6 +352,7 @@ mod tests {
         assert!(error.to_string().contains("message_id"));
 
         let oversized_body = ChatTextV1 {
+            reply_to: None,
             message_id: "msg-1".to_string(),
             body: "b".repeat(CHAT_BODY_MAX_BYTES + 1),
             created_at_unix_ms: 1_000,
@@ -367,6 +371,7 @@ mod tests {
             nonce_hex: "11".repeat(12),
             ciphertext_hex: "ff".repeat(ENCRYPTED_PAYLOAD_CIPHERTEXT_MAX_BYTES + 1),
             mac_hex: "22".repeat(16),
+            header_mac_hex: None,
         };
 
         let error = validate_encrypted_payload_v1(&payload).unwrap_err();
@@ -377,6 +382,7 @@ mod tests {
     #[test]
     fn stage8_attachment_offer_rejects_large_metadata() {
         let oversized_name = AttachmentOfferV1 {
+            reply_to: None,
             message_id: "msg-1".to_string(),
             body: "hi".to_string(),
             file_name: "a".repeat(ATTACHMENT_FILE_NAME_MAX_BYTES + 1),
@@ -408,6 +414,7 @@ mod tests {
             protocol_version: OMNI_PROTOCOL_VERSION_V1,
             payload: WirePayloadV1::LogicalEvent(LogicalEventEnvelopeV1::attachment_offer(
                 AttachmentOfferV1 {
+                    reply_to: None,
                     message_id: "msg-1".to_string(),
                     body: "b".repeat(CONTROL_PLANE_WIRE_ENVELOPE_MAX_BYTES),
                     file_name: "test.bin".to_string(),

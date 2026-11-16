@@ -46,6 +46,39 @@ public sealed partial class MainWindow
         }
     }
 
+    /// The header read OFF the UI thread (a section switch: the read took ~350 ms and froze the switch),
+    /// applied only if the same dialog is still open.
+    private async void RefreshChatHeaderSummaryAsync()
+    {
+        string? dialogKey = GetResolvedCurrentDialogKey();
+        if (string.IsNullOrWhiteSpace(dialogKey))
+        {
+            ClearChatHeaderSummaryState();
+            return;
+        }
+
+        try
+        {
+            ChatHeaderRefreshPayload? payload = await System.Threading.Tasks.Task.Run(() =>
+            {
+                ChatHeaderRefreshPayload? read = chatRefreshService.FetchHeader(rustBridge, dialogKey, CancellationToken.None);
+                ReadMeshConnectionState();
+                return read;
+            });
+            if (payload is not null && GetResolvedCurrentDialogKey() == dialogKey)
+            {
+                ApplyChatHeaderRefreshPayload(payload);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (GetResolvedCurrentDialogKey() == dialogKey)
+            {
+                ApplyChatHeaderRefreshFailure(ex);
+            }
+        }
+    }
+
     private void ClearChatHeaderSummaryState()
     {
         WithSelectionSyncSuppressed(ref suppressChatSelectionSync, () =>
@@ -178,6 +211,15 @@ public sealed partial class MainWindow
             subtitle = $"{subtitle} · {routeWords}";
         }
 
+        // No link: the line under the name says why and what happens («Ищу собеседника в сети…»), in
+        // place of a bare «Офлайн» over a separate status strip (docs/decisions/omni-app-ux.md §4:
+        // the connection status lives in the header; owner, 2026-11-03: «строку со статусом можно и
+        // выше перенести»).
+        if (!online && !string.IsNullOrWhiteSpace(linkLine))
+        {
+            subtitle = linkLine.TrimStart('⏳', ' ');
+        }
+
         string? trustWords = DescribeHeaderTrustProblem(currentChatHeaderSummary.ContactCard?.TrustState);
         ChatIdentitySubtitleTextBlock.Text = trustWords is null ? subtitle : $"{subtitle} · {trustWords}";
         ToolTipService.SetToolTip(ChatIdentitySubtitleTextBlock, linkLine);
@@ -187,7 +229,8 @@ public sealed partial class MainWindow
         // [reason]) for the current contact; fall back to the security/session-derived status when
         // there's no resolvable contact. See docs/decisions/omni-network-model.md.
         ChatConnectionStatusTextBlock.Text = linkLine ?? connectionSecurityStatus;
-        ChatConnectionStatusTextBlock.Visibility = online ? Visibility.Collapsed : Visibility.Visible;
+        // Said in the header now; the strip under it is for trust warnings only.
+        ChatConnectionStatusTextBlock.Visibility = Visibility.Collapsed;
         // "Подключиться" — the explicit twin of the auto reconnect-on-open nudge. Shown only when
         // this is an approved contact with a remote account that has no live mesh link right now
         // (offline / still searching), so the user can force an immediate rendezvous re-find instead
@@ -242,7 +285,7 @@ public sealed partial class MainWindow
 
         try
         {
-            MeshConnectionStateDto state = rustBridge.MeshConnectionState();
+            MeshConnectionStateDto state = MeshStateForScreen();
             ContactConnectionDto? contact = state.Contacts
                 .FirstOrDefault(c => string.Equals(c.AccountId, remoteAccountId, StringComparison.Ordinal));
             if (contact is null)
@@ -284,13 +327,15 @@ public sealed partial class MainWindow
         string carrier = FormatCarrier(contact.Carrier);
         return contact.Link switch
         {
-            "online_direct" => $"● Онлайн, напрямую{carrier}{unverified}",
+            "online_direct" => $"● В сети, напрямую{carrier}{unverified}",
             "online_via_relay" => contact.RelayHops is int hops
-                ? $"◐ Онлайн, через сеть ({hops} {HopWord(hops)}){carrier}{unverified}"
-                : $"◐ Онлайн, через сеть{carrier}{unverified}",
+                ? $"◐ В сети, через сеть ({hops} {HopWord(hops)}){carrier}{unverified}"
+                : $"◐ В сети, через сеть{carrier}{unverified}",
             "searching" => FormatSearchingStage(nodeKind),
             "will_deliver_later" => "✉ Доставлю, когда появится",
-            "cannot_reach" => $"⚠ {FormatCannotReachReason(contact.CannotReachReason)}",
+            "cannot_reach" => contact.CannotReachReason == "no_common_address_family"
+                ? $"⚠ {MainWindowPresentation.FormatAddressFamilyGap(contact.AddressFamilyGap)}"
+                : $"⚠ {FormatCannotReachReason(contact.CannotReachReason)}",
             _ => string.Empty,
         };
     }
@@ -313,18 +358,29 @@ public sealed partial class MainWindow
     // the honest connection-state DTO. The presence dot uses this as the single source of "online"
     // (green) — so the dot can't say green while the link is actually down (a peer that went offline).
     // One FFI read per render; empty on any error (mesh not started / transient).
-    private HashSet<string> CurrentlyLinkedAccountIds()
+    private HashSet<string> CurrentlyLinkedAccountIds() => LinkedAccountIdsOf(CurrentMeshContacts());
+
+    private static HashSet<string> LinkedAccountIdsOf(IReadOnlyDictionary<string, ContactConnectionDto> contacts)
+        => contacts.Values
+            .Where(c => c.Link is "online_direct" or "online_via_relay")
+            .Select(c => c.AccountId)
+            .ToHashSet(StringComparer.Ordinal);
+
+    // Every contact's connection state by account id — one FFI read; empty on any error, as above.
+    private Dictionary<string, ContactConnectionDto> CurrentMeshContacts()
     {
         try
         {
-            return rustBridge.MeshConnectionState().Contacts
-                .Where(c => c.Link is "online_direct" or "online_via_relay")
-                .Select(c => c.AccountId)
-                .ToHashSet(StringComparer.Ordinal);
+            Dictionary<string, ContactConnectionDto> byAccount = new(StringComparer.Ordinal);
+            foreach (ContactConnectionDto contact in MeshStateForScreen().Contacts)
+            {
+                byAccount[contact.AccountId] = contact;
+            }
+            return byAccount;
         }
         catch
         {
-            return new HashSet<string>(StringComparer.Ordinal);
+            return new Dictionary<string, ContactConnectionDto>(StringComparer.Ordinal);
         }
     }
 
@@ -347,13 +403,12 @@ public sealed partial class MainWindow
         UpdateChatStatusBarVisibility();
     }
 
-    // The bar under the header is for trouble only (no link, a warning, "Подключиться"): a
+    // The bar under the header is for trouble only (a warning; «Подключиться» is in the header): a
     // working chat shows none of it, not an empty strip with a rule.
     private void UpdateChatStatusBarVisibility()
     {
         bool any = ChatConnectionStatusTextBlock.Visibility == Visibility.Visible
-            || ChatTrustWarningTextBlock.Visibility == Visibility.Visible
-            || ReconnectContactButton.Visibility == Visibility.Visible;
+            || ChatTrustWarningTextBlock.Visibility == Visibility.Visible;
         ChatHeaderStatusBarBorder.Visibility = ChatHeaderGrid.Visibility == Visibility.Visible && any
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -381,12 +436,18 @@ public sealed partial class MainWindow
     private void RefreshSelectedContactConnection(long nowUnixMs)
     {
         ContactSnapshot? selected = selectedContactCard?.Contact;
+        Dictionary<string, ContactConnectionDto> connections = selected is null ? [] : CurrentMeshContacts();
         SelectedContactSubtitleTextBlock.Text = selected is null
-            ? contactItems.Count == 0 ? "Добавьте первого — по приглашению, коду связи или Omni-ID." : "Слева — все ваши контакты."
-            : MainWindowPresentation.BuildContactStatus(selected, nowUnixMs, CurrentlyLinkedAccountIds());
+            ? contactItems.Count == 0 ? "Добавьте первого — по приглашению или Omni-ID." : "Слева — все ваши контакты."
+            : MainWindowPresentation.BuildContactStatus(
+                selected,
+                nowUnixMs,
+                LinkedAccountIdsOf(connections),
+                selected.RemoteAccountId is { } selectedAccount ? connections.GetValueOrDefault(selectedAccount) : null);
         SelectedContactConnectionTextBlock.Text = string.Empty;
         SelectedContactConnectionDetailTextBlock.Text = string.Empty;
         SelectedContactConnectionTraceTextBlock.Text = string.Empty;
+        selectedContactCouriersToAllow = [];
         string? accountId = selected?.RemoteAccountId;
         try
         {
@@ -395,7 +456,7 @@ public sealed partial class MainWindow
                 return;
             }
 
-            MeshConnectionStateDto state = rustBridge.MeshConnectionState();
+            MeshConnectionStateDto state = MeshStateForScreen();
             ContactConnectionDto? contact = state.Contacts
                 .FirstOrDefault(c => string.Equals(c.AccountId, accountId, StringComparison.Ordinal));
             if (contact is null)
@@ -419,6 +480,7 @@ public sealed partial class MainWindow
                     ? linkLine.TrimStart('⏳', '✉', '⚠', ' ')
                     : string.Empty;
             SelectedContactConnectionTextBlock.Text = $"{connection}{FormatCourierGap(contact)}".Trim();
+            selectedContactCouriersToAllow = contact.CouriersToAllow ?? [];
             SelectedContactConnectionDetailTextBlock.Text = string.IsNullOrEmpty(linkLine) ? string.Empty : $"Соединение: {linkLine}";
             SelectedContactConnectionTraceTextBlock.Text = FormatConnectionTrace(contact.Trace);
         }
@@ -428,6 +490,7 @@ public sealed partial class MainWindow
         }
         finally
         {
+            SelectedContactAllowCourierButton.Visibility = selectedContactCouriersToAllow.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
             SelectedContactConnectionTextBlock.Visibility = string.IsNullOrEmpty(SelectedContactConnectionTextBlock.Text)
                 ? Visibility.Collapsed
                 : Visibility.Visible;
@@ -455,8 +518,32 @@ public sealed partial class MainWindow
 
         string hint = contact.CouriersToEnable is { Count: > 0 } urls
             ? " Включите в «Настройки → Как вас находят»: " + string.Join(", ", urls.Select(CourierHost)) + "."
-            : " У вас нет способа встречи, которым пользуется этот контакт.";
+            : contact.CouriersToAllow is { Count: > 0 } theirs
+                // V-13: its server learns our address and when we look — so only on a yes.
+                ? " Контакт встречается через свой сервер " + string.Join(", ", theirs.Select(CourierHost))
+                    + ". Разрешите — и этот сервер увидит ваш адрес и время, когда вы ищете друг друга."
+                : " У вас нет способа встречи, которым пользуется этот контакт.";
         return "\n⚠ Нет общего способа встречи с этим контактом — найти друг друга получится, только пока вы уже соединены." + hint;
+    }
+
+    // The servers the open contact's card asks to allow (V-13), as of its last refresh.
+    private IReadOnlyList<string> selectedContactCouriersToAllow = [];
+
+    private void OnAllowContactCourierClicked(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            foreach (string url in selectedContactCouriersToAllow)
+            {
+                rustBridge.AllowContactCourier(url);
+            }
+        }
+        catch (Exception ex)
+        {
+            ContactManagementStatusTextBlock.Text = $"Не удалось разрешить сервер: {ex.Message}";
+        }
+
+        RefreshSelectedContactConnection(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
     private static string CourierHost(string url) =>
@@ -517,7 +604,7 @@ public sealed partial class MainWindow
     // verification_failed.
     private static string FormatCannotReachReason(string? reason) => reason switch
     {
-        "peer_offline" => "Контакт офлайн — сообщения доставлю позже",
+        "peer_offline" => "Контакт не в сети — сообщения доставлю позже",
         "no_route_both_unreachable" => "Напрямую не соединиться: у обоих закрытые сети — нужен релей",
         "rendezvous_disabled" => "Режим «только прямое» — обменяйтесь кодом связи",
         "address_stale" => "Адрес устарел, ищу заново…",

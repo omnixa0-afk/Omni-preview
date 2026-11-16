@@ -45,6 +45,54 @@ impl Storage {
         Ok(())
     }
 
+    /// A line handed over by a sync (`line_id`, authored at `through_unix_ms`) counts as read — unless an
+    /// incoming line older than it is unread still. The mark is one time per chat: moved past such a
+    /// line, it read that line too, and a message nobody had opened lost its counter to history coming
+    /// back (blind audit 2026-11-11, F6). Then the line handed over counts as unread itself.
+    pub fn mark_dialog_read_through_history_line(
+        &self,
+        dialog_key: &str,
+        through_unix_ms: i64,
+        line_id: &str,
+    ) -> OmniResult<()> {
+        // A line dated ahead of our clock moves nothing: a contact's history line dated minutes
+        // ahead marked read what really came later, before that time (blind audit 2026-11-13,
+        // pass 22). It counts as unread itself.
+        if through_unix_ms > current_unix_ms() {
+            return Ok(());
+        }
+        let profile_id = self.resolve_transition_profile_id()?;
+        let dialog_key = normalize_dialog_key(dialog_key);
+        let unread_before: i64 = self
+            .connection
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM messages m
+                WHERE m.profile_id = ?1
+                  AND m.dialog_key = ?2
+                  AND m.created_at_unix_ms > COALESCE(
+                      (SELECT read_through_unix_ms FROM dialog_read_marks r
+                       WHERE r.profile_id = ?1 AND r.dialog_key = ?2),
+                      0)
+                  AND m.created_at_unix_ms <= ?3
+                  AND m.id <> ?4
+                  AND m.direction = 'incoming'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM group_message_meta g
+                      WHERE g.profile_id = ?1 AND g.message_id = m.id AND g.kind = 'system'
+                  )
+                ",
+                params![profile_id.0, dialog_key, through_unix_ms, line_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        if unread_before > 0 {
+            return Ok(());
+        }
+        self.mark_dialog_read_through(&dialog_key, through_unix_ms)
+    }
+
     /// Unread lines of one chat. Walks the (profile, dialog, created) index from the mark, so it costs
     /// the unread lines, not the history.
     pub fn count_unread_in_dialog(&self, dialog_key: &str) -> OmniResult<u32> {

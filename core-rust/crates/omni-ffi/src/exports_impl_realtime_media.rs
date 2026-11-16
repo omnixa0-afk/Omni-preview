@@ -45,10 +45,14 @@ fn parse_dialog_key_bytes(ptr: *const u8, len: usize) -> OmniResult<&'static str
 /// call (a receiver still being built on a worker when the call stops) then calls into a missing
 /// entry and is ignored, instead of into freed memory.
 ///
+/// The app is named by its id in [`live_media_apps`], not by a pointer: the engine's threads may
+/// still send when the shell frees the app (its media teardown has a time limit), and a send then
+/// either finishes before the app goes or finds no app (code audit 2026-11-09, OMNI-01).
+///
 /// Before 2026-09-26 the shell drained the engine's queue on a timer and sent batches; see
 /// docs/bugs/media-rode-the-shells-timer.md.
 pub struct RealtimeMediaPacketTarget {
-    handle: *mut OmniAppHandle,
+    app_id: u64,
     route: omni_app::RealtimeMediaRoute,
     /// Stand knob: drop this share of outgoing packets before they reach the core
     /// (`OMNI_MEDIA_TEST_PACKET_LOSS_PERCENT`, 0..=100). Read once, at creation.
@@ -59,11 +63,32 @@ pub struct RealtimeMediaPacketTarget {
     test_dropped: std::sync::atomic::AtomicU64,
 }
 
-// SAFETY: `handle` points at the app, which outlives every call's media path (the shell destroys
-// the target before it releases the app), and the per-packet path only reaches state behind its
-// own locks (see `OmniApp::send_realtime_media_packet`).
-unsafe impl Send for RealtimeMediaPacketTarget {}
-unsafe impl Sync for RealtimeMediaPacketTarget {}
+/// Live apps the media send path may reach: id → the handle's address. An app is in it from
+/// `omni_app_init` until `omni_app_free`, which takes it out under the write lock before the app
+/// goes: a send holds the read lock for as long as it uses the app.
+type LiveMediaApps = parking_lot::RwLock<std::collections::HashMap<u64, usize>>;
+
+fn live_media_apps() -> &'static LiveMediaApps {
+    static APPS: std::sync::OnceLock<LiveMediaApps> = std::sync::OnceLock::new();
+    APPS.get_or_init(Default::default)
+}
+
+/// A new app's id in [`live_media_apps`]: never reused, so a target of a freed app never reaches
+/// another app that got the same address.
+fn next_media_app_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn register_media_app(app_id: u64, handle: *mut OmniAppHandle) {
+    live_media_apps().write().insert(app_id, handle as usize);
+}
+
+/// The app is about to go: waits for the sends in flight, and its targets go with it.
+fn release_media_app(app_id: u64) {
+    live_media_apps().write().remove(&app_id);
+    packet_targets().write().retain(|_, target| target.app_id != app_id);
+}
 
 impl RealtimeMediaPacketTarget {
     /// xorshift64 — a stand knob needs spread, not quality.
@@ -95,8 +120,16 @@ impl RealtimeMediaPacketTarget {
             self.test_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // SAFETY: see the Send/Sync note — the app outlives the target.
-        let app = unsafe { &(*self.handle).inner };
+        // Held for the whole send: `omni_app_free` waits for it before the app goes. A plain (fair)
+        // read — a free waiting for the write lock is not starved by a pacer that keeps sending.
+        let apps = live_media_apps().read();
+        let Some(&handle) = apps.get(&self.app_id) else {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        // SAFETY: the app is in `live_media_apps`, and it leaves (in `omni_app_free`, before the
+        // handle is dropped) only once no send holds the read lock.
+        let app = unsafe { &(*(handle as *mut OmniAppHandle)).inner };
         match app.send_realtime_media_packet(&self.route, packet) {
             Ok(()) => self.accepted.fetch_add(1, Ordering::Relaxed),
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed),
@@ -164,10 +197,13 @@ fn realtime_media_packet_target_create_impl(
     }
     unsafe { *out_target_id = 0 };
     let dialog_key = parse_dialog_key_bytes(dialog_key, dialog_key_len)?;
-    let route = require_handle(handle)?.inner.realtime_media_route(dialog_key)?;
+    let guard = require_handle(handle)?;
+    let route = guard.inner.realtime_media_route(dialog_key)?;
+    let app_id = guard.media_app_id;
+    drop(guard);
     let seed = (current_unix_ms_for_ffi() as u64) | 1;
     let target = std::sync::Arc::new(RealtimeMediaPacketTarget {
-        handle,
+        app_id,
         route,
         test_loss_percent: read_test_loss_percent(),
         test_rng: std::sync::atomic::AtomicU64::new(seed),

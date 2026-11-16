@@ -26,6 +26,22 @@ pub extern "C" fn omni_trace_write(category: *const c_char, message: *const c_ch
     }));
 }
 
+/// Turn the trace sink on, writing to `path`, or off (null or empty `path`) — the settings switch
+/// «Журнал для разработчика». Takes effect for the next line, no restart. Never panics across the
+/// boundary.
+#[no_mangle]
+// FFI fn: C caller owns pointer validity; null-checked + catch_unwind. See `omni_app_free`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn omni_trace_set_file(path: *const c_char) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let path = (!path.is_null())
+            .then(|| unsafe { CStr::from_ptr(path) }.to_string_lossy().trim().to_string())
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from);
+        omni_net_primitives::trace::set_trace_file(path);
+    }));
+}
+
 /// One record per line, three tab-separated fields: a newline or a tab inside a shell field (an
 /// exception text, say) would split the record or shift its columns, so they become spaces.
 fn shell_trace_fields(category: &str, message: &str) -> (String, String) {

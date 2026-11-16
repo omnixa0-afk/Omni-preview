@@ -22,9 +22,8 @@ mod tests {
         omni_chat_get_message_delta, omni_chat_get_message_refresh_summary,
         omni_chat_get_message_security_details, omni_chat_get_security_summary,
         omni_configure_platform_secret_wrap_key_hex,
-        omni_contacts_add_by_identifier, omni_contacts_add_from_payload,
+        omni_contacts_add_from_payload,
         omni_contacts_get_card_revision,
-        omni_contacts_request_by_identifier,
         omni_contacts_attach_dialog_to_contact,
         omni_contacts_confirm_verification, omni_contacts_get_card,
         omni_contacts_get_verification_state, omni_contacts_list, omni_identity_create_account,
@@ -51,12 +50,38 @@ mod tests {
         omni_realtime_media_packet_target_counters, omni_realtime_media_packet_target_create,
         omni_realtime_media_packet_target_destroy,
         omni_string_free,
-        AddContactByIdentifierRequest, AddContactFromPayloadRequest,
-        RequestContactByIdentifierRequest,
+        AddContactFromPayloadRequest,
         ConfirmContactVerificationRequest, ContactIdRequest, CreateAccountRequest,
         DialogKeyRequest, MessageIdRequest,
         RevealCurrentProfileRecoveryPhraseWithPasswordRequest, SetLocalProfilePasswordRequest,
     };
+
+    // A contact known only by its account id, with no keys or addresses — the fixture these tests
+    // start from. The shell has no such path: a contact arrives from an invite, a search by Omni-ID
+    // or a contact payload, each with its keys.
+    fn test_contact_input(account_id: &str, petname: &str, display_name: &str) -> omni_identity::AddContactInput {
+        omni_identity::AddContactInput {
+            petname: petname.to_string(),
+            remote_account_id: Some(omni_identity::AccountId(account_id.to_string())),
+            public_display_name: Some(display_name.to_string()),
+            remote_instance_id: None,
+            primary_dialog_key: None,
+            initial_observation: None,
+        }
+    }
+
+    fn add_test_contact(
+        handle: *mut super::OmniAppHandle,
+        account_id: &str,
+        petname: &str,
+        display_name: &str,
+    ) -> *mut std::os::raw::c_char {
+        super::to_result_payload(super::require_handle(handle).and_then(|handle| {
+            handle
+                .inner
+                .add_contact(&test_contact_input(account_id, petname, display_name))
+        }))
+    }
 
     fn create_account_response_account(value: &serde_json::Value) -> &serde_json::Value {
         &value["account"]
@@ -78,7 +103,7 @@ mod tests {
     fn ffi_init_and_ping_work() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-0-ffi-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -146,13 +171,13 @@ mod tests {
 
     #[test]
     fn ffi_embedded_daemon_serves_the_handles_core() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufRead, Write};
         use std::net::TcpStream;
         use std::time::Duration;
 
         let db_path = std::env::temp_dir()
             .join("omni-embedded-daemon-ffi-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
             escape_json_string(&db_path.to_string_lossy())
@@ -161,35 +186,60 @@ mod tests {
         let handle = omni_app_init(config_cstring.as_ptr());
         assert!(!handle.is_null());
 
-        // Start the embedded daemon on a localhost TCP endpoint against THIS handle's core.
-        let endpoint = CString::new("127.0.0.1:47811").unwrap();
+        // Start the embedded daemon on a localhost TCP endpoint against THIS handle's core. TCP is
+        // served only with a token the starter set (V-11); the shell itself uses a pipe.
+        std::env::set_var(omni_daemon::TOKEN_ENV, "ffi-test-token");
+        // A free port, not the daemon's default: a dev daemon running on this machine holds that one,
+        // and since the start reports a failed bind (blind audit 2026-11-10, E10) the test failed
+        // whenever one was up.
+        let free_port = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let listen_at = format!("127.0.0.1:{}", free_port());
+        let endpoint = CString::new(listen_at.clone()).unwrap();
         let started_ptr = omni_daemon_start(handle, endpoint.as_ptr());
         let started = unsafe { CStr::from_ptr(started_ptr) }.to_str().unwrap().to_string();
         omni_string_free(started_ptr);
         assert!(started.contains("\"ok\":true"), "start should succeed: {started}");
 
-        // One listener per process: a second start only points it at the handle again.
-        let again_ptr = omni_daemon_start(handle, endpoint.as_ptr());
+        // One listener per process: a second start only points it at the handle again — and says
+        // where the daemon really listens, whatever endpoint it named (blind audit 2026-11-10).
+        let elsewhere = CString::new(format!("127.0.0.1:{}", free_port())).unwrap();
+        let again_ptr = omni_daemon_start(handle, elsewhere.as_ptr());
         let again = unsafe { CStr::from_ptr(again_ptr) }.to_str().unwrap().to_string();
         omni_string_free(again_ptr);
         assert!(again.contains("\"ok\":true"), "second start keeps the one daemon: {again}");
+        assert!(again.contains(&listen_at), "it names where the daemon listens: {again}");
+
+        // Another core open beside it does not take the daemon from this one (blind audit
+        // 2026-11-10): only a core opened after this one was freed (a backup import) does.
+        let other_db = db_path.with_file_name(format!("{}-other.db", unique_suffix()));
+        let other_config = CString::new(format!(r#"{{"db_path":"{}"}}"#, escape_json_string(&other_db.to_string_lossy()))).unwrap();
+        let other = omni_app_init(other_config.as_ptr());
+        assert!(!other.is_null());
+        let taken_ptr = omni_daemon_start(other, endpoint.as_ptr());
+        let taken = unsafe { CStr::from_ptr(taken_ptr) }.to_str().unwrap().to_string();
+        omni_string_free(taken_ptr);
+        assert!(taken.contains("\"ok\":false"), "a second open core is refused: {taken}");
+        omni_app_free(other);
 
         // Connect a plain client and drive the core over the line protocol. Retry until the
         // daemon thread has bound the listener.
         let mut stream = None;
         for _ in 0..40 {
-            if let Ok(s) = TcpStream::connect("127.0.0.1:47811") {
+            if let Ok(s) = TcpStream::connect(listen_at.as_str()) {
                 stream = Some(s);
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let mut writer = stream.expect("embedded daemon should accept a connection");
-        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let stream = stream.expect("embedded daemon should accept a connection");
+        // The client proves the token first (without sending it); the channel is sealed after.
+        let (mut reader, mut writer) = omni_daemon::secure_channel::connect(stream.try_clone().unwrap(), stream, "ffi-test-token")
+            .expect("the token is proved");
+        let mut line = String::new();
 
         writeln!(writer, "create-profile DaemonTest Dev").unwrap();
         writer.flush().unwrap();
-        let mut line = String::new();
+        line.clear();
         reader.read_line(&mut line).unwrap();
         assert_eq!(line.trim(), "OK", "create-profile over the embedded daemon");
 
@@ -242,6 +292,11 @@ mod tests {
         writeln!(writer, "quit").unwrap();
         let _ = writer.flush();
         omni_app_free(second);
+        // A freed core is not taken: the daemon would read it later (blind audit 2026-11-10).
+        let freed_ptr = omni_daemon_start(second, endpoint.as_ptr());
+        let freed = unsafe { CStr::from_ptr(freed_ptr) }.to_str().unwrap().to_string();
+        omni_string_free(freed_ptr);
+        assert!(freed.contains("\"ok\":false"), "a freed core is refused: {freed}");
         std::thread::sleep(Duration::from_millis(600));
     }
 
@@ -308,7 +363,7 @@ mod tests {
     fn ffi_realtime_media_binary_pump_rejects_invalid_inputs_and_drains_empty_batch() {
         let db_path = std::env::temp_dir()
             .join("omni-realtime-media-ffi-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -405,11 +460,75 @@ mod tests {
         omni_app_free(handle);
     }
 
+    /// Blind audit 2026-11-10: `omni_app_free` dropped the core while another thread's call held it,
+    /// and a call waiting for the core's lock then read freed memory. The free waits for the call in
+    /// flight now; a call with the freed handle is refused, and a second free does nothing.
+    #[test]
+    fn freeing_the_core_waits_for_a_call_in_flight_and_refuses_later_ones() {
+        let db_path = std::env::temp_dir()
+            .join("omni-ffi-free-tests")
+            .join(format!("{}", unique_suffix())).join("omni.db");
+        let config = CString::new(format!(r#"{{"db_path":"{}"}}"#, escape_json_string(&db_path.to_string_lossy()))).unwrap();
+        let handle = omni_app_init(config.as_ptr());
+        assert!(!handle.is_null());
+        let address = handle as usize;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let call = std::thread::spawn(move || {
+            let guard = crate::require_handle(address as *mut crate::OmniAppHandle).expect("live");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            // Still the live core while the call holds it.
+            let _ = guard.inner.ping();
+        });
+        held_rx.recv().unwrap();
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let freed_flag = std::sync::Arc::clone(&freed);
+        let free = std::thread::spawn(move || {
+            omni_app_free(address as *mut crate::OmniAppHandle);
+            freed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!freed.load(std::sync::atomic::Ordering::SeqCst), "the free waits for the call in flight");
+        release_tx.send(()).unwrap();
+        call.join().unwrap();
+        free.join().unwrap();
+        assert!(freed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::require_handle(handle).is_err(), "a call with the freed handle is refused");
+        omni_app_free(handle);
+    }
+
+    #[test]
+    fn a_media_send_after_the_app_is_freed_reaches_no_app() {
+        // Code audit 2026-11-09, OMNI-01: the engine's thread had the target in hand (an Arc taken
+        // from the table) when the shell freed the app — its send used to read the freed handle.
+        let db_path = std::env::temp_dir()
+            .join("omni-realtime-media-ffi-tests")
+            .join(format!("{}", unique_suffix())).join("omni.db");
+        let config = CString::new(format!(r#"{{"db_path":"{}"}}"#, escape_json_string(&db_path.to_string_lossy()))).unwrap();
+        let handle = omni_app_init(config.as_ptr());
+        assert!(!handle.is_null());
+        let group_dialog = b"group:ffi-media-free";
+        let mut target = 0_u64;
+        let error_ptr = omni_realtime_media_packet_target_create(handle, group_dialog.as_ptr(), group_dialog.len(), &mut target);
+        assert!(error_ptr.is_null());
+        let in_hand = crate::packet_target(target).expect("the target is in the table");
+        in_hand.send(&[1_u8; 8]);
+        assert_eq!(in_hand.accepted.load(std::sync::atomic::Ordering::Relaxed), 1, "while the app lives, a send reaches it");
+
+        omni_app_free(handle);
+        in_hand.send(&[1_u8; 8]);
+        assert_eq!(in_hand.refused.load(std::sync::atomic::Ordering::Relaxed), 1, "after the free, a send finds no app");
+        assert!(crate::packet_target(target).is_none(), "the app's targets go with it");
+        // The engine's late packet by the old context: ignored, no crash.
+        omni_realtime_media_packet_sink(target as usize as *mut std::ffi::c_void, [1_u8; 8].as_ptr(), 8);
+    }
+
     #[test]
     fn ffi_send_text_disconnected_still_persists_queued_message_history() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-ffi-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -431,16 +550,7 @@ mod tests {
         let created_ptr = omni_identity_create_account(handle, create_request.as_ptr());
         omni_string_free(created_ptr);
 
-        let contact_request = CString::new(
-            serde_json::to_string(&AddContactByIdentifierRequest {
-                account_id: "acct-ffi-remote".to_string(),
-                petname: "FFI Remote".to_string(),
-                public_display_name: Some("FFI Remote".to_string()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let contact_ptr = omni_contacts_add_by_identifier(handle, contact_request.as_ptr());
+        let contact_ptr = add_test_contact(handle, "acct-ffi-remote", "FFI Remote", "FFI Remote");
         let contact_json = unsafe { CStr::from_ptr(contact_ptr) }
             .to_str()
             .expect("contact response should be valid utf-8")
@@ -506,7 +616,7 @@ mod tests {
     fn ffi_queue_endpoints_expose_stage3_snapshots() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-ffi-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -527,16 +637,7 @@ mod tests {
         let created_ptr = omni_identity_create_account(handle, create_request.as_ptr());
         omni_string_free(created_ptr);
 
-        let contact_request = CString::new(
-            serde_json::to_string(&AddContactByIdentifierRequest {
-                account_id: "acct-ffi-queued".to_string(),
-                petname: "FFI Queue".to_string(),
-                public_display_name: Some("FFI Queue".to_string()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let contact_ptr = omni_contacts_add_by_identifier(handle, contact_request.as_ptr());
+        let contact_ptr = add_test_contact(handle, "acct-ffi-queued", "FFI Queue", "FFI Queue");
         let contact_json = unsafe { CStr::from_ptr(contact_ptr) }
             .to_str()
             .expect("contact response should be valid utf-8")
@@ -607,7 +708,7 @@ mod tests {
     fn ffi_identity_endpoints_expose_stage4_snapshots() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-ffi-tests")
-            .join(format!("identity-{}.db", unique_suffix()));
+            .join(format!("identity-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -673,7 +774,7 @@ mod tests {
     fn ffi_create_account_is_sanitized_and_reveal_requires_password() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-ffi-tests")
-            .join(format!("sanitized-reveal-{}.db", unique_suffix()));
+            .join(format!("sanitized-reveal-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -754,10 +855,10 @@ mod tests {
     fn ffi_restore_account_from_input_supports_mnemonic_v2() {
         let source_db_path = std::env::temp_dir()
             .join("omni-stage-4-ffi-tests")
-            .join(format!("source-mnemonic-{}.db", unique_suffix()));
+            .join(format!("source-mnemonic-{}", unique_suffix())).join("omni.db");
         let target_db_path = std::env::temp_dir()
             .join("omni-stage-4-ffi-tests")
-            .join(format!("target-mnemonic-{}.db", unique_suffix()));
+            .join(format!("target-mnemonic-{}", unique_suffix())).join("omni.db");
 
         let source_config = CString::new(format!(
             r#"{{"db_path":"{}"}}"#,
@@ -821,7 +922,7 @@ mod tests {
     fn ffi_recovery_preview_and_reopen_contracts_are_wired() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-ffi-tests")
-            .join(format!("recovery-preview-{}.db", unique_suffix()));
+            .join(format!("recovery-preview-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -906,7 +1007,7 @@ mod tests {
     fn ffi_current_profile_lifecycle_contract_endpoints_are_wired() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-ffi-tests")
-            .join(format!("lifecycle-{}.db", unique_suffix()));
+            .join(format!("lifecycle-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -978,7 +1079,7 @@ mod tests {
     fn ffi_explicit_sign_out_profile_contract_is_wired() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-ffi-tests")
-            .join(format!("explicit-signout-{}.db", unique_suffix()));
+            .join(format!("explicit-signout-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -1049,7 +1150,7 @@ mod tests {
     fn ffi_active_profile_selection_contract_is_wired() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-ffi-tests")
-            .join(format!("active-profile-{}.db", unique_suffix()));
+            .join(format!("active-profile-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -1139,7 +1240,7 @@ mod tests {
     fn ffi_final_stage13_profile_registry_and_footprint_contract_is_wired() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-ffi-tests")
-            .join(format!("final-stage13-{}.db", unique_suffix()));
+            .join(format!("final-stage13-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -1219,16 +1320,7 @@ mod tests {
         let active_value: serde_json::Value = serde_json::from_str(&active_json).unwrap();
         assert_eq!(active_value.as_str(), Some(alice_profile_id.as_str()));
 
-        let contact_request = CString::new(
-            serde_json::json!({
-                "account_id": "acct-stage13-friend",
-                "petname": "Stage13 Friend",
-                "public_display_name": "Stage13 Friend"
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let contact_ptr = omni_contacts_add_by_identifier(handle, contact_request.as_ptr());
+        let contact_ptr = add_test_contact(handle, "acct-stage13-friend", "Stage13 Friend", "Stage13 Friend");
         let contact_json = unsafe { CStr::from_ptr(contact_ptr) }
             .to_str()
             .unwrap()
@@ -1337,7 +1429,7 @@ mod tests {
     fn ffi_contact_endpoints_support_identifier_and_verification_flows() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-ffi-tests")
-            .join(format!("contacts-{}.db", unique_suffix()));
+            .join(format!("contacts-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -1359,16 +1451,7 @@ mod tests {
         let created_ptr = omni_identity_create_account(handle, create_request.as_ptr());
         omni_string_free(created_ptr);
 
-        let add_request = CString::new(
-            serde_json::to_string(&AddContactByIdentifierRequest {
-                account_id: "acct-remote".to_string(),
-                petname: "Алиса".to_string(),
-                public_display_name: Some("Alice".to_string()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let added_ptr = omni_contacts_add_by_identifier(handle, add_request.as_ptr());
+        let added_ptr = add_test_contact(handle, "acct-remote", "Алиса", "Alice");
         let added_json = unsafe { CStr::from_ptr(added_ptr) }
             .to_str()
             .unwrap()
@@ -1449,7 +1532,7 @@ mod tests {
     fn ffi_can_add_contact_from_importable_payload() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-ffi-tests")
-            .join(format!("payload-{}.db", unique_suffix()));
+            .join(format!("payload-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -1509,59 +1592,13 @@ mod tests {
     }
 
     #[test]
-    fn ffi_can_request_contact_by_identifier() {
-        let db_path = std::env::temp_dir()
-            .join("omni-stage-4-ffi-tests")
-            .join(format!("request-{}.db", unique_suffix()));
-
-        let config_json = format!(
-            r#"{{"db_path":"{}"}}"#,
-            escape_json_string(&db_path.to_string_lossy())
-        );
-        let config_cstring =
-            CString::new(config_json).expect("config json should not contain null bytes");
-        let handle = omni_app_init(config_cstring.as_ptr());
-        assert!(!handle.is_null());
-        let create_request = CString::new(
-            serde_json::to_string(&CreateAccountRequest {
-                display_name: "FFI Local".to_string(),
-                device_label: "FFI Device".to_string(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let created_ptr = omni_identity_create_account(handle, create_request.as_ptr());
-        omni_string_free(created_ptr);
-
-        let request = CString::new(
-            serde_json::to_string(&RequestContactByIdentifierRequest {
-                account_id: "acct-request".to_string(),
-                petname: "Запрос".to_string(),
-                public_display_name: Some("Remote Display".to_string()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let requested_ptr = omni_contacts_request_by_identifier(handle, request.as_ptr());
-        let requested_json = unsafe { CStr::from_ptr(requested_ptr) }
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(requested_json.contains("acct-request"));
-        assert!(requested_json.contains("pending"));
-        omni_string_free(requested_ptr);
-
-        omni_app_free(handle);
-    }
-
-    #[test]
     fn ffi_stage5_security_projection_endpoints_expose_typed_summaries_without_raw_secrets() {
         let local_db = std::env::temp_dir()
             .join("omni-stage-5-ffi-tests")
-            .join(format!("local-{}.db", unique_suffix()));
+            .join(format!("local-{}", unique_suffix())).join("omni.db");
         let remote_db = std::env::temp_dir()
             .join("omni-stage-5-ffi-tests")
-            .join(format!("remote-{}.db", unique_suffix()));
+            .join(format!("remote-{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(local_db.parent().unwrap()).unwrap();
 
         let config_json = format!(
@@ -1602,11 +1639,11 @@ mod tests {
             .expect("remote bundle should be stored");
         let contact = local
             .inner
-            .add_contact_by_identifier(
-                remote_account.descriptor.account_id.0.clone(),
-                "Боб".to_string(),
-                Some("Remote".to_string()),
-            )
+            .add_contact(&test_contact_input(
+                &remote_account.descriptor.account_id.0,
+                "Боб",
+                "Remote",
+            ))
             .expect("contact should be added");
         let verification_request = CString::new(
             serde_json::json!({
@@ -1710,10 +1747,10 @@ mod tests {
     fn ffi_prekey_bundle_export_and_import_roundtrip_is_wired() {
         let local_db = std::env::temp_dir()
             .join("omni-stage-5-ffi-tests")
-            .join(format!("local-prekey-{}.db", unique_suffix()));
+            .join(format!("local-prekey-{}", unique_suffix())).join("omni.db");
         let remote_db = std::env::temp_dir()
             .join("omni-stage-5-ffi-tests")
-            .join(format!("remote-prekey-{}.db", unique_suffix()));
+            .join(format!("remote-prekey-{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(local_db.parent().unwrap()).unwrap();
 
         let local_config_json = format!(
@@ -1776,7 +1813,7 @@ mod tests {
     fn ffi_chat_delta_and_detail_revision_endpoints_are_wired() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-11-ffi-tests")
-            .join(format!("delta-{}.db", unique_suffix()));
+            .join(format!("delta-{}", unique_suffix())).join("omni.db");
 
         let config_json = format!(
             r#"{{"db_path":"{}"}}"#,
@@ -1798,16 +1835,7 @@ mod tests {
         let created_ptr = omni_identity_create_account(handle, create_request.as_ptr());
         assert!(!created_ptr.is_null());
         omni_string_free(created_ptr);
-        let contact_request = CString::new(
-            serde_json::to_string(&AddContactByIdentifierRequest {
-                account_id: "acct-ffi-delta".to_string(),
-                petname: "Delta Remote".to_string(),
-                public_display_name: Some("Delta Remote".to_string()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let contact_ptr = omni_contacts_add_by_identifier(handle, contact_request.as_ptr());
+        let contact_ptr = add_test_contact(handle, "acct-ffi-delta", "Delta Remote", "Delta Remote");
         let contact_json = unsafe { CStr::from_ptr(contact_ptr) }
             .to_str()
             .expect("contact response should be valid utf-8")

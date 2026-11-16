@@ -2,8 +2,11 @@
 name = "omni-storage"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 [dependencies]
+cap-std = "4"
+cap-fs-ext = "4"
 argon2.workspace = true
 base64.workspace = true
 hex.workspace = true

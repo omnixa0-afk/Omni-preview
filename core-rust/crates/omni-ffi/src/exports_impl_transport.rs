@@ -14,7 +14,43 @@ fn chat_send_text_impl(handle: *mut OmniAppHandle, request_json: *const c_char) 
         let request: SendTextRequest = parse_json_request(request_json, "send_text request")?;
         require_handle(handle)?
             .inner
-            .send_text(request.dialog_key, request.body)
+            .send_text_answering(request.dialog_key, request.body, request.reply_to.as_deref())
+    })();
+
+    to_result_payload(result)
+}
+
+fn message_delete_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: MessageDeleteRequest = parse_json_request(request_json, "message_delete request")?;
+        require_handle(handle)?.inner.delete_message(&request.message_id, request.for_everyone)
+    })();
+
+    to_result_payload(result)
+}
+
+fn message_pin_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: MessagePinRequest = parse_json_request(request_json, "message_pin request")?;
+        require_handle(handle)?.inner.pin_message(&request.message_id, request.pinned)
+    })();
+
+    to_result_payload(result)
+}
+
+fn message_actions_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: MessageActionsRequest = parse_json_request(request_json, "message_actions request")?;
+        require_handle(handle)?.inner.message_actions(&request.dialog_key)
+    })();
+
+    to_result_payload(result)
+}
+
+fn message_react_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: MessageReactRequest = parse_json_request(request_json, "message_react request")?;
+        require_handle(handle)?.inner.react_to_message(&request.message_id, &request.emoji)
     })();
 
     to_result_payload(result)
@@ -102,6 +138,33 @@ fn media_read_file_impl(handle: *mut OmniAppHandle, request_json: *const c_char)
     let result = (|| -> OmniResult<_> {
         let request: MediaFileRequest = parse_json_request(request_json, "media_read_file request")?;
         require_handle(handle)?.inner.read_media_file(request.path)
+    })();
+
+    to_result_payload(result)
+}
+
+fn voice_stage_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: VoiceStageRequest = parse_json_request(request_json, "voice_stage request")?;
+        require_handle(handle)?.inner.stage_voice_recording(&request.packets_b64, &request.waveform_b64)
+    })();
+
+    to_result_payload(result)
+}
+
+fn video_note_stage_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: VideoNoteStageRequest = parse_json_request(request_json, "video_note_stage request")?;
+        require_handle(handle)?.inner.stage_video_note_recording(&request.video_b64, &request.preview_b64)
+    })();
+
+    to_result_payload(result)
+}
+
+fn voice_read_impl(handle: *mut OmniAppHandle, request_json: *const c_char) -> *mut c_char {
+    let result = (|| -> OmniResult<_> {
+        let request: MediaFileRequest = parse_json_request(request_json, "voice_read request")?;
+        require_handle(handle)?.inner.read_voice_file(request.path)
     })();
 
     to_result_payload(result)

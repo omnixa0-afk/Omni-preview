@@ -34,6 +34,7 @@ impl Storage {
             if !has_one_time_prekey {
                 self.replenish_one_time_prekeys(&device.device_id, now_unix_ms)?;
             }
+            self.maintain_prekeys(&account.descriptor.account_id, &device.device_id, now_unix_ms)?;
             return self.ensure_local_device_certificate(
                 &account.descriptor.account_id,
                 &device,
@@ -194,51 +195,127 @@ impl Storage {
     pub fn get_active_signed_prekey(&self, device_id: &DeviceId) -> OmniResult<Option<SignedPrekey>> {
         self.connection
             .query_row(
-                "
-                SELECT
-                    prekey_id,
-                    device_id,
-                    public_key,
-                    private_key_protection_scheme,
-                    private_key_blob,
-                    signature_r,
-                    signature_s,
-                    suite_version,
-                    created_at_unix_ms,
-                    expires_at_unix_ms,
-                    updated_at_unix_ms
-                FROM signed_prekeys
-                WHERE device_id = ?1
-                  AND state = 'active'
-                ORDER BY created_at_unix_ms DESC, prekey_id DESC
-                LIMIT 1
-                ",
+                &format!(
+                    "SELECT {SIGNED_PREKEY_COLUMNS} FROM signed_prekeys
+                     WHERE device_id = ?1 AND state = 'active'
+                     ORDER BY created_at_unix_ms DESC, prekey_id DESC
+                     LIMIT 1"
+                ),
                 params![device_id.0],
-                |row| {
-                    Ok(SignedPrekey {
-                        prekey_id: row.get::<_, i64>(0)? as u32,
-                        device_id: DeviceId(row.get(1)?),
-                        public_key: prekey_public_key_from_wire(&row.get::<_, String>(2)?)
-                            .map_err(to_sqlite_user_error)?,
-                        protected_private_key: protected_secret_from_db(
-                            &row.get::<_, String>(3)?,
-                            &row.get::<_, String>(4)?,
-                        )
-                        .map_err(to_sqlite_user_error)?,
-                        signature: signature_from_wire(
-                            &row.get::<_, String>(5)?,
-                            &row.get::<_, String>(6)?,
-                        )
-                        .map_err(to_sqlite_user_error)?,
-                        suite_version: row.get::<_, i64>(7)? as u16,
-                        created_at_unix_ms: row.get(8)?,
-                        expires_at_unix_ms: row.get(9)?,
-                        updated_at_unix_ms: row.get(10)?,
-                    })
-                },
+                signed_prekey_from_row,
             )
             .optional()
             .map_err(map_sqlite_error)
+    }
+
+    /// The signed prekey an inbound bootstrap names: the active one, or one rotated out whose
+    /// private half is still kept (`maintain_prekeys`) - a contact may still hold a bundle with it.
+    pub fn get_signed_prekey_for_inbound_bootstrap(
+        &self,
+        device_id: &DeviceId,
+        prekey_id: u32,
+    ) -> OmniResult<Option<SignedPrekey>> {
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT {SIGNED_PREKEY_COLUMNS} FROM signed_prekeys
+                     WHERE device_id = ?1 AND prekey_id = ?2 AND state IN ('active', 'retired')"
+                ),
+                params![device_id.0, prekey_id as i64],
+                signed_prekey_from_row,
+            )
+            .optional()
+            .map_err(map_sqlite_error)
+    }
+
+    /// Prekey upkeep of this profile's current device; `true` if a new signed prekey was made (the
+    /// bundle in our hello is then stale). See [`Self::maintain_prekeys`].
+    pub fn maintain_local_prekeys(&self, now_unix_ms: i64) -> OmniResult<bool> {
+        let (Some(account), Some(device)) = (self.get_local_account()?, self.get_local_device()?) else {
+            return Ok(false);
+        };
+        self.maintain_prekeys(&account.descriptor.account_id, &device.device_id, now_unix_ms)
+    }
+
+    /// V-09. A new signed prekey every [`SIGNED_PREKEY_ROTATION_MS`]; the one it replaces is
+    /// `retired` - it still opens bootstraps that name it - until [`PREKEY_LATE_BOOTSTRAP_MS`] past
+    /// both its expiry and the rotation. Then, like a one-time prekey once its shared grace is over,
+    /// its private half is erased: the row stays (`erased`, public key only) so prekey numbers never
+    /// repeat. An erased key is one a stolen database can no longer use to open a recorded session
+    /// start. Returns `true` if a new signed prekey was made.
+    pub fn maintain_prekeys(
+        &self,
+        account_id: &AccountId,
+        device_id: &DeviceId,
+        now_unix_ms: i64,
+    ) -> OmniResult<bool> {
+        let due = self
+            .get_active_signed_prekey(device_id)?
+            .is_some_and(|active| now_unix_ms.saturating_sub(active.created_at_unix_ms) >= SIGNED_PREKEY_ROTATION_MS);
+        if due {
+            let identity_key = self
+                .get_local_identity_key(account_id)?
+                .ok_or_else(|| OmniError::Storage("local identity key is missing".to_string()))?;
+            self.with_immediate_transaction("rotate_signed_prekey", |storage| {
+                let highest: i64 = storage
+                    .connection
+                    .query_row(
+                        "SELECT COALESCE(MAX(prekey_id), 0) FROM signed_prekeys WHERE device_id = ?1",
+                        params![device_id.0.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_sqlite_error)?;
+                let next = omni_crypto::generate_signed_prekey(
+                    &identity_key,
+                    device_id,
+                    (highest as u32).saturating_add(1),
+                    now_unix_ms,
+                )?;
+                storage
+                    .connection
+                    .execute(
+                        "UPDATE signed_prekeys SET state = 'retired', updated_at_unix_ms = ?2
+                         WHERE device_id = ?1 AND state = 'active'",
+                        params![device_id.0.as_str(), now_unix_ms],
+                    )
+                    .map_err(map_sqlite_error)?;
+                storage.insert_signed_prekey_row(&next)
+            })?;
+        }
+        // Called on every foundation check, so it reads first: an UPDATE that matches nothing still
+        // takes the database's write lock.
+        let device = device_id.0.as_str();
+        let spent_one_time: (&str, &str, &[&dyn rusqlite::ToSql]) = (
+            "one_time_prekeys",
+            "device_id = ?1 AND state = 'consumed' AND consumed_at_unix_ms < ?2 - ?3",
+            &[&device, &now_unix_ms, &ONE_TIME_PREKEY_SHARED_GRACE_MS],
+        );
+        let spent_signed: (&str, &str, &[&dyn rusqlite::ToSql]) = (
+            "signed_prekeys",
+            "device_id = ?1 AND state = 'retired'
+             AND MAX(COALESCE(expires_at_unix_ms, created_at_unix_ms + ?4), updated_at_unix_ms) + ?3 <= ?2",
+            &[&device, &now_unix_ms, &PREKEY_LATE_BOOTSTRAP_MS, &omni_crypto::SIGNED_PREKEY_LIFETIME_MS],
+        );
+        for (table, spent, values) in [spent_one_time, spent_signed] {
+            let any: bool = self
+                .connection
+                .query_row(&format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE {spent})"), values, |row| row.get(0))
+                .map_err(map_sqlite_error)?;
+            if any {
+                self.connection
+                    .execute(
+                        &format!(
+                            "UPDATE {table}
+                             SET state = 'erased', private_key_protection_scheme = 'erased', private_key_blob = '',
+                                 updated_at_unix_ms = ?2
+                             WHERE {spent}"
+                        ),
+                        values,
+                    )
+                    .map_err(map_sqlite_error)?;
+            }
+        }
+        Ok(due)
     }
 
     pub fn get_available_one_time_prekey(
@@ -340,9 +417,9 @@ impl Storage {
     /// they all name its prekey; the first to bootstrap took it, and every later one failed with
     /// «expected one-time prekey is missing» and kept resending the same bootstrap forever (a copy
     /// of a profile on the stand: the PC took the prekey 3 s before the laptop, the laptop never
-    /// reached the copy, its revocation neither). The private half of a consumed prekey stays in
-    /// the table regardless, so this keeps nothing longer than before; a replayed bootstrap is
-    /// refused before this, by its `created_at` (`existing_session_should_absorb_incoming_bootstrap`).
+    /// reached the copy, its revocation neither). After the grace its private half is erased
+    /// (`maintain_prekeys`); a replayed bootstrap is refused before this, by its `created_at`
+    /// (`existing_session_should_absorb_incoming_bootstrap`).
     pub fn get_one_time_prekey_for_inbound_bootstrap(
         &self,
         device_id: &DeviceId,
@@ -513,4 +590,24 @@ impl Storage {
         bundle.device_certificate_chain = self.get_local_device_certificate_chain()?;
         Ok(bundle)
     }
+}
+
+const SIGNED_PREKEY_COLUMNS: &str = "prekey_id, device_id, public_key, private_key_protection_scheme, \
+     private_key_blob, signature_r, signature_s, suite_version, created_at_unix_ms, expires_at_unix_ms, \
+     updated_at_unix_ms";
+
+fn signed_prekey_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedPrekey> {
+    Ok(SignedPrekey {
+        prekey_id: row.get::<_, i64>(0)? as u32,
+        device_id: DeviceId(row.get(1)?),
+        public_key: prekey_public_key_from_wire(&row.get::<_, String>(2)?).map_err(to_sqlite_user_error)?,
+        protected_private_key: protected_secret_from_db(&row.get::<_, String>(3)?, &row.get::<_, String>(4)?)
+            .map_err(to_sqlite_user_error)?,
+        signature: signature_from_wire(&row.get::<_, String>(5)?, &row.get::<_, String>(6)?)
+            .map_err(to_sqlite_user_error)?,
+        suite_version: row.get::<_, i64>(7)? as u16,
+        created_at_unix_ms: row.get(8)?,
+        expires_at_unix_ms: row.get(9)?,
+        updated_at_unix_ms: row.get(10)?,
+    })
 }

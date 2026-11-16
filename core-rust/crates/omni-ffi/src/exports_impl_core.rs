@@ -1,8 +1,10 @@
 fn init_impl(config_json: *const c_char) -> OmniResult<OmniAppHandle> {
+    #[cfg(feature = "dev-tools")]
+    core_heap::start_reporting();
     let request = parse_init_request(config_json, "init")?;
     let app = OmniApp::init(request)?;
 
-    Ok(OmniAppHandle { inner: app })
+    Ok(OmniAppHandle { inner: app, media_app_id: next_media_app_id() })
 }
 
 fn inspect_database_bootstrap_impl(config_json: *const c_char) -> *mut c_char {

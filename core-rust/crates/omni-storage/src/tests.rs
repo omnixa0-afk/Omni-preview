@@ -36,7 +36,7 @@ mod tests {
     fn open_migrate_and_healthcheck_create_database() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-0-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -53,7 +53,7 @@ mod tests {
     fn migrate_drops_the_legacy_is_friend_column() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-0-tests")
-            .join(format!("no-friend-{}.db", unique_suffix()));
+            .join(format!("no-friend-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         let has_column = |storage: &Storage| -> bool {
@@ -78,7 +78,7 @@ mod tests {
     fn migrate_drops_the_legacy_direct_route_hints_table() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-0-tests")
-            .join(format!("no-route-hints-{}.db", unique_suffix()));
+            .join(format!("no-route-hints-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         let has_table = |storage: &Storage| -> bool {
@@ -109,7 +109,7 @@ mod tests {
     fn durable_frames_replace_load_and_survive_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-durable-frames-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
 
@@ -118,36 +118,36 @@ mod tests {
 
         // Persist two opaque wire-blob frames.
         let frames = vec![
-            (vec![1u8; 16], 1i64, vec![10u8, 20, 30]),
-            (vec![2u8; 16], 5i64, vec![40u8, 50]),
+            (vec![1u8; 16], 1i64, vec![10u8, 20, 30], false),
+            (vec![2u8; 16], 5i64, vec![40u8, 50], true),
         ];
         assert_eq!(storage.replace_durable_frames(&frames).unwrap(), 2);
         let loaded = storage.load_durable_frames().unwrap();
         assert_eq!(loaded.len(), 2);
-        assert!(loaded.contains(&vec![10u8, 20, 30]));
-        assert!(loaded.contains(&vec![40u8, 50]));
+        assert!(loaded.contains(&(vec![10u8, 20, 30], false)));
+        assert!(loaded.contains(&(vec![40u8, 50], true)), "the handled mark comes back with the frame");
 
         // Replace clears the previous set.
         assert_eq!(
             storage
-                .replace_durable_frames(&[(vec![3u8; 16], 9, vec![99u8])])
+                .replace_durable_frames(&[(vec![3u8; 16], 9, vec![99u8], true)])
                 .unwrap(),
             1
         );
-        assert_eq!(storage.load_durable_frames().unwrap(), vec![vec![99u8]]);
+        assert_eq!(storage.load_durable_frames().unwrap(), vec![(vec![99u8], true)]);
 
         // Survives a reopen (the point of persistence).
         drop(storage);
         let reopened = Storage::open(&db_path).expect("storage should reopen");
         reopened.migrate().expect("migrations should succeed");
-        assert_eq!(reopened.load_durable_frames().unwrap(), vec![vec![99u8]]);
+        assert_eq!(reopened.load_durable_frames().unwrap(), vec![(vec![99u8], true)]);
     }
 
     #[test]
     fn mesh_dialog_route_persists_and_overwrites() {
         let db_path = std::env::temp_dir()
             .join("omni-mesh-route-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
 
@@ -190,7 +190,7 @@ mod tests {
     fn mesh_peer_book_upserts_loads_expires_and_clears() {
         let db_path = std::env::temp_dir()
             .join("omni-mesh-peer-book-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
 
@@ -252,7 +252,7 @@ mod tests {
         // остальных из выборки — иначе тёплое переподключение занимается только им.
         let db_path = std::env::temp_dir()
             .join("omni-peer-book-caps")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         let now = 1_700_000_000_000_i64;
@@ -305,7 +305,7 @@ mod tests {
     fn network_nodes_add_list_remove_survive_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-network-nodes-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         // migrate() seeds the base node; this test exercises raw CRUD, so start from a clean slate (the
@@ -374,6 +374,49 @@ mod tests {
 
         reopened.clear_network_nodes().unwrap();
         assert!(reopened.list_network_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_removes_only_the_expired_base_node_by_its_address() {
+        let db_path = std::env::temp_dir()
+            .join("omni-network-nodes-tests")
+            .join(format!("{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).expect("storage should open");
+        storage.migrate().expect("migrations should succeed");
+        storage.clear_network_nodes().unwrap();
+
+        let hex = crate::EXPIRED_BASE_NODE_ADDRESS;
+        let expired: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let live = vec![0x42u8; 20];
+        for (address, source) in [
+            (&expired, crate::NETWORK_NODE_SOURCE_BASE),
+            (&live, crate::NETWORK_NODE_SOURCE_BASE),
+            (&expired, crate::NETWORK_NODE_SOURCE_MANUAL),
+        ] {
+            storage
+                .add_network_node(&crate::NewNetworkNode {
+                    endpoint: Some("203.0.113.9:443"),
+                    node_address: Some(address),
+                    label: "узел",
+                    source,
+                    added_at_unix_ms: 1_000,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        drop(storage);
+        let reopened = Storage::open(&db_path).expect("storage should reopen");
+        reopened.migrate().expect("migrations should succeed");
+        let after = reopened.list_network_nodes().unwrap();
+        assert_eq!(after.len(), 2, "only the expired base row goes");
+        assert!(after.iter().any(|n| n.source == crate::NETWORK_NODE_SOURCE_BASE
+            && n.node_address.as_deref() == Some(live.as_slice())));
+        assert!(after.iter().any(|n| n.source == crate::NETWORK_NODE_SOURCE_MANUAL
+            && n.node_address.as_deref() == Some(expired.as_slice())), "a node the user added by hand stays");
     }
 
     /// A passport kept for another account: the newest version replaces an older one and an older one
@@ -449,7 +492,7 @@ mod tests {
         let open = |name: &str| {
             let db_path = std::env::temp_dir()
                 .join("omni-rendezvous-providers-tests")
-                .join(format!("{name}-{}.db", unique_suffix()));
+                .join(format!("{name}-{}", unique_suffix())).join("omni.db");
             let storage = Storage::open(&db_path).expect("storage should open");
             storage.migrate().expect("migrations should succeed");
             (storage, db_path)
@@ -506,7 +549,7 @@ mod tests {
     fn rendezvous_providers_seed_add_remove_survive_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-rendezvous-providers-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
 
@@ -559,14 +602,14 @@ mod tests {
         // See docs/bugs/relay-less-first-contact-validate-before-advertise.md.
         let db_path = std::env::temp_dir()
             .join("omni-bootstrap-invites-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
 
         let node = [0x7Au8; 20];
         // Importer-side invite (knows the inviter node) + an inviter-side one (node = None).
-        storage.upsert_bootstrap_invite("aa".repeat(32).as_str(), Some(node), 10_000).unwrap();
-        storage.upsert_bootstrap_invite("bb".repeat(32).as_str(), None, 5_000).unwrap();
+        storage.upsert_bootstrap_invite("aa".repeat(32).as_str(), Some(node), Some([0x5Bu8; 32]), 10_000).unwrap();
+        storage.upsert_bootstrap_invite("bb".repeat(32).as_str(), None, None, 5_000).unwrap();
 
         // Only non-expired invites come back, soonest-expiry first; the node round-trips both ways.
         let active = storage.list_active_bootstrap_invites(4_000).unwrap();
@@ -574,6 +617,8 @@ mod tests {
         assert_eq!(active[0].nonce_hex, "bb".repeat(32), "soonest expiry first");
         assert_eq!(active[0].inviter_node, None, "inviter side has no node");
         assert_eq!(active[1].inviter_node, Some(node), "importer side node round-trips");
+        assert_eq!(active[1].inviter_reply_key, Some([0x5Bu8; 32]), "and the inviter's reply key");
+        assert_eq!(active[0].inviter_reply_key, None);
 
         // At t=6000 the bb invite has expired → filtered out of the active list.
         let active = storage.list_active_bootstrap_invites(6_000).unwrap();
@@ -581,7 +626,7 @@ mod tests {
         assert_eq!(active[0].nonce_hex, "aa".repeat(32));
 
         // Upsert is idempotent on the nonce (refresh node/expiry, no duplicate).
-        storage.upsert_bootstrap_invite("aa".repeat(32).as_str(), Some(node), 20_000).unwrap();
+        storage.upsert_bootstrap_invite("aa".repeat(32).as_str(), Some(node), None, 20_000).unwrap();
         assert_eq!(storage.list_active_bootstrap_invites(15_000).unwrap().len(), 1, "refreshed, not dup'd");
 
         // Prune sweeps the expired bb row; explicit remove drops the aa one.
@@ -589,7 +634,7 @@ mod tests {
         assert_eq!(storage.remove_bootstrap_invite(&"aa".repeat(32)).unwrap(), 1);
 
         // Re-add + reopen: the persisted invite outlives the restart.
-        storage.upsert_bootstrap_invite("cc".repeat(32).as_str(), Some(node), 30_000).unwrap();
+        storage.upsert_bootstrap_invite("cc".repeat(32).as_str(), Some(node), None, 30_000).unwrap();
         drop(storage);
         let reopened = Storage::open(&db_path).expect("storage should reopen");
         reopened.migrate().expect("migrations should succeed");
@@ -600,7 +645,7 @@ mod tests {
 
         // A completed pairing spends every invite aimed at that node — and only those.
         let other = [7u8; 20];
-        reopened.upsert_bootstrap_invite("dd".repeat(32).as_str(), Some(other), 30_000).unwrap();
+        reopened.upsert_bootstrap_invite("dd".repeat(32).as_str(), Some(other), None, 30_000).unwrap();
         assert_eq!(reopened.remove_bootstrap_invites_for_inviter(&node).unwrap(), 1);
         let left = reopened.list_active_bootstrap_invites(1_000).unwrap();
         assert_eq!(left.len(), 1, "another inviter's invite stays");
@@ -614,7 +659,7 @@ mod tests {
         // other bundles untouched. See docs/decisions/r1c-rotatable-white-relay.md.
         let db_path = std::env::temp_dir()
             .join("omni-relay-bundle-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         storage.clear_network_nodes().unwrap();
@@ -699,7 +744,7 @@ mod tests {
         // (it's the issuer side of beacon auto-propagation). See docs/decisions/r1c-rotatable-white-relay.md.
         let db_path = std::env::temp_dir()
             .join("omni-relay-shared-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         storage.clear_network_nodes().unwrap();
@@ -755,7 +800,7 @@ mod tests {
     fn durable_feed_seq_is_monotonic_per_peer_and_survives_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-durable-seq-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
 
@@ -779,7 +824,7 @@ mod tests {
     fn local_instance_id_is_stable_across_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-2-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -802,7 +847,7 @@ mod tests {
     fn delete_local_data_removes_database_attachments_and_known_sidecars() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-2-storage-tests")
-            .join(format!("cleanup-{}.db", unique_suffix()));
+            .join(format!("cleanup-{}", unique_suffix())).join("omni.db");
         let app_directory = db_path.parent().expect("db path should have parent");
         let db_file_name = db_path
             .file_name()
@@ -971,14 +1016,14 @@ mod tests {
         let avatar_source_path = dir.join(format!("own-device-avatar-{}.png", unique_suffix()));
         fs::write(&avatar_source_path, tiny_png_bytes()).unwrap();
         // The other device: its avatar, as it hands it over.
-        let other = Storage::open(dir.join(format!("own-device-other-{}.db", unique_suffix()))).unwrap();
+        let other = Storage::open(dir.join(format!("own-device-other-{}", unique_suffix())).join("omni.db")).unwrap();
         other.migrate().unwrap();
         other.create_local_account("Alice", "Laptop", 1_000).unwrap();
         other.update_local_public_profile("Alice", Some(&avatar_source_path), false, 2_000).unwrap();
         let picture = other.get_local_public_profile_state().unwrap();
         let (hash, mime, bytes) = (picture.avatar_hash_hex.unwrap(), picture.avatar_mime_type.unwrap(), picture.avatar_bytes.unwrap());
 
-        let storage = Storage::open(dir.join(format!("own-device-{}.db", unique_suffix()))).unwrap();
+        let storage = Storage::open(dir.join(format!("own-device-{}", unique_suffix())).join("omni.db")).unwrap();
         storage.migrate().unwrap();
         storage.create_local_account("Alice", "Desktop", 1_000).unwrap();
         storage.update_local_public_profile("Alice Desk", None, false, 1_500).unwrap();
@@ -1008,7 +1053,7 @@ mod tests {
     fn updating_local_public_profile_persists_avatar_and_can_clear_it() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-2-storage-tests")
-            .join(format!("public-profile-{}.db", unique_suffix()));
+            .join(format!("public-profile-{}", unique_suffix())).join("omni.db");
         let avatar_source_path = std::env::temp_dir()
             .join("omni-stage-2-storage-tests")
             .join(format!("public-profile-avatar-{}.png", unique_suffix()));
@@ -1086,7 +1131,7 @@ mod tests {
     fn contact_avatar_resolution_falls_back_to_legacy_media_layout() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-2-storage-tests")
-            .join(format!("legacy-contact-avatar-{}.db", unique_suffix()));
+            .join(format!("legacy-contact-avatar-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         let created = storage
@@ -1167,7 +1212,7 @@ mod tests {
     fn message_storage_round_trip_works() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -1218,7 +1263,7 @@ mod tests {
     fn message_paging_uses_exclusive_cursor_and_returns_ascending_pages() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("messages-page-{}.db", unique_suffix()));
+            .join(format!("messages-page-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -1295,7 +1340,7 @@ mod tests {
     fn forgetting_contact_removes_dialog_history_and_queue_rows() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("forget-dialog-{}.db", unique_suffix()));
+            .join(format!("forget-dialog-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -1410,7 +1455,7 @@ mod tests {
     fn outgoing_pending_refresh_does_not_mark_approved_contact_as_pending_direction() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("approved-pending-direction-{}.db", unique_suffix()));
+            .join(format!("approved-pending-direction-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -1519,6 +1564,104 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The same file sent in two chats is one managed copy; deleting one message must not take it
+    /// from the other — it goes with the last message that names it (audit 2026-11-09, F05).
+    #[test]
+    fn a_managed_copy_two_messages_share_goes_only_with_the_last_of_them() {
+        let dir = std::env::temp_dir().join("omni-stage-1-storage-tests").join(format!("shared-blob-{}", unique_suffix()));
+        fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("plan.pdf");
+        fs::write(&source_path, "one file, two chats").unwrap();
+        let storage = Storage::open(dir.join("omni.db")).expect("storage should open");
+        storage.migrate().expect("migrations should succeed");
+        storage.create_local_account("Alice", "Office PC", 1_000).expect("account should be created");
+        let send = |message_id: &str, peer: &str| {
+            storage
+                .prepare_outgoing_attachment(
+                    message_id,
+                    &dialog_key_from_instance_id(peer),
+                    source_path.to_str().unwrap(),
+                    None,
+                    omni_types::AttachmentMediaProtectionMode::E2eeMedia,
+                    1_010,
+                )
+                .expect("attachment should be prepared")
+                .local_blob_path
+                .expect("a managed copy")
+        };
+        let (first, second) = (send("to-bob", "inst-bob"), send("to-carol", "inst-carol"));
+        assert_eq!(first, second, "one copy for both");
+
+        storage.delete_message_here("to-bob").unwrap();
+        assert!(second.exists(), "Carol's message keeps its copy");
+        assert_eq!(storage.read_media_file(&second).unwrap(), b"one file, two chats");
+        storage.revoke_local_attachment_access("to-carol", 1_020).unwrap();
+        assert!(!second.exists(), "the last message let it go");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The queue's resume scan may take a small file's `Preparing` row while the send prepares it
+    /// inline, and finish it first. The file is ready either way: the send must say so, not
+    /// «stopped» (a full `omni-app` run under load, 2026-10-27).
+    #[test]
+    fn a_small_file_another_pass_prepared_first_is_ready_not_stopped() {
+        let dir = std::env::temp_dir().join("omni-stage-1-storage-tests").join(format!("race-{}", unique_suffix()));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("omni.db");
+        let source_path = dir.join("note.txt");
+        fs::write(&source_path, "a small file two passes reach at once").unwrap();
+        let storage = Storage::open(&db_path).expect("storage should open");
+        storage.migrate().expect("migrations should succeed");
+        storage.create_local_account("Alice", "Office PC", 1_000).expect("account should be created");
+
+        let mut other_pass_done = false;
+        let prepared = storage
+            .prepare_outgoing_attachment_with(
+                "race-message",
+                &dialog_key_from_instance_id("inst-bob"),
+                source_path.to_str().unwrap(),
+                None,
+                omni_types::AttachmentMediaProtectionMode::E2eeMedia,
+                1_010,
+                &mut |_| {
+                    if !other_pass_done {
+                        other_pass_done = true;
+                        // The background pass, while ours is reading: it completes the row.
+                        storage
+                            .finish_outgoing_attachment_preparation("race-message", &mut |_| true, 1_011)
+                            .expect("the other pass prepares the file");
+                    }
+                    true
+                },
+            )
+            .expect("the file is ready, whichever pass made it so");
+        assert!(other_pass_done);
+        assert_ne!(prepared.attachment.state, omni_types::AttachmentTransferState::Preparing);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn internal_part_writers_create_and_resume_new_and_legacy_downloads() {
+        let dir = std::env::temp_dir().join("omni-stage-1-storage-tests").join(format!("part-{}", unique_suffix()));
+        fs::create_dir_all(dir.join("attachments")).unwrap();
+        let storage = Storage::open(dir.join("omni.db")).unwrap();
+        storage.migrate().unwrap();
+        let part = dir.join("attachments/photo.part");
+        for bytes in [b"one", b"two"] {
+            let mut writer = storage.open_attachment_part_writer(&part).unwrap();
+            writer.write_at(0, bytes).unwrap();
+            writer.sync_data().unwrap();
+            drop(writer);
+            assert_eq!(storage.read_media_file(&part).unwrap(), bytes);
+        }
+        fs::write(&part, b"legacy").unwrap();
+        drop(storage.open_attachment_part_writer(&part).unwrap());
+        assert!(omni_crypto::is_file_at_rest(&part));
+        assert_eq!(storage.read_media_file(&part).unwrap(), b"legacy");
+        drop(storage);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn plain_files_left_in_omnis_storage_are_sealed_and_an_interrupted_sealing_recovers() {
         let dir = std::env::temp_dir().join("omni-stage-1-storage-tests").join(format!("seal-{}", unique_suffix()));
@@ -1538,7 +1681,28 @@ mod tests {
         let outside = dir.join("outside.jpg");
         fs::write(&outside, b"the user's").unwrap();
 
+        // An additional name for the same plaintext must survive migration byte-for-byte.
+        let retained = dir.join("retained.jpg");
+        fs::hard_link(&old, &retained).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep"), b"untouched").unwrap();
+        // A completed legacy migration may share its old plaintext with another filename.
+        let backup = photos.join("complete.jpg.plain-old");
+        fs::hard_link(&outside, &backup).unwrap();
+        storage.write_media_file(&photos.join("complete.jpg"), b"the user's").unwrap();
+        let alias = photos.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, &alias).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "New-Item -ItemType Junction -Path $env:OMNI_TEST_ALIAS -Target $env:OMNI_TEST_TARGET -ErrorAction Stop | Out-Null"])
+            .env("OMNI_TEST_ALIAS", &alias).env("OMNI_TEST_TARGET", &elsewhere).status().unwrap().success());
+
         assert_eq!(storage.seal_plain_attachment_files().unwrap(), 1);
+        assert!(!backup.exists());
+        assert_eq!(fs::read(&retained).unwrap(), b"an old plain photo");
+        assert_eq!(fs::read(elsewhere.join("keep")).unwrap(), b"untouched");
         assert!(omni_crypto::is_file_at_rest(&old));
         assert_eq!(storage.read_media_file(&old).unwrap(), b"an old plain photo");
         assert!(omni_crypto::is_file_at_rest(&cut));
@@ -1553,7 +1717,7 @@ mod tests {
     fn local_attachment_copy_can_be_saved_repeatedly_even_after_access_is_revoked() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-copy-{}.db", unique_suffix()));
+            .join(format!("attachment-copy-{}", unique_suffix())).join("omni.db");
         let source_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("source-{}.txt", unique_suffix()));
@@ -1635,7 +1799,7 @@ mod tests {
     fn large_outgoing_attachment_uses_original_file_without_managed_copy() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("large-attachment-copy-{}.db", unique_suffix()));
+            .join(format!("large-attachment-copy-{}", unique_suffix())).join("omni.db");
         let source_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("large-source-{}.bin", unique_suffix()));
@@ -1685,7 +1849,7 @@ mod tests {
     fn large_outgoing_attachment_source_change_blocks_serving() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("large-attachment-source-change-{}.db", unique_suffix()));
+            .join(format!("large-attachment-source-change-{}", unique_suffix())).join("omni.db");
         let source_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("large-source-change-{}.bin", unique_suffix()));
@@ -1720,7 +1884,7 @@ mod tests {
     fn outgoing_attachment_preserves_explicit_display_file_name() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-display-name-{}.db", unique_suffix()));
+            .join(format!("attachment-display-name-{}", unique_suffix())).join("omni.db");
         let source_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("display-name-source-{}.txt", unique_suffix()));
@@ -1761,11 +1925,135 @@ mod tests {
         assert_eq!(runtime.attachment.file_name, "Quarterly report.txt");
     }
 
+    /// V-18: the name a sender gave is cleaned once, where the offer is stored — no bidi override
+    /// turning `…fdp.exe` into `…exe.pdf` on screen, no device name — and a program is flagged.
+    #[test]
+    fn a_received_file_name_is_cleaned_and_a_program_is_flagged() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-1-storage-tests")
+            .join(format!("received-name-{}", unique_suffix())).join("omni.db");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let dialog = dialog_key_from_instance_id("inst-names");
+        for (i, (sent, kept, program)) in [
+            ("invoice\u{202E}fdp.exe", "invoicefdp.exe", true),
+            ("report\u{2066}.pdf\u{2069}.lnk", "report.pdf.lnk", true),
+            ("photo\u{200B}.jpg", "photo.jpg", false),
+            ("CON.txt", "_CON.txt", false),
+            ("bell\u{7}\nname.docx ", "bellname.docx", false),
+            ("\u{202E}", "file", false),
+            ("setup.MSI", "setup.MSI", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message_id = format!("m-name-{i}");
+            storage
+                .store_incoming_attachment_offer(
+                    &message_id, &dialog, sent, 10, None, "sha", Some("chacha20_poly1305_v1"),
+                    Some(TEST_MEDIA_KEY_HEX), Some(TEST_MEDIA_NONCE_SEED_HEX), Some(16_384), 1_010,
+                )
+                .unwrap();
+            let stored = storage.get_attachment_runtime_info(&message_id).unwrap().unwrap().attachment;
+            assert_eq!(stored.file_name, kept, "{sent:?}");
+            assert_eq!(stored.opens_as_program, program, "{sent:?}");
+        }
+    }
+
+    /// V-18: a plain copy taken out of our storage — to open it, or «Save as» — carries Windows'
+    fn review_storage(name: &str) -> (std::path::PathBuf, Storage) {
+        let dir = std::env::temp_dir().join("omni-stage-1-storage-tests").join(format!("{name}-{}", unique_suffix()));
+        fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(dir.join("omni.db")).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        (dir, storage)
+    }
+
+    /// A delivery receipt speaks for a message of the chat it came over only: one from another chat
+    /// neither marks it delivered nor stops it being resent (security review 2026-11-09, F4).
+    #[test]
+    fn a_receipt_from_another_chat_does_not_deliver_a_message() {
+        let (dir, storage) = review_storage("receipt-chat");
+        let (to_carol, to_bob) = (dialog_key_from_instance_id("inst-carol"), dialog_key_from_instance_id("inst-bob"));
+        storage.insert_outgoing_message("to-carol", &to_carol, "для Кэрол", omni_types::MessageStatus::Sent, 10).unwrap();
+        assert!(storage.record_delivery_receipt("to-carol", &to_bob, 20, 21).unwrap().is_none(), "Bob's receipt");
+        assert_ne!(storage.get_message("to-carol").unwrap().status, omni_types::MessageStatus::Delivered);
+        assert!(storage.record_delivery_receipt("to-carol", &to_carol, 22, 23).unwrap().is_some(), "Carol's own");
+        assert_eq!(storage.get_message("to-carol").unwrap().status, omni_types::MessageStatus::Delivered);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An offer of another chat's file under the same message id does not re-point it — not its chat,
+    /// not its content, not its key (security review 2026-11-09, F2).
+    #[test]
+    fn an_offer_under_another_chats_message_id_does_not_repoint_its_file() {
+        let (dir, storage) = review_storage("offer-collision");
+        let (group, mallory) = ("group:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", dialog_key_from_instance_id("inst-mallory"));
+        let offer = |dialog: &str, content: char, key: char| {
+            storage.store_incoming_attachment_offer(
+                "g-known",
+                dialog,
+                "report.pdf",
+                4,
+                None,
+                &content.to_string().repeat(64),
+                Some("chacha20_poly1305_v1"),
+                Some(&key.to_string().repeat(64)),
+                Some(&"b".repeat(64)),
+                Some(65_536),
+                100,
+            )
+        };
+        offer(group, 'a', 'a').unwrap();
+        let after = offer(&mallory, 'c', 'd').unwrap();
+        assert_eq!(after.attachment.content_id_hex, "a".repeat(64), "the file stays the group's");
+        assert_eq!(after.dialog_key, group);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Two message ids that one cleaning of a file name would make the same never share a file path
+    /// here; a clean id keeps the name it always had (security review 2026-11-09, F3).
+    #[test]
+    fn two_message_ids_never_share_a_media_path() {
+        let (dir, storage) = review_storage("media-path");
+        let photo = |id: &str| storage.shown_file_download_path(id, omni_types::AttachmentPresentationKindV1::Photo).unwrap();
+        assert_eq!(photo("g-known-media").file_name().unwrap(), "g-known-media.jpg", "a clean id keeps its name");
+        assert_ne!(photo("g-known-media"), photo("g-known-media "));
+        assert_ne!(photo("g-known-media"), photo("g-known-media."));
+        assert_ne!(photo("a/b"), photo("a_b"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Mark-of-the-Web, like a browser download.
+    #[cfg(windows)]
+    #[test]
+    fn a_plain_copy_out_of_storage_is_marked_as_downloaded() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-1-storage-tests")
+            .join(format!("motw-{}", unique_suffix())).join("omni.db");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let inside = storage.shown_file_download_path("m-motw", omni_types::AttachmentPresentationKindV1::Photo).unwrap();
+        storage.write_media_file(&inside, b"bytes from a contact").unwrap();
+        let outside = db_path.with_extension("copy.txt");
+        storage.copy_media_file(&inside, &outside).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"bytes from a contact");
+        let mut zone = outside.as_os_str().to_owned();
+        zone.push(":Zone.Identifier");
+        let mark = fs::read_to_string(&zone).expect("the copy carries a Zone.Identifier stream");
+        assert!(mark.contains("ZoneId=3"), "{mark}");
+    }
+
     #[test]
     fn an_attachment_offer_without_end_to_end_encryption_is_refused() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("plain-offer-{}.db", unique_suffix()));
+            .join(format!("plain-offer-{}", unique_suffix())).join("omni.db");
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -1795,7 +2083,7 @@ mod tests {
     fn dialogs_with_pending_attachment_downloads_lists_every_chat_waiting_to_ask() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("pending-download-dialogs-{}.db", unique_suffix()));
+            .join(format!("pending-download-dialogs-{}", unique_suffix())).join("omni.db");
         let save_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("pending-download-save-{}.bin", unique_suffix()));
@@ -1843,10 +2131,8 @@ mod tests {
     fn incoming_attachment_download_saves_only_user_copy_without_managed_blob() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!(
-                "incoming-attachment-download-{}.db",
-                unique_suffix()
-            ));
+            .join(format!("incoming-attachment-download-{}", unique_suffix()))
+            .join("omni.db");
         let requested_save_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("incoming-save-{}.txt", unique_suffix()));
@@ -2025,7 +2311,7 @@ mod tests {
     fn attachment_download_preallocation_does_not_advance_temp_file_len() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-preallocation-{}.db", unique_suffix()));
+            .join(format!("attachment-preallocation-{}", unique_suffix())).join("omni.db");
         let requested_save_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("preallocation-save-{}.bin", unique_suffix()));
@@ -2070,7 +2356,7 @@ mod tests {
     fn failed_download_verification_marks_attachment_failed() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-verify-failed-{}.db", unique_suffix()));
+            .join(format!("attachment-verify-failed-{}", unique_suffix())).join("omni.db");
         let requested_save_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("verify-failed-save-{}.bin", unique_suffix()));
@@ -2134,7 +2420,7 @@ mod tests {
     fn the_same_offer_delivered_again_does_not_set_its_download_back() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-offer-again-{}.db", unique_suffix()));
+            .join(format!("attachment-offer-again-{}", unique_suffix())).join("omni.db");
         let save_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("offer-again-save-{}.bin", unique_suffix()));
@@ -2174,7 +2460,7 @@ mod tests {
     fn the_dialogs_with_a_download_under_way_are_the_one_to_one_ones_downloading() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-downloading-dialogs-{}.db", unique_suffix()));
+            .join(format!("attachment-downloading-dialogs-{}", unique_suffix())).join("omni.db");
         let save_dir = std::env::temp_dir().join("omni-stage-1-storage-tests");
         fs::create_dir_all(&save_dir).unwrap();
         let storage = Storage::open(&db_path).unwrap();
@@ -2212,7 +2498,7 @@ mod tests {
     fn pausing_inflight_attachment_download_counts_only_the_blocks_in_its_map() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-pause-resume-{}.db", unique_suffix()));
+            .join(format!("attachment-pause-resume-{}", unique_suffix())).join("omni.db");
         let requested_save_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("pause-resume-save-{}.bin", unique_suffix()));
@@ -2285,7 +2571,7 @@ mod tests {
     fn dialog_refresh_summary_tracks_attachment_only_updates() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("attachment-summary-{}.db", unique_suffix()));
+            .join(format!("attachment-summary-{}", unique_suffix())).join("omni.db");
         let source_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
             .join(format!("attachment-summary-source-{}.txt", unique_suffix()));
@@ -2348,7 +2634,7 @@ mod tests {
     fn dialog_delta_queries_use_updated_at_and_message_id_tie_breakers() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("dialog-delta-{}.db", unique_suffix()));
+            .join(format!("dialog-delta-{}", unique_suffix())).join("omni.db");
         let dialog_key = dialog_key_from_instance_id("inst-delta");
 
         let storage = Storage::open(&db_path).expect("storage should open");
@@ -2430,7 +2716,7 @@ mod tests {
     fn full_dialog_scope_rebind_moves_history_queue_receipts_attachments_and_security_metadata() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("dialog-rebind-full-{}.db", unique_suffix()));
+            .join(format!("dialog-rebind-full-{}", unique_suffix())).join("omni.db");
         let attachment_path = db_path.with_file_name(format!(
             "dialog-rebind-full-attachment-{}.bin",
             unique_suffix()
@@ -2594,7 +2880,7 @@ mod tests {
     fn contact_revisions_change_after_mutations() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-6-storage-tests")
-            .join(format!("detail-revisions-{}.db", unique_suffix()));
+            .join(format!("detail-revisions-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -2642,7 +2928,7 @@ mod tests {
     fn first_presence_sent_upsert_uses_safe_defaults() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-11-storage-tests")
-            .join(format!("presence-defaults-{}.db", unique_suffix()));
+            .join(format!("presence-defaults-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -2682,7 +2968,7 @@ mod tests {
     fn record_contact_presence_recently_sets_recent_state() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-11-storage-tests")
-            .join(format!("presence-recently-{}.db", unique_suffix()));
+            .join(format!("presence-recently-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -2724,10 +3010,10 @@ mod tests {
     fn database_backup_export_creates_valid_copy() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("source-{}.db", unique_suffix()));
+            .join(format!("source-{}", unique_suffix())).join("omni.db");
         let backup_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("backup-{}.db", unique_suffix()));
+            .join(format!("backup-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -2776,7 +3062,7 @@ mod tests {
     fn duplicate_incoming_message_id_is_ignored() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -2816,7 +3102,7 @@ mod tests {
     fn inbound_dedup_foundation_tracks_message_id_once() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
@@ -2856,7 +3142,7 @@ mod tests {
     fn unsupported_legacy_history_database_is_reported() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let connection = Storage::open_keyed_connection(&db_path).unwrap();
         connection
@@ -2898,7 +3184,7 @@ mod tests {
     fn queue_schema_survives_restart() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -2931,7 +3217,7 @@ mod tests {
     fn attempt_count_accumulates_across_sending_sent_retrying_and_delivery() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-3-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3029,7 +3315,7 @@ mod tests {
     fn dialogs_with_due_pending_queue_lists_every_chat_with_a_waiting_message() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("due-pending-dialogs-{}.db", unique_suffix()));
+            .join(format!("due-pending-dialogs-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         storage
@@ -3058,10 +3344,52 @@ mod tests {
     }
 
     #[test]
+    fn group_lines_never_wait_in_the_one_to_one_queue() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-10-storage-tests")
+            .join(format!("group-lines-not-queued-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage
+            .create_local_account("Alice", "Office PC", 1_000)
+            .unwrap();
+        let group = "group:2cda550907964e18";
+
+        storage
+            .insert_group_outgoing_message("g-plain", group, "hi", 1_100)
+            .unwrap();
+        // The way a stuck row got there, and a status change that must not bring one.
+        storage
+            .insert_group_outgoing_message("g-stuck", group, "hi", 1_200)
+            .unwrap();
+        storage
+            .mark_queue_retry(
+                "g-stuck",
+                omni_types::QueueFailureKind::AckTimeout,
+                "stuck",
+                1_300,
+                1_300,
+            )
+            .unwrap();
+        assert_eq!(storage.dialogs_with_due_pending_queue(i64::MAX).unwrap(), vec![group.to_string()]);
+
+        // Every start runs the migrations.
+        storage.migrate().unwrap();
+        assert!(storage.outbound_queue_snapshot().unwrap().items.is_empty());
+        assert!(storage.dialogs_with_due_pending_queue(i64::MAX).unwrap().is_empty());
+        assert_eq!(storage.get_message("g-stuck").unwrap().status, MessageStatus::Sent);
+
+        storage
+            .update_message_status("g-plain", MessageStatus::Failed, 1_400)
+            .unwrap();
+        assert!(storage.outbound_queue_snapshot().unwrap().items.is_empty());
+    }
+
+    #[test]
     fn pending_queue_for_dialog_is_profile_scoped() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("pending-queue-profile-{}.db", unique_suffix()));
+            .join(format!("pending-queue-profile-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3128,7 +3456,7 @@ mod tests {
     fn create_local_account_persists_account_and_current_device() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3152,7 +3480,7 @@ mod tests {
     fn local_profile_list_and_summary_baseline_are_available() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("profiles-{}.db", unique_suffix()));
+            .join(format!("profiles-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3207,7 +3535,7 @@ mod tests {
     fn profile_registry_foundation_tracks_active_profile_and_current_device() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("profile-foundation-{}.db", unique_suffix()));
+            .join(format!("profile-foundation-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3240,7 +3568,7 @@ mod tests {
     fn profile_registry_supports_multiple_saved_profiles_and_active_switching() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("multi-profile-{}.db", unique_suffix()));
+            .join(format!("multi-profile-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3333,7 +3661,7 @@ mod tests {
     fn unsupported_legacy_profile_database_is_reported() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("backfill-{}.db", unique_suffix()));
+            .join(format!("backfill-{}", unique_suffix())).join("omni.db");
 
         let connection = Storage::open_keyed_connection(&db_path).unwrap();
         connection
@@ -3407,7 +3735,7 @@ mod tests {
     fn runtime_gate_helper_reports_not_signed_in_without_local_profile() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("runtime-gate-none-{}.db", unique_suffix()));
+            .join(format!("runtime-gate-none-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3419,7 +3747,7 @@ mod tests {
     fn restore_local_account_from_mnemonic_supports_v2() {
         let restore_db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("restore-v2-{}.db", unique_suffix()));
+            .join(format!("restore-v2-{}", unique_suffix())).join("omni.db");
 
         let root_secret = omni_identity::AccountRootSecret(
             "ababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_string(),
@@ -3442,7 +3770,7 @@ mod tests {
     fn inspect_recovery_input_distinguishes_existing_locked_profile() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-storage-tests")
-            .join(format!("inspect-locked-{}.db", unique_suffix()));
+            .join(format!("inspect-locked-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3482,7 +3810,7 @@ mod tests {
     fn reopen_local_profile_sets_active_profile_without_unlocking() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-storage-tests")
-            .join(format!("reopen-{}.db", unique_suffix()));
+            .join(format!("reopen-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3529,7 +3857,7 @@ mod tests {
     fn restore_local_account_from_mnemonic_rejects_existing_profile() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-storage-tests")
-            .join(format!("restore-conflict-{}.db", unique_suffix()));
+            .join(format!("restore-conflict-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3556,7 +3884,7 @@ mod tests {
     fn sign_out_keeps_profile_saved_and_transitions_to_locked_state() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("signout-{}.db", unique_suffix()));
+            .join(format!("signout-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3579,7 +3907,7 @@ mod tests {
     fn sign_out_keeps_local_account_shadow_profile_state_in_sync() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("signout-shadow-{}.db", unique_suffix()));
+            .join(format!("signout-shadow-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3607,7 +3935,7 @@ mod tests {
     fn password_unlock_and_wrong_password_behave_safely() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("pw-unlock-{}.db", unique_suffix()));
+            .join(format!("pw-unlock-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3639,7 +3967,7 @@ mod tests {
     fn mnemonic_unlock_and_wrong_mnemonic_behave_safely() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("mnemonic-unlock-{}.db", unique_suffix()));
+            .join(format!("mnemonic-unlock-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3675,7 +4003,7 @@ mod tests {
     fn reopen_local_profile_rejects_locked_profiles() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-13-storage-tests")
-            .join(format!("reopen-locked-{}.db", unique_suffix()));
+            .join(format!("reopen-locked-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3704,7 +4032,7 @@ mod tests {
     fn v2_profile_secrets_are_stored_encrypted_at_rest() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("profile-secrets-{}.db", unique_suffix()));
+            .join(format!("profile-secrets-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3725,6 +4053,55 @@ mod tests {
             .unwrap();
         assert!(encrypted_blob_json.is_some());
         assert!(!encrypted_blob_json.unwrap().contains("omni000"));
+    }
+
+    #[test]
+    fn files_of_deleted_rows_go_only_when_the_transaction_commits() {
+        // Code audit 2026-11-09, OMNI-05: the files went inside the transaction, so a later step's
+        // failure rolled the rows back over files already gone.
+        let test_root = std::env::temp_dir()
+            .join("omni-stage-4-storage-tests")
+            .join(format!("files-after-commit-{}", unique_suffix()));
+        let db_path = test_root.join("storage.db");
+        let source = test_root.join("kept-on-rollback.txt");
+        let avatar_source = test_root.join("kept-on-rollback.png");
+        fs::create_dir_all(&test_root).unwrap();
+        fs::write(&source, "attachment").unwrap();
+        fs::write(&avatar_source, tiny_png_bytes()).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let avatar = std::path::PathBuf::from(
+            storage.update_local_public_profile("Alice", Some(&avatar_source), false, 1_100).unwrap().public_avatar_image_path.unwrap(),
+        );
+        let profile_id = storage.list_local_profiles().unwrap().profiles[0].profile_id.clone();
+        let dialog = "dialog:instance:inst-bob";
+        storage.insert_outgoing_message("msg-1", dialog, "hello", omni_types::MessageStatus::Queued, 1_500).unwrap();
+        let blob = storage
+            .prepare_outgoing_attachment("msg-1", dialog, source.to_str().unwrap(), None, omni_types::AttachmentMediaProtectionMode::E2eeMedia, 1_510)
+            .unwrap()
+            .local_blob_path
+            .unwrap();
+
+        let failed = storage.with_immediate_transaction("delete then fail", |s| {
+            s.delete_attachment_assets_for_dialog(dialog)?;
+            s.delete_public_profile_assets_for_profile(&profile_id)?;
+            Err::<(), _>(omni_types::OmniError::Storage("a later step failed".into()))
+        });
+        assert!(failed.is_err());
+        assert!(storage.get_attachment_runtime_info("msg-1").unwrap().is_some(), "the row is back");
+        assert!(blob.exists(), "and so is its file");
+        assert!(avatar.exists(), "the profile's media too");
+
+        storage
+            .with_immediate_transaction("delete", |s| {
+                s.delete_attachment_assets_for_dialog(dialog)?;
+                s.delete_public_profile_assets_for_profile(&profile_id)
+            })
+            .unwrap();
+        assert!(storage.get_attachment_runtime_info("msg-1").unwrap().is_none());
+        assert!(!blob.exists(), "committed: the file goes");
+        assert!(!avatar.exists());
     }
 
     #[test]
@@ -3874,10 +4251,246 @@ mod tests {
     }
 
     #[test]
+    fn every_table_has_an_owner_so_a_profile_deletion_knows_it() {
+        // 2026-11-09: 35 tables were in no list, and deleting a profile left their rows — signed group
+        // lines with their text, member cards, mentions, passports. A new table without an owner fails
+        // here. The MLS crate's own tables go with `wipe_mls_state`.
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-10-storage-tests")
+            .join(format!("ownership-{}", unique_suffix()))
+            .join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        let mut statement = storage
+            .connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")
+            .unwrap();
+        let tables: Vec<String> = statement.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        let unowned: Vec<&String> = tables
+            .iter()
+            .filter(|name| !name.starts_with("openmls_") && name.as_str() != "omni_mls_snapshots")
+            .filter(|name| ownership_category_for_table(name).is_none())
+            .collect();
+        assert!(unowned.is_empty(), "tables with no owner: {unowned:?}");
+    }
+
+    #[test]
+    fn deleting_the_last_profile_leaves_no_row_and_no_value_of_it() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-10-storage-tests")
+            .join(format!("last-profile-{}", unique_suffix()))
+            .join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let profile_id = storage.list_local_profiles().unwrap().profiles[0].profile_id.clone();
+        let couriers_before: i64 = storage.connection.query_row("SELECT COUNT(*) FROM rendezvous_providers", [], |row| row.get(0)).unwrap();
+        storage
+            .record_group_signed_line(
+                "group-1",
+                &super::GroupSignedLine {
+                    message_id: "line-1".into(),
+                    kind: "text".into(),
+                    sender_pub: "pub".into(),
+                    sender_name: "Bob".into(),
+                    body: "a secret line".into(),
+                    authored_at_unix_ms: 1_000,
+                    signature_b64: "sig".into(),
+                    reply_to: None,
+                    mentions: Vec::new(),
+                },
+            )
+            .unwrap();
+        storage.store_group_member_profile("acct-bob", 1, "Bob", None, 1_000).unwrap();
+        storage.record_message_deletion("gone-1", "dialog:x", 1_000, false).unwrap();
+        storage.connection.execute("INSERT INTO durable_feed_seq (peer, seq) VALUES (x'01', 7)", []).unwrap();
+        storage.upsert_profile_meta("agent_self", "{}").unwrap();
+        assert_eq!(storage.get_profile_meta("agent_self").unwrap().as_deref(), Some("{}"));
+
+        storage.delete_local_profile(&profile_id).unwrap();
+
+        for table in ["group_signed_lines", "group_member_profiles", "message_deletions", "durable_feed_seq"] {
+            let left: i64 = storage.connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+            assert_eq!(left, 0, "{table} keeps rows of the deleted profile");
+        }
+        let profile_values: i64 = storage.connection.query_row("SELECT COUNT(*) FROM app_meta WHERE key LIKE 'profile:%'", [], |row| row.get(0)).unwrap();
+        assert_eq!(profile_values, 0, "the profile's own values go with it");
+        let couriers_after: i64 = storage.connection.query_row("SELECT COUNT(*) FROM rendezvous_providers", [], |row| row.get(0)).unwrap();
+        assert_eq!(couriers_after, couriers_before, "the couriers the user chose stay with the install");
+
+        // A profile made next is nothing of the deleted one.
+        storage.create_local_account("Carol", "Office PC", 2_000).unwrap();
+        assert_eq!(storage.get_profile_meta("agent_self").unwrap(), None);
+    }
+
+    #[test]
+    fn message_key_upgrade_keeps_legacy_rows_and_their_owner() {
+        let db = std::env::temp_dir().join(format!("omni-message-upgrade-{}", unique_suffix())).join("old.db");
+        let storage = Storage::open(db).unwrap();
+        storage.migrate().unwrap();
+        let alice = storage.create_local_account("Alice", "PC", 1).unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = storage.create_local_account("Bob", "Laptop", 2).unwrap().local_profile_summary.unwrap().profile_id;
+        storage.set_active_profile_id(Some(&alice)).unwrap();
+        storage.insert_outgoing_message("legacy", "account:x", "old text", MessageStatus::Queued, 10).unwrap();
+        // Recreate the v1 message id constraint and unscoped quote table in a populated installation.
+        storage.connection.execute_batch("
+            DROP TRIGGER message_children_follow_message;
+            CREATE TABLE legacy_messages AS SELECT * FROM messages;
+            DROP TABLE messages;
+            ALTER TABLE legacy_messages RENAME TO messages;
+            CREATE UNIQUE INDEX legacy_message_id ON messages(id);
+            DROP TABLE message_replies;
+            CREATE TABLE message_replies(message_id TEXT PRIMARY KEY, reply_to TEXT NOT NULL);
+            INSERT INTO message_replies VALUES ('legacy', 'old-parent');
+            UPDATE app_meta SET value = '1' WHERE key = 'schema_version';
+        ").unwrap();
+        storage.migrate().unwrap();
+        assert_eq!(storage.get_message("legacy").unwrap().body, "old text");
+        assert_eq!(storage.message_reply_to("legacy").unwrap().as_deref(), Some("old-parent"));
+        assert_eq!(storage.outbound_queue_snapshot().unwrap().queued_count, 1);
+        storage.set_active_profile_id(Some(&bob)).unwrap();
+        assert!(!storage.message_exists("legacy").unwrap());
+        storage.insert_incoming_message("legacy", "account:x", "new text", 11).unwrap();
+        assert_eq!(storage.message_reply_to("legacy").unwrap(), None);
+    }
+
+    #[test]
+    fn incoming_message_id_in_other_profile_does_not_block_delivery() {
+        let db = std::env::temp_dir().join(format!("omni-message-keys-{}", unique_suffix())).join("both.db");
+        let storage = Storage::open(db).unwrap();
+        storage.migrate().unwrap();
+        let alice = storage.create_local_account("Alice", "PC", 1).unwrap().local_profile_summary.unwrap().profile_id;
+        let bob = storage.create_local_account("Bob", "Laptop", 2).unwrap().local_profile_summary.unwrap().profile_id;
+        let dialog = "account:shared";
+        for (owner, body) in [(&alice, "first"), (&bob, "second")] {
+            storage.set_active_profile_id(Some(owner)).unwrap();
+            assert!(!storage.message_exists("same-id").unwrap());
+            assert_eq!(storage.insert_incoming_message("same-id", dialog, body, 10).unwrap().body, body);
+            assert!(storage.pin_message_here("same-id", dialog, true, 11, false).unwrap().is_some());
+            storage.remember_message_mentions("same-id", &[body.to_string()]).unwrap();
+            let file = storage.store_incoming_attachment_offer(
+                "same-id", dialog, body, 10, None, &"a".repeat(64), Some("chacha20_poly1305_v1"),
+                Some(TEST_MEDIA_KEY_HEX), Some(TEST_MEDIA_NONCE_SEED_HEX), Some(16_384), 11,
+            ).unwrap();
+            assert_eq!(file.attachment.file_name, body);
+            storage.record_message_device_receipt("same-id", &DeviceId(body.into()), 12).unwrap();
+        }
+        let other_photo = storage.shown_file_download_path("same-id", omni_types::AttachmentPresentationKindV1::Photo).unwrap();
+        storage.migrate().unwrap();
+        storage.delete_message_here("same-id").unwrap();
+        storage.set_active_profile_id(Some(&alice)).unwrap();
+        assert_eq!(storage.get_message("same-id").unwrap().body, "first");
+        assert_ne!(storage.shown_file_download_path("same-id", omni_types::AttachmentPresentationKindV1::Photo).unwrap(), other_photo);
+        assert_eq!(storage.get_attachment_runtime_info("same-id").unwrap().unwrap().attachment.file_name, "first");
+        assert!(storage.message_is_pinned("same-id").unwrap());
+        assert_eq!(storage.message_mentions("same-id").unwrap(), ["first"]);
+        assert_eq!(storage.message_delivered_devices("same-id").unwrap(), [DeviceId("first".into())]);
+    }
+
+    /// Blind audit 2026-11-13, pass 23: the move of tombstones to per profile gave every old one to
+    /// every profile — a profile's deletions kept the same ids out of the others. Each goes to the
+    /// owner when identifiable. An unknown dialog cannot authorize deletion in either profile.
+    #[test]
+    fn message_action_migration_does_not_clone_tombstone_to_other_profile() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-10-storage-tests")
+            .join(format!("tombstone-migration-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        let first = storage.create_local_account("Alice", "Office PC", 1_000).unwrap().local_profile_summary.unwrap().profile_id;
+        let second = storage.create_local_account("Bob", "Laptop", 1_100).unwrap().local_profile_summary.unwrap().profile_id;
+        storage.set_active_profile_id(Some(&first)).unwrap();
+        storage.insert_incoming_message("kept-a-1", "account:x", "still here", 1_200).unwrap();
+        storage.insert_incoming_message("shared-a", "account:shared", "A", 1_200).unwrap();
+        storage.set_active_profile_id(Some(&second)).unwrap();
+        storage.insert_incoming_message("shared-b", "account:shared", "B", 1_200).unwrap();
+        storage.set_active_profile_id(Some(&first)).unwrap();
+        // The layout from before: one row per message id, no profile.
+        storage
+            .connection
+            .execute_batch(
+                "DROP TABLE message_deletions;
+                 CREATE TABLE message_deletions (message_id TEXT PRIMARY KEY, dialog_key TEXT NOT NULL, at_unix_ms INTEGER NOT NULL,
+                     unsent INTEGER NOT NULL DEFAULT 0, changed INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO message_deletions (message_id, dialog_key, at_unix_ms) VALUES ('delete-a-1', 'account:x', 1), ('gone-1', 'dialog:gone', 1), ('shared-1', 'account:shared', 1);
+                 DROP TABLE message_delete_requests;
+                 CREATE TABLE message_delete_requests (message_id TEXT NOT NULL, dialog_key TEXT NOT NULL, requester_pub TEXT NOT NULL,
+                     requester_account TEXT NOT NULL, at_unix_ms INTEGER NOT NULL, received_at_unix_ms INTEGER NOT NULL,
+                     PRIMARY KEY (message_id, requester_pub, requester_account));",
+            )
+            .unwrap();
+        storage.migrate().unwrap();
+
+        assert!(storage.message_is_deleted("delete-a-1").unwrap(), "Alice's own");
+        assert!(!storage.message_is_deleted("shared-1").unwrap());
+        assert!(!storage.message_is_deleted("gone-1").unwrap());
+        storage.set_active_profile_id(Some(&second)).unwrap();
+        assert!(!storage.message_is_deleted("delete-a-1").unwrap(), "not Bob's conversation");
+        assert!(!storage.message_is_deleted("gone-1").unwrap(), "unknown owner");
+    }
+
+    /// Blind audit 2026-11-13, pass 23: pins, reactions and quotes looked messages up by conversation
+    /// alone — two profiles with a chat with one account share its dialog key, so one profile's
+    /// pinned lines showed in the other, and a pin or a reaction through the other changed them.
+    #[test]
+    fn pins_and_reactions_are_isolated_when_profiles_share_peer_dialog() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-10-storage-tests")
+            .join(format!("pins-per-profile-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        let first = storage.create_local_account("Alice", "Office PC", 1_000).unwrap().local_profile_summary.unwrap().profile_id;
+        let second = storage.create_local_account("Bob", "Laptop", 1_100).unwrap().local_profile_summary.unwrap().profile_id;
+        let dialog = "account:acct-x";
+
+        storage.set_active_profile_id(Some(&first)).unwrap();
+        storage.insert_incoming_message("m-x-17", dialog, "Alice's secret", 1_200).unwrap();
+        assert!(storage.pin_message_here("m-x-17", dialog, true, 1_300, false).unwrap().is_some());
+
+        storage.set_active_profile_id(Some(&second)).unwrap();
+        assert!(storage.pinned_messages(dialog).unwrap().is_empty(), "Alice's pins are not Bob's");
+        assert!(!storage.message_is_pinned("m-x-17").unwrap());
+        assert!(!storage.set_message_pin("m-x-17", dialog, false, 1_400, false, 1_400).unwrap(), "not Bob's line to unpin");
+        assert!(!storage.set_message_reaction("m-x-17", dialog, "acct-x", false, "👍", 1_400, false, 1_400).unwrap());
+
+        storage.set_active_profile_id(Some(&first)).unwrap();
+        assert_eq!(storage.pinned_messages(dialog).unwrap().len(), 1, "still pinned for Alice");
+        assert!(storage.message_reactions("m-x-17").unwrap().is_empty());
+    }
+
+    /// Blind audit 2026-11-13, pass 22: tombstones were kept by message id alone — a line a profile
+    /// deleted kept the line of the same id out of another profile of the database, and the other
+    /// profile's devices were told its deleted ids.
+    #[test]
+    fn deleted_id_in_profile_a_does_not_suppress_profile_b() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-10-storage-tests")
+            .join(format!("tombstone-per-profile-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        let first = storage.create_local_account("Alice", "Office PC", 1_000).unwrap().local_profile_summary.unwrap().profile_id;
+        let second = storage.create_local_account("Bob", "Laptop", 1_100).unwrap().local_profile_summary.unwrap().profile_id;
+
+        storage.set_active_profile_id(Some(&first)).unwrap();
+        storage.record_message_deletion("same-001", "dialog:x", 1_200, true).unwrap();
+        storage.record_message_delete_request("asked-001", "dialog:x", "", "acct-x", 1_200, 1_200).unwrap();
+        assert!(storage.message_is_deleted("same-001").unwrap());
+
+        storage.set_active_profile_id(Some(&second)).unwrap();
+        assert!(!storage.message_is_deleted("same-001").unwrap(), "another profile's tombstone");
+        assert!(storage.recent_chat_deletions().unwrap().1.is_empty(), "its own devices hear nothing of the other profile");
+        assert!(storage.unsent_message_deletions("dialog:x").unwrap().is_empty());
+        assert!(storage.take_message_delete_requests("asked-001").unwrap().is_empty());
+
+        storage.set_active_profile_id(Some(&first)).unwrap();
+        assert_eq!(storage.take_message_delete_requests("asked-001").unwrap().len(), 1, "the profile's own request stays");
+    }
+
+    #[test]
     fn delete_local_profile_keeps_other_profiles_and_active_context_intact() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("delete-inactive-profile-{}.db", unique_suffix()));
+            .join(format!("delete-inactive-profile-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -3990,7 +4603,7 @@ mod tests {
     fn add_contact_is_idempotent_for_same_remote_account_id() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("contact-dedup-{}.db", unique_suffix()));
+            .join(format!("contact-dedup-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4039,7 +4652,7 @@ mod tests {
     fn duplicate_contacts_with_same_remote_account_merge_into_canonical_profile_state() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("contact-merge-existing-{}.db", unique_suffix()));
+            .join(format!("contact-merge-existing-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4221,7 +4834,7 @@ mod tests {
     fn pending_contact_placeholder_names_are_enriched_after_identity_is_known() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("contact-enrich-{}.db", unique_suffix()));
+            .join(format!("contact-enrich-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4267,7 +4880,7 @@ mod tests {
     fn custom_petname_survives_identity_enrichment() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("contact-enrich-custom-{}.db", unique_suffix()));
+            .join(format!("contact-enrich-custom-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4312,7 +4925,7 @@ mod tests {
     fn dangerous_action_previews_are_honest_for_stage10_scope() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-10-storage-tests")
-            .join(format!("dangerous-previews-{}.db", unique_suffix()));
+            .join(format!("dangerous-previews-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4398,10 +5011,10 @@ mod tests {
     fn restore_local_account_reuses_account_identity_and_marks_restored_state() {
         let original_db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("orig-{}.db", unique_suffix()));
+            .join(format!("orig-{}", unique_suffix())).join("omni.db");
         let restore_db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("restore-{}.db", unique_suffix()));
+            .join(format!("restore-{}", unique_suffix())).join("omni.db");
 
         let original_storage = Storage::open(&original_db_path).unwrap();
         original_storage.migrate().unwrap();
@@ -4436,7 +5049,7 @@ mod tests {
     fn local_identity_survives_storage_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4465,7 +5078,7 @@ mod tests {
     fn identity_migration_is_safe_on_stage3_database() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let connection = Storage::open_keyed_connection(&db_path).unwrap();
         connection
@@ -4505,7 +5118,7 @@ mod tests {
     fn shadow_current_device_rows_can_coexist_across_profiles() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-4-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -4552,7 +5165,7 @@ mod tests {
     fn unsupported_legacy_crypto_database_is_reported() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         let connection = Storage::open_keyed_connection(&db_path).unwrap();
@@ -4638,7 +5251,7 @@ mod tests {
     fn unsupported_legacy_toy_crypto_database_is_reported() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("toy-{}.db", unique_suffix()));
+            .join(format!("toy-{}", unique_suffix())).join("omni.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         let connection = Storage::open_keyed_connection(&db_path).unwrap();
@@ -4841,7 +5454,7 @@ mod tests {
     ) {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("prekey-migration-{}.db", unique_suffix()));
+            .join(format!("prekey-migration-{}", unique_suffix())).join("omni.db");
 
         let connection = Storage::open_keyed_connection(&db_path).unwrap();
         connection
@@ -5047,7 +5660,7 @@ mod tests {
     fn ensure_local_crypto_foundation_repairs_missing_one_time_prekeys_without_sessions() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("repair-partial-foundation-{}.db", unique_suffix()));
+            .join(format!("repair-partial-foundation-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5122,7 +5735,7 @@ mod tests {
         // мог любой профиль.
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("drained-prekeys-with-sessions-{}.db", unique_suffix()));
+            .join(format!("drained-prekeys-with-sessions-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5201,7 +5814,7 @@ mod tests {
     fn a_one_time_prekey_taken_by_one_peer_still_opens_another_peers_bootstrap_for_a_week() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("shared-one-time-prekey-{}.db", unique_suffix()));
+            .join(format!("shared-one-time-prekey-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
@@ -5235,6 +5848,81 @@ mod tests {
         );
     }
 
+    fn prekey_private_blob(storage: &Storage, table: &str, prekey_id: u32) -> String {
+        storage
+            .connection
+            .query_row(
+                &format!("SELECT private_key_blob FROM {table} WHERE prekey_id = ?1"),
+                rusqlite::params![prekey_id as i64],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// V-09: a new signed prekey every week. The old one still opens bootstraps that name it until a
+    /// week past its expiry; then its private half is gone from the database, the row and number stay.
+    #[test]
+    fn a_signed_prekey_rotates_weekly_and_its_private_half_is_erased_after_late_bootstraps() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-5-storage-tests")
+            .join(format!("signed-prekey-rotation-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let device = storage.get_local_device().unwrap().unwrap();
+        let start = 1_100;
+        storage.ensure_local_crypto_foundation(start).unwrap();
+        let first = storage.get_active_signed_prekey(&device.device_id).unwrap().unwrap();
+        assert_eq!(first.expires_at_unix_ms, Some(start + omni_crypto::SIGNED_PREKEY_LIFETIME_MS));
+
+        let week = crate::SIGNED_PREKEY_ROTATION_MS;
+        assert!(!storage.maintain_local_prekeys(start + week - 1).unwrap(), "not due yet");
+        assert!(storage.maintain_local_prekeys(start + week).unwrap(), "due after a week");
+        let second = storage.get_active_signed_prekey(&device.device_id).unwrap().unwrap();
+        assert!(second.prekey_id > first.prekey_id, "numbered after the ones stored");
+        assert_eq!(
+            storage.build_local_prekey_bundle(start + week).unwrap().signed_prekey.prekey_id,
+            second.prekey_id,
+            "the bundle carries the new one"
+        );
+
+        let erase_at = first.expires_at_unix_ms.unwrap() + crate::PREKEY_LATE_BOOTSTRAP_MS;
+        storage.maintain_local_prekeys(erase_at - 1).unwrap();
+        assert!(
+            storage.get_signed_prekey_for_inbound_bootstrap(&device.device_id, first.prekey_id).unwrap().is_some(),
+            "a late bootstrap from a bundle with the old prekey still opens"
+        );
+        storage.maintain_local_prekeys(erase_at).unwrap();
+        assert!(storage.get_signed_prekey_for_inbound_bootstrap(&device.device_id, first.prekey_id).unwrap().is_none());
+        assert_eq!(prekey_private_blob(&storage, "signed_prekeys", first.prekey_id), "");
+    }
+
+    /// V-09: a one-time prekey's private half is erased once its shared week is over.
+    #[test]
+    fn a_taken_one_time_prekey_is_erased_after_its_shared_week() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-5-storage-tests")
+            .join(format!("one-time-prekey-erase-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let device = storage.get_local_device().unwrap().unwrap();
+        storage.ensure_local_crypto_foundation(1_100).unwrap();
+        let named = storage.build_local_prekey_bundle(1_200).unwrap().one_time_prekey.unwrap().prekey_id;
+        let taken_at = 10_000;
+        storage.mark_one_time_prekey_consumed(&device.device_id, named, taken_at).unwrap();
+
+        storage.maintain_local_prekeys(taken_at + crate::ONE_TIME_PREKEY_SHARED_GRACE_MS - 1).unwrap();
+        assert_ne!(prekey_private_blob(&storage, "one_time_prekeys", named), "", "kept within the week");
+        storage.maintain_local_prekeys(taken_at + crate::ONE_TIME_PREKEY_SHARED_GRACE_MS + 1).unwrap();
+        assert_eq!(prekey_private_blob(&storage, "one_time_prekeys", named), "");
+        storage.replenish_one_time_prekeys(&device.device_id, taken_at).unwrap();
+        assert!(
+            storage.get_available_one_time_prekey_by_id(&device.device_id, named).unwrap().is_none(),
+            "the erased number is not handed out again"
+        );
+    }
+
     #[test]
     fn replenished_prekey_ids_continue_past_everything_already_stored() {
         // Номера обязано назначать ХРАНИЛИЩЕ. Генератор берёт их из счётчика, который живёт в
@@ -5248,7 +5936,7 @@ mod tests {
         // ставит генератор заведомо «позади» — без назначения из хранилища проверка падает.
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("prekey-ids-continue-{}.db", unique_suffix()));
+            .join(format!("prekey-ids-continue-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5288,7 +5976,7 @@ mod tests {
         // bootstrap'ы отваливались бы с «expected one-time prekey is missing».
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("refill-on-consume-{}.db", unique_suffix()));
+            .join(format!("refill-on-consume-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5327,7 +6015,7 @@ mod tests {
     fn a_stale_session_copy_is_refused_and_a_fresh_one_is_stored() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("cas-{}.db", unique_suffix()));
+            .join(format!("cas-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         let account = storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
@@ -5393,18 +6081,131 @@ mod tests {
         assert_eq!(stored.send_counter, rebuilt.send_counter, "the replacement is what is stored");
         assert_eq!(stored.revision, 5);
         assert_eq!(rebuilt.revision, 5);
+        // A new session replacing the row is as old as itself: the fresh-session grace for stray
+        // frames of the old one is measured from it (it kept the old one's age before).
+        let (newer, _) =
+            bootstrap_initiator_session(&local_identity_key, &local_device_key, &remote_bundle, 2_000).unwrap();
+        let mut newer = establish_session(&newer, 2_001);
+        storage.replace_session_record(&mut newer).unwrap();
+        assert_eq!(storage.get_session_record(&address).unwrap().unwrap().created_at_unix_ms, 2_000);
 
         // Legacy rows (revision 0, before the column existed) are lifted to 1 on migrate.
         storage.connection.execute("UPDATE sessions SET revision = 0", []).unwrap();
         storage.migrate().unwrap();
         assert_eq!(storage.get_session_record(&address).unwrap().unwrap().revision, 1);
+
+        // A copy read before its session was deleted does not insert it back (blind audit
+        // 2026-11-10): the deleted keys stay deleted.
+        let mut read_before = storage.get_session_record(&address).unwrap().unwrap();
+        storage.delete_session_state_for_session_address(&address).unwrap();
+        read_before.send_counter += 1;
+        let error = storage.store_session_record(&mut read_before).unwrap_err().to_string();
+        assert!(error.contains(crate::STALE_SESSION_WRITE), "{error}");
+        assert!(storage.get_session_record(&address).unwrap().is_none(), "the deleted session stays deleted");
+    }
+
+    /// Two profiles of one database, each with its own session to the same remote device (blind
+    /// audit 2026-11-10): keyed by the remote address alone, the second one's new session overwrote
+    /// the first one's row — its keys and chains — and could not read it back. Replay windows the
+    /// same. And a database from before keeps its rows when the key is rebuilt.
+    /// Bootstrap marks are a profile's, as its sessions are (maintainers' decision 2026-11-11): a mark of
+    /// one profile made the other profile's fresh bootstrap from the same remote device look like a
+    /// replay.
+    #[test]
+    fn two_profiles_keep_their_own_bootstrap_marks_of_the_same_remote_device() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-5-storage-tests")
+            .join(format!("two-profile-marks-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        let profile_of = |name: &str, at: i64| {
+            let account = storage.create_local_account(name, "PC", at).unwrap();
+            account.local_profile_summary.as_ref().unwrap().profile_id.clone()
+        };
+        let alice = profile_of("Alice", 1_000);
+        let bob = profile_of("Bob", 2_000);
+        let (remote_account, remote_device) = (AccountId("acct-remote".into()), DeviceId("dev-remote".into()));
+        storage.set_active_profile_id(Some(&alice)).unwrap();
+        storage.record_inbound_bootstrap_at(&remote_account, &remote_device, 5_000, i64::MAX).unwrap();
+        assert_eq!(storage.newest_inbound_bootstrap_at(&remote_account, &remote_device).unwrap(), Some(5_000));
+        storage.set_active_profile_id(Some(&bob)).unwrap();
+        assert_eq!(storage.newest_inbound_bootstrap_at(&remote_account, &remote_device).unwrap(), None, "not Alice's mark");
+        storage.record_inbound_bootstrap_at(&remote_account, &remote_device, 3_000, i64::MAX).unwrap();
+        assert_eq!(storage.newest_inbound_bootstrap_at(&remote_account, &remote_device).unwrap(), Some(3_000));
+        storage.set_active_profile_id(Some(&alice)).unwrap();
+        assert_eq!(storage.newest_inbound_bootstrap_at(&remote_account, &remote_device).unwrap(), Some(5_000), "hers stays");
+    }
+
+    #[test]
+    fn two_profiles_keep_their_own_sessions_with_the_same_remote_device() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-5-storage-tests")
+            .join(format!("two-profile-sessions-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        let remote = generate_local_key_hierarchy(
+            &AccountId("acct-remote".to_string()),
+            &DeviceId("dev-remote".to_string()),
+            1_200,
+            1,
+        )
+        .unwrap();
+        let remote_bundle =
+            build_prekey_bundle(&remote.identity_key, &remote.device_key, &remote.signed_prekey, None, 1_200).unwrap();
+        let session_for = |name: &str, at: i64| {
+            let account = storage.create_local_account(name, "PC", at).unwrap();
+            let profile = account.local_profile_summary.as_ref().unwrap().profile_id.clone();
+            let device = storage.get_local_device().unwrap().unwrap();
+            storage.ensure_local_crypto_foundation(at + 1).unwrap();
+            let identity = storage.get_local_identity_key(&account.descriptor.account_id).unwrap().unwrap();
+            let device_key = storage.get_local_device_key(&device.device_id).unwrap().unwrap();
+            let (built, _) = bootstrap_initiator_session(&identity, &device_key, &remote_bundle, at + 2).unwrap();
+            let mut session = establish_session(&built, at + 3);
+            storage.replace_session_record(&mut session).unwrap();
+            let mut window = storage.ensure_replay_window(&session.session_address, at + 4).unwrap();
+            window.highest_counter = at as u64;
+            storage.store_replay_window(&window).unwrap();
+            (profile, account.descriptor.account_id, session.session_address)
+        };
+        let (alice, alice_account, address) = session_for("Alice", 1_000);
+        let (bob, bob_account, bob_address) = session_for("Bob", 2_000);
+        assert_eq!(address, bob_address, "the same remote device");
+
+        for (profile, account, highest) in [(&alice, &alice_account, 1_000), (&bob, &bob_account, 2_000)] {
+            storage.set_active_profile_id(Some(profile)).unwrap();
+            let session = storage.get_session_record(&address).unwrap().expect("its own session");
+            assert_eq!(&session.local_account_id, account);
+            assert_eq!(storage.ensure_replay_window(&address, 9_000).unwrap().highest_counter, highest);
+        }
+
+        // A database from before: the old single-column key, a row in it (of a session that exists,
+        // or migrate drops it as an orphan). The rebuild keeps it.
+        storage.connection.execute_batch(&format!(
+            "DROP TABLE replay_windows;
+             CREATE TABLE replay_windows (session_address TEXT PRIMARY KEY NOT NULL, highest_counter INTEGER NOT NULL DEFAULT 0, recent_tags_json TEXT NOT NULL, updated_at_unix_ms INTEGER NOT NULL, profile_id TEXT);
+             INSERT INTO replay_windows VALUES ('{}', 7, '[]', 1, '{}');",
+            address.storage_key(),
+            alice.0
+        )).unwrap();
+        storage.migrate().unwrap();
+        storage.set_active_profile_id(Some(&alice)).unwrap();
+        assert_eq!(storage.ensure_replay_window(&address, 9_000).unwrap().highest_counter, 7);
+        let key: Vec<String> = storage
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('replay_windows') WHERE pk > 0 ORDER BY pk")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(key, ["profile_id", "session_address"]);
     }
 
     #[test]
     fn local_crypto_identity_and_session_records_survive_reopen() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5486,7 +6287,7 @@ mod tests {
     fn stage6_sync_migration_is_safe_on_existing_stage5_state() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-6-storage-tests")
-            .join(format!("legacy-{}.db", unique_suffix()));
+            .join(format!("legacy-{}", unique_suffix())).join("omni.db");
 
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5603,7 +6404,7 @@ mod tests {
         // even if files don't exist — graceful NotFound handling).
         let target = std::env::temp_dir()
             .join("omni-tm006-confinement-tests")
-            .join(format!("ok-{}.db", unique_suffix()));
+            .join(format!("ok-{}", unique_suffix())).join("omni.db");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         let result = Storage::delete_local_data_at_path(&target);
         assert!(
@@ -5620,7 +6421,7 @@ mod tests {
     fn count_inbound_attachments_for_dialog_counts_only_downloads_holding_a_file() {
         let db_path = std::env::temp_dir()
             .join("omni-tm005-storage-tests")
-            .join(format!("count-{}.db", unique_suffix()));
+            .join(format!("count-{}", unique_suffix())).join("omni.db");
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
@@ -5681,10 +6482,89 @@ mod tests {
         assert_eq!(storage.count_inbound_attachments_for_dialog(&dialog_a).unwrap(), 1);
     }
 
+    #[test]
+    fn a_late_preparation_keeps_the_copy_another_pass_already_completed() {
+        let root = std::env::temp_dir().join("omni-prepare-storage-tests")
+            .join(format!("late-completion-{}", unique_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = Storage::open(root.join("omni.db")).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "PC", 1_000).unwrap();
+        let dialog = dialog_key_from_instance_id("inst-bob");
+        let source = root.join("small.bin");
+        fs::write(&source, b"keep this attachment").unwrap();
+        storage.begin_outgoing_attachment("raced", &dialog, &source.to_string_lossy(), None,
+            omni_types::AttachmentMediaProtectionMode::E2eeMedia, 1_000).unwrap();
+        let read = storage.read_outgoing_attachment_preparation("raced", &mut |_| true).unwrap();
+        // Another pass finishes between our copy and conditional row update. Its row now
+        // owns that copy; our UPDATE affects zero rows, just as after a lost race.
+        storage.connection.execute_batch("
+            CREATE TRIGGER complete_before_late_update BEFORE UPDATE OF content_id_hex ON message_attachments
+            WHEN OLD.message_id = 'raced' AND OLD.state = 'preparing' AND NEW.state = 'available'
+            BEGIN
+                UPDATE message_attachments SET state = 'available',
+                    local_blob_path = NEW.local_blob_path, local_blob_managed = NEW.local_blob_managed
+                    WHERE message_id = OLD.message_id AND profile_id = OLD.profile_id;
+                SELECT RAISE(IGNORE);
+            END;
+        ").unwrap();
+        assert!(storage.complete_outgoing_attachment_preparation(&read, 1_100).is_err());
+        let runtime = storage.get_attachment_runtime_info("raced").unwrap().unwrap();
+        assert_eq!(runtime.attachment.state, omni_types::AttachmentTransferState::Available);
+        let blob = runtime.local_blob_path.unwrap();
+        assert!(blob.is_file(), "the completed row must keep its copy");
+        assert_eq!(storage.read_media_file(&blob).unwrap(), b"keep this attachment");
+    }
+
     /// A big outgoing file is written down first and read later (C2, attachment-content-tree.md):
     /// `Preparing` is not a copy to serve; the read makes it `Available` under the tree of the very
     /// file that was picked; a changed file, a stopped pass and a cancelled row end without a tree —
     /// and without a managed copy left behind.
+    /// Blind audit 2026-11-13, pass 22: a small file's managed copy is made as its row is completed;
+    /// when that transaction rolled back (the group offer beside it failed), the copy stayed on the
+    /// disk, named by no row.
+    #[test]
+    fn group_offer_rollback_removes_new_managed_blob() {
+        let root = std::env::temp_dir()
+            .join("omni-prepare-storage-tests")
+            .join(format!("rollback-{}", unique_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = Storage::open(root.join("omni.db")).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "PC", 1_000).unwrap();
+        let dialog = dialog_key_from_instance_id("inst-bob");
+        let source = root.join("small.bin");
+        fs::write(&source, vec![7u8; 100]).unwrap();
+        storage.insert_outgoing_message("m-small", &dialog, "", omni_types::MessageStatus::Queued, 1_000).unwrap();
+        storage
+            .begin_outgoing_attachment("m-small", &dialog, &source.to_string_lossy(), None, omni_types::AttachmentMediaProtectionMode::E2eeMedia, 1_000)
+            .unwrap();
+        let read = storage.read_outgoing_attachment_preparation("m-small", &mut |_| true).unwrap();
+        let files = |dir: &std::path::Path| {
+            let mut all = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(at) = stack.pop() {
+                for entry in fs::read_dir(&at).unwrap().flatten() {
+                    if entry.path().is_dir() { stack.push(entry.path()) } else { all.push(entry.path()) }
+                }
+            }
+            all.retain(|p| !p.to_string_lossy().contains("omni.db"));
+            all.sort();
+            all
+        };
+        let before = files(&root);
+
+        let failed: omni_types::OmniResult<()> = storage.with_immediate_transaction("prepared attachment", |storage| {
+            let ready = storage.complete_outgoing_attachment_preparation(&read, 1_100)?;
+            assert_eq!(ready, vec!["m-small".to_string()]);
+            Err(omni_types::OmniError::StorageLocked("the offer failed".into()))
+        });
+        assert!(failed.is_err());
+        let after = storage.get_attachment_runtime_info("m-small").unwrap().unwrap();
+        assert_eq!(after.attachment.state, omni_types::AttachmentTransferState::Preparing);
+        assert_eq!(files(&root), before, "no copy left behind");
+    }
+
     #[test]
     fn an_outgoing_file_is_prepared_in_two_steps_and_a_stopped_one_leaves_nothing() {
         let root = std::env::temp_dir()
@@ -5997,7 +6877,7 @@ mod tests {
         // exist — the helper walks up to an existing ancestor when
         // the leaf is missing.
         let temp = std::env::temp_dir();
-        let candidate = temp.join(format!("omni-tm006-confine-{}.db", unique_suffix()));
+        let candidate = temp.join(format!("omni-tm006-confine-{}", unique_suffix())).join("omni.db");
         let result = Storage::confine_destructive_path_for_callers(&candidate);
         assert!(
             result.is_ok(),
@@ -6015,7 +6895,7 @@ mod tests {
     fn an_old_builds_group_ops_does_not_cost_the_groups_and_a_newer_schema_is_refused() {
         let db_path = std::env::temp_dir()
             .join("omni-groups-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         let account = storage.create_local_account("Alice", "Laptop", 1_000).expect("account");
@@ -6054,10 +6934,82 @@ mod tests {
     }
 
     #[test]
+    fn a_members_new_announcement_replaces_its_branches_and_keeps_fetched_only_where_unchanged() {
+        let db_path = std::env::temp_dir()
+            .join("omni-workspace-tests")
+            .join(format!("{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).expect("storage should open");
+        storage.migrate().expect("migrations should succeed");
+        let account = storage.create_local_account("Alice", "Laptop", 1_000).expect("account");
+        let profile_id = account.local_profile_summary.as_ref().expect("profile summary").profile_id.clone();
+        storage.set_active_profile_id(Some(&profile_id)).unwrap();
+        let (gid, a, b) = ("00112233445566778899aabbccddeeff", "a".repeat(40), "b".repeat(40));
+
+        let repo = super::WorkspaceRepoRecord {
+            group_id: gid.into(),
+            repo: "api".into(),
+            published_path: "D:/ws/api.git".into(),
+            work_path: None,
+            announced_refs_json: None,
+            created_at_unix_ms: 1,
+        };
+        storage.upsert_workspace_repo(&repo).unwrap();
+        assert_eq!(storage.get_workspace_repo(gid, "api").unwrap(), Some(repo));
+
+        let main = ("refs/heads/main".to_string(), a.clone());
+        let feat = ("refs/heads/feat".to_string(), a.clone());
+        storage.replace_workspace_member_refs(gid, "api", "bob", "bob-dev", &[main.clone(), feat.clone()], 10).unwrap();
+        storage.mark_workspace_member_ref_fetched(gid, "api", "bob", "refs/heads/main", &a).unwrap();
+        storage.mark_workspace_member_ref_fetched(gid, "api", "bob", "refs/heads/feat", &a).unwrap();
+        storage.replace_workspace_member_refs(gid, "api", "carol", "carol-dev", std::slice::from_ref(&main), 11).unwrap();
+
+        // Bob moved feat and dropped nothing else; main is the same commit.
+        storage
+            .replace_workspace_member_refs(gid, "api", "bob", "bob-dev", &[main.clone(), ("refs/heads/feat".into(), b.clone())], 20)
+            .unwrap();
+        let refs = storage.list_workspace_member_refs(gid, "api").unwrap();
+        let of = |acc: &str, name: &str| refs.iter().find(|r| r.account_id == acc && r.ref_name == name).cloned();
+        assert!(of("bob", "refs/heads/main").unwrap().fetched, "an unchanged branch stays fetched");
+        assert!(!of("bob", "refs/heads/feat").unwrap().fetched, "a moved branch waits for its objects");
+        assert_eq!(of("bob", "refs/heads/feat").unwrap().oid, b);
+        assert!(of("carol", "refs/heads/main").is_some(), "one member's announcement leaves another's alone");
+
+        // Bob deleted feat: gone from his branches.
+        storage.replace_workspace_member_refs(gid, "api", "bob", "bob-dev", &[main], 30).unwrap();
+        assert!(storage.list_workspace_member_refs(gid, "api").unwrap().iter().all(|r| r.ref_name != "refs/heads/feat"));
+
+        // The rule: none yet is "any maintainer"; a later one wins, an earlier one is dropped; each
+        // project has its own.
+        assert_eq!(storage.get_workspace_main_rule(gid, "api").unwrap(), super::WorkspaceMainRuleRecord::default());
+        let strict = super::WorkspaceMainRuleRecord { main_needs_approval: true, changed_at_unix_ms: 50 };
+        assert!(storage.put_workspace_main_rule_if_newer(gid, "api", &strict).unwrap());
+        let stale = super::WorkspaceMainRuleRecord { main_needs_approval: false, changed_at_unix_ms: 40 };
+        assert!(!storage.put_workspace_main_rule_if_newer(gid, "api", &stale).unwrap());
+        assert_eq!(storage.get_workspace_main_rule(gid, "api").unwrap(), strict);
+        assert!(!storage.get_workspace_main_rule(gid, "web").unwrap().main_needs_approval, "another project keeps its own rule");
+
+        // Approvals: an account keeps only its newest ones.
+        for i in 0..super::WORKSPACE_APPROVALS_PER_ACCOUNT + 3 {
+            storage.add_workspace_approval(gid, "api", "carol", &format!("{i:040x}"), 100 + i as i64).unwrap();
+        }
+        storage.add_workspace_approval(gid, "api", "dave", &a, 100).unwrap();
+        let approvals = storage.list_workspace_approvals(gid, "api").unwrap();
+        assert_eq!(approvals.iter().filter(|(acc, _)| acc == "carol").count(), super::WORKSPACE_APPROVALS_PER_ACCOUNT);
+        assert!(!approvals.contains(&("carol".into(), format!("{:040x}", 0))), "the oldest went");
+        assert!(approvals.contains(&("dave".into(), a.clone())), "another account's are its own");
+
+        storage.delete_group_chat_rows(gid).unwrap();
+        assert!(storage.list_workspace_repos(gid).unwrap().is_empty());
+        assert!(storage.list_workspace_member_refs(gid, "api").unwrap().is_empty());
+        assert!(storage.list_workspace_approvals(gid, "api").unwrap().is_empty());
+        assert!(!storage.get_workspace_main_rule(gid, "api").unwrap().main_needs_approval);
+    }
+
+    #[test]
     fn group_rows_members_invites_and_epoch_bookkeeping_roundtrip() {
         let db_path = std::env::temp_dir()
             .join("omni-groups-tests")
-            .join(format!("{}.db", unique_suffix()));
+            .join(format!("{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         let account = storage
@@ -6136,6 +7088,43 @@ mod tests {
         assert_eq!(storage.take_group_pending_inbound(group_id).unwrap(), vec![b"e4".to_vec(), b"e5".to_vec()]);
         assert!(storage.take_group_pending_inbound(group_id).unwrap().is_empty());
 
+        // Bounded (blind audit 2026-11-10): anyone naming the group can send what we cannot read yet.
+        for n in 0..super::GROUP_PENDING_INBOUND_MAX_ROWS {
+            assert!(storage.push_group_pending_inbound(group_id, 1, format!("m{n}").as_bytes(), 20).unwrap());
+        }
+        assert!(!storage.push_group_pending_inbound(group_id, 1, b"one more", 21).unwrap(), "rows per group");
+        assert_eq!(storage.take_group_pending_inbound(group_id).unwrap().len() as i64, super::GROUP_PENDING_INBOUND_MAX_ROWS);
+        let big = vec![7u8; 4 * 1024 * 1024];
+        for n in 0..4u8 {
+            let mut blob = big.clone();
+            blob[0] = n;
+            assert!(storage.push_group_pending_inbound(group_id, 1, &blob, 30).unwrap());
+        }
+        assert!(!storage.push_group_pending_inbound(group_id, 1, b"x", 31).unwrap(), "bytes per group");
+        for other in ["g-b", "g-c", "g-d"] {
+            for n in 0..4u8 {
+                let mut blob = big.clone();
+                blob[0] = n;
+                assert!(storage.push_group_pending_inbound(other, 1, &blob, 40).unwrap());
+            }
+        }
+        assert!(!storage.push_group_pending_inbound("g-e", 1, b"x", 41).unwrap(), "bytes for all groups");
+        for gid in [group_id, "g-b", "g-c", "g-d"] {
+            storage.take_group_pending_inbound(gid).unwrap();
+        }
+        // Full of messages saying they are far ahead (their epoch is anyone's to write until they
+        // open), one for a nearer epoch takes the place of the farthest (blind audit 2026-11-13,
+        // pass 19): it was turned away.
+        for n in 0..super::GROUP_PENDING_INBOUND_MAX_ROWS {
+            assert!(storage.push_group_pending_inbound(group_id, 100 + n as u64, format!("far{n}").as_bytes(), 50).unwrap());
+        }
+        assert!(storage.push_group_pending_inbound(group_id, 2, b"the next epoch", 51).unwrap());
+        let kept = storage.list_group_pending_inbound(group_id).unwrap();
+        assert_eq!(kept.len() as i64, super::GROUP_PENDING_INBOUND_MAX_ROWS);
+        assert_eq!(kept[0], (2, b"the next epoch".to_vec()));
+        assert!(!kept.iter().any(|(epoch, _)| *epoch == 100 + super::GROUP_PENDING_INBOUND_MAX_ROWS as u64 - 1), "the farthest went");
+        storage.take_group_pending_inbound(group_id).unwrap();
+
         // Outbox: what we sent at an epoch or later; own changes taken once.
         storage.record_group_outbox(group_id, 3, "m1", "{\"a\":1}", 1).unwrap();
         storage.record_group_outbox(group_id, 4, "m2", "{\"a\":2}", 2).unwrap();
@@ -6202,7 +7191,7 @@ mod tests {
         use omni_types::RemoteAccessMode;
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("remote-access-{}.db", unique_suffix()));
+            .join(format!("remote-access-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).expect("storage should open");
         storage.migrate().expect("migrations should succeed");
         storage.create_local_account("Alice", "Office PC", 1_000).expect("account");
@@ -6254,7 +7243,7 @@ mod tests {
     fn open_account_key_storage(label: &str) -> Storage {
         let db_path = std::env::temp_dir()
             .join("omni-account-key-tests")
-            .join(format!("{label}-{}.db", unique_suffix()));
+            .join(format!("{label}-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         storage
@@ -6397,6 +7386,50 @@ mod tests {
             laptop.list_device_revocations(&revocation.account_id).unwrap(),
             vec![revocation]
         );
+    }
+
+    /// Blind audit 2026-11-13, pass 18: the signed revocation and the device's mark were written
+    /// apart. A failure between them left the device refused on 1:1 yet still taken for ours where
+    /// only the mark is read (the git of our own devices). Both go in, or neither.
+    #[test]
+    fn a_revocation_is_written_with_the_devices_mark_or_not_at_all() {
+        let (laptop, _desktop, _laptop_id, desktop_id) = laptop_and_desktop_that_know_each_other("revoke-atomic");
+        let revocation = laptop.issue_local_device_revocation(&desktop_id, None, 3_000).unwrap();
+        laptop
+            .connection
+            .execute_batch("CREATE TRIGGER mark_fails BEFORE UPDATE ON account_devices BEGIN SELECT RAISE(ABORT, 'disk is full'); END;")
+            .unwrap();
+        assert!(laptop.apply_device_revocation(&revocation, 3_000).is_err());
+        assert!(!laptop.is_device_revoked(&revocation.account_id, &desktop_id).unwrap(), "no revocation without the mark");
+        laptop.connection.execute_batch("DROP TRIGGER mark_fails;").unwrap();
+        assert!(laptop.apply_device_revocation(&revocation, 3_100).unwrap().newly_applied);
+        assert!(laptop.is_device_revoked(&revocation.account_id, &desktop_id).unwrap());
+        assert!(laptop.list_own_device_dialogs().unwrap().is_empty());
+    }
+
+    /// Blind audit 2026-11-11, I3: a key move marks the devices it leaves behind `superseded` — a row
+    /// with no document. A signed revocation of such a device after it was ignored on that row, and
+    /// nothing was left to hand the device or the contacts when it came back. It takes the row now.
+    #[test]
+    fn a_signed_revocation_takes_the_place_of_a_superseded_mark() {
+        let (laptop, _desktop, _laptop_id, desktop_id) = laptop_and_desktop_that_know_each_other("revoke-superseded");
+        let account_id = laptop.get_local_account().unwrap().unwrap().descriptor.account_id;
+        laptop
+            .connection
+            .execute(
+                "INSERT INTO device_revocations (account_id, device_id, revocation_json, working_key_version,
+                    revoked_at_unix_ms, received_at_unix_ms, kind)
+                 VALUES (?1, ?2, '', 1, 2000, 2000, 'superseded')",
+                rusqlite::params![account_id.0, desktop_id.0],
+            )
+            .unwrap();
+        assert!(laptop.list_device_revocations(&account_id).unwrap().is_empty(), "a mark is no revocation");
+        let revocation = laptop.issue_local_device_revocation(&desktop_id, None, 3_000).unwrap();
+        assert!(laptop.apply_device_revocation(&revocation, 3_000).unwrap().newly_applied);
+        let listed = laptop.list_device_revocations(&account_id).unwrap();
+        assert_eq!(listed.len(), 1, "the signed revocation is there to hand on");
+        assert_eq!(listed[0].device_id, desktop_id);
+        assert!(!laptop.apply_device_revocation(&revocation, 3_100).unwrap().newly_applied, "and it stays");
     }
 
     #[test]
@@ -6796,6 +7829,88 @@ mod tests {
         assert_eq!(storage.get_account_keys(&account_id).unwrap().unwrap(), before);
     }
 
+    fn stored_root(storage: &Storage, profile_id: &omni_identity::LocalProfileId, unlock_key: Option<&[u8; 32]>) -> super::StoredProfileRoot {
+        let row = storage.get_profile_secrets_row(profile_id).unwrap().unwrap();
+        super::read_stored_profile_root(&row, unlock_key).unwrap()
+    }
+
+    // r2 question 12: the password lies over this machine's seal of the root — DPAPI(password(root)).
+    #[test]
+    fn the_root_follows_the_profile_password_inside_this_machines_seal() {
+        let storage = open_account_key_storage("password-root");
+        let account = storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        storage.ensure_local_crypto_foundation(1_100).unwrap();
+        let phrase = account.recovery_phrase_v2.clone().unwrap();
+        let profile_id = storage.get_active_profile_id().unwrap().unwrap();
+        assert!(matches!(stored_root(&storage, &profile_id, None), super::StoredProfileRoot::Open(_)));
+
+        storage.set_local_profile_password(&profile_id, "first secret").unwrap();
+        assert!(matches!(
+            stored_root(&storage, &profile_id, None),
+            super::StoredProfileRoot::NeedsPassword
+        ));
+        let first_key = storage.verify_profile_password(&profile_id, "first secret").unwrap();
+        let super::StoredProfileRoot::Open(secrets) = stored_root(&storage, &profile_id, Some(&first_key)) else {
+            panic!("the password must open the root");
+        };
+        assert_eq!(secrets.recovery_phrase_v2, phrase);
+        assert_eq!(
+            storage.reveal_profile_recovery_phrase_with_password(&profile_id, "first secret").unwrap(),
+            phrase
+        );
+        // The account snapshot does without the root: it is held here, the phrase is not shown.
+        let snapshot = storage.get_local_account().unwrap().unwrap();
+        assert!(snapshot.local_profile_summary.unwrap().has_root_secret);
+        assert!(snapshot.recovery_phrase_v2.is_none());
+
+        storage
+            .change_local_profile_password(&profile_id, "first secret", "second secret")
+            .unwrap();
+        storage
+            .reveal_profile_recovery_phrase_with_password(&profile_id, "first secret")
+            .unwrap_err();
+        assert_eq!(
+            storage.reveal_profile_recovery_phrase_with_password(&profile_id, "second secret").unwrap(),
+            phrase
+        );
+
+        storage.remove_local_profile_password(&profile_id, "second secret").unwrap();
+        assert!(matches!(stored_root(&storage, &profile_id, None), super::StoredProfileRoot::Open(_)));
+    }
+
+    #[test]
+    fn a_password_root_left_outside_the_password_goes_under_it_at_the_password_unlock() {
+        let storage = open_account_key_storage("password-root-migration");
+        let account = storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        storage.ensure_local_crypto_foundation(1_100).unwrap();
+        let phrase = account.recovery_phrase_v2.clone().unwrap();
+        let profile_id = storage.get_active_profile_id().unwrap().unwrap();
+        storage.set_local_profile_password(&profile_id, "secret").unwrap();
+        let unlock_key = storage.verify_profile_password(&profile_id, "secret").unwrap();
+        // As a password set before 2026-10-29 left it: the password on, the root under DPAPI only.
+        storage.rewrap_profile_root(&profile_id, Some(&unlock_key), None, 1_200).unwrap();
+        assert!(matches!(stored_root(&storage, &profile_id, None), super::StoredProfileRoot::Open(_)));
+
+        storage.sign_out_profile(&profile_id).unwrap();
+        storage.unlock_profile_with_password(&profile_id, "secret").unwrap();
+        assert!(matches!(
+            stored_root(&storage, &profile_id, None),
+            super::StoredProfileRoot::NeedsPassword
+        ));
+
+        // The phrase signs in without the password and leaves the password layer in place.
+        storage.sign_out_profile(&profile_id).unwrap();
+        storage.unlock_profile_with_mnemonic(&profile_id, &phrase.mnemonic).unwrap();
+        assert!(matches!(
+            stored_root(&storage, &profile_id, None),
+            super::StoredProfileRoot::NeedsPassword
+        ));
+        assert_eq!(
+            storage.reveal_profile_recovery_phrase_with_password(&profile_id, "secret").unwrap(),
+            phrase
+        );
+    }
+
     // docs/decisions/multi-device-equal-nodes.md, 1.4 — a copied folder is a new device.
     fn new_profile_db(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir()
@@ -7071,7 +8186,7 @@ mod tests {
     fn the_per_tick_queries_use_their_partial_indexes() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-5-storage-tests")
-            .join(format!("tick-plan-{}.db", unique_suffix()));
+            .join(format!("tick-plan-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         let plan = |sql: &str| -> String {
@@ -7105,7 +8220,7 @@ mod tests {
     fn the_newest_message_of_each_chat_is_found_without_reading_the_history() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("latest-{}.db", unique_suffix()));
+            .join(format!("latest-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
@@ -7130,7 +8245,7 @@ mod tests {
         let mut statement = storage
             .connection
             .prepare(
-                "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE id IN (WITH RECURSIVE dialogs(dialog_key) AS (                  SELECT (SELECT MIN(dialog_key) FROM messages WHERE profile_id = 'x' AND dialog_key > '') UNION ALL                  SELECT (SELECT MIN(dialog_key) FROM messages WHERE profile_id = 'x' AND dialog_key > dialogs.dialog_key)                  FROM dialogs WHERE dialogs.dialog_key IS NOT NULL) SELECT (SELECT id FROM messages                  WHERE profile_id = 'x' AND dialog_key = dialogs.dialog_key ORDER BY created_at_unix_ms DESC, id DESC LIMIT 1)                  FROM dialogs WHERE dialogs.dialog_key IS NOT NULL)",
+                "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE profile_id = 'x' AND id IN (WITH RECURSIVE dialogs(dialog_key) AS (                  SELECT (SELECT MIN(dialog_key) FROM messages WHERE profile_id = 'x' AND dialog_key > '') UNION ALL                  SELECT (SELECT MIN(dialog_key) FROM messages WHERE profile_id = 'x' AND dialog_key > dialogs.dialog_key)                  FROM dialogs WHERE dialogs.dialog_key IS NOT NULL) SELECT (SELECT id FROM messages                  WHERE profile_id = 'x' AND dialog_key = dialogs.dialog_key ORDER BY created_at_unix_ms DESC, id DESC LIMIT 1)                  FROM dialogs WHERE dialogs.dialog_key IS NOT NULL)",
             )
             .unwrap();
         let plan: Vec<String> =
@@ -7147,7 +8262,7 @@ mod tests {
     fn the_active_circle_is_the_recently_added_heard_written_and_queued() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("circle-{}.db", unique_suffix()));
+            .join(format!("circle-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
@@ -7178,13 +8293,31 @@ mod tests {
         assert_eq!(circle, vec!["acc-heard", "acc-new", "acc-queued", "acc-written"]);
     }
 
+    /// Blind audit 2026-11-13, pass 22: a history line dated ahead of our clock moved the read mark
+    /// there, and what really came in before that time counted as read.
+    #[test]
+    fn future_history_line_does_not_mark_later_message_read() {
+        let db_path = std::env::temp_dir()
+            .join("omni-stage-1-storage-tests")
+            .join(format!("unread-future-{}", unique_suffix())).join("omni.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage.migrate().unwrap();
+        storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        let a = storage.chat_dialog_key_for(&dialog_key_from_instance_id("peer-a")).unwrap();
+        let now = crate::current_unix_ms();
+        let future = storage.insert_incoming_message("future-1", &a, "from history", now + 9 * 60_000).unwrap();
+        storage.mark_dialog_read_through_history_line(&a, now + 9 * 60_000, &future.id).unwrap();
+        storage.insert_incoming_message("real-1", &a, "really new", now + 3 * 60_000).unwrap();
+        assert_eq!(storage.count_unread_in_dialog(&a).unwrap(), 2, "the new line is unread, and so is the one dated ahead");
+    }
+
     /// Unread counters: incoming lines past the read mark; reading, or writing in the chat, clears
     /// them; a group's own system lines never count; a profile from before the marks starts read.
     #[test]
     fn unread_lines_are_incoming_past_the_read_mark() {
         let db_path = std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("unread-{}.db", unique_suffix()));
+            .join(format!("unread-{}", unique_suffix())).join("omni.db");
         let storage = Storage::open(&db_path).unwrap();
         storage.migrate().unwrap();
         storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
@@ -7229,7 +8362,7 @@ mod tests {
     fn encrypted_test_db(name: &str) -> std::path::PathBuf {
         std::env::temp_dir()
             .join("omni-stage-1-storage-tests")
-            .join(format!("{name}-{}.db", unique_suffix()))
+            .join(format!("{name}-{}", unique_suffix())).join("omni.db")
     }
 
     fn file_contains(path: &Path, needle: &[u8]) -> bool {
@@ -7271,34 +8404,48 @@ mod tests {
         assert_eq!(Storage::database_lock_state(&db_path).unwrap(), super::DatabaseLockState::Openable);
     }
 
+    /// A database from before encryption at rest is not opened, and left as it was: encrypted in place,
+    /// a stop in the middle left its plaintext copy on the disk (blind audit 2026-11-11, H6; pre-1.0 an
+    /// old format is not migrated).
     #[test]
-    fn a_plaintext_database_is_encrypted_on_first_open_with_its_rows_and_user_version() {
-        let db_path = encrypted_test_db("at-rest-migrate");
+    fn a_plaintext_database_is_not_opened_and_left_as_it_was() {
+        let db_path = encrypted_test_db("at-rest-plaintext");
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        {
-            let plain = rusqlite::Connection::open(&db_path).unwrap();
-            plain
-                .execute_batch(
-                    "PRAGMA journal_mode = WAL;
-                     CREATE TABLE legacy (body TEXT);
-                     INSERT INTO legacy VALUES ('plaintext-before-upgrade');
-                     PRAGMA user_version = 7;",
-                )
-                .unwrap();
-        }
-        assert!(file_contains(&db_path, b"SQLite format 3"));
+        write_plaintext_database(&db_path, "plaintext-before-upgrade");
+        let error = Storage::open(&db_path).err().expect("a plaintext database is not opened");
+        assert!(error.to_string().contains("before encryption at rest"), "{error}");
+        assert!(file_contains(&db_path, b"plaintext-before-upgrade"), "left as it was");
+    }
 
-        let storage = Storage::open(&db_path).unwrap();
-        let body: String = storage.connection.query_row("SELECT body FROM legacy", [], |row| row.get(0)).unwrap();
-        let user_version: i64 = storage.connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-        drop(storage);
-        assert_eq!(body, "plaintext-before-upgrade");
-        assert_eq!(user_version, 7, "sqlcipher_export does not copy it; the migration does");
-        assert!(!file_contains(&db_path, b"SQLite format 3"));
-        assert!(!file_contains(&db_path, b"plaintext-before-upgrade"));
-        let mut leftover = db_path.file_name().unwrap().to_os_string();
-        leftover.push(".plaintext-old");
-        assert!(!db_path.with_file_name(leftover).exists(), "the plaintext original is wiped");
+    fn write_plaintext_database(db_path: &Path, marker: &str) {
+        let plain = rusqlite::Connection::open(db_path).unwrap();
+        plain
+            .execute_batch(&format!("CREATE TABLE legacy (body TEXT); INSERT INTO legacy VALUES ('{marker}');"))
+            .unwrap();
+    }
+
+    /// V-23: once the database next to a key file has been encrypted with it, a plaintext database put
+    /// in its place is not opened (encrypting it with our key would adopt someone else's database).
+    #[test]
+    fn a_plaintext_database_put_where_ours_was_encrypted_is_not_opened() {
+        let db_path = encrypted_test_db("at-rest-replaced");
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            storage.migrate().unwrap();
+            storage.create_local_account("Alice", "Office PC", 1_000).unwrap();
+        }
+        super::forget_database_key(&db_path);
+        fs::remove_file(&db_path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let mut name = db_path.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            let _ = fs::remove_file(db_path.with_file_name(name));
+        }
+        write_plaintext_database(&db_path, "planted");
+
+        let error = Storage::open(&db_path).err().expect("the planted database must not open");
+        assert!(error.to_string().contains("replaced"), "{error}");
+        assert!(file_contains(&db_path, b"SQLite format 3"), "and it is left as it was, not encrypted");
     }
 
     #[test]

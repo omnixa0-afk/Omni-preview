@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Omni.Windows.App.Features.Shared;
@@ -13,7 +14,8 @@ namespace Omni.Windows.App;
 // in a collapsed expander whose header is the plan's one-line summary.
 public sealed partial class MainWindow
 {
-    private bool publishPlansWired;
+    private bool publishPlansReading;
+    private string shownPublishPlans = string.Empty;
 
     private (string Publication, string Name)[] PublishPlanHosts =>
     [
@@ -25,34 +27,55 @@ public sealed partial class MainWindow
 
     private void InitializePublishPlans()
     {
-        if (!publishPlansWired)
-        {
-            SettingsSectionRoot.RegisterPropertyChangedCallback(UIElement.VisibilityProperty, (_, _) =>
-            {
-                if (SettingsSectionRoot.Visibility == Visibility.Visible)
-                {
-                    DispatcherQueue.TryEnqueue(RefreshPublishPlans);
-                }
-            });
-            publishPlansWired = true;
-        }
-
-        RefreshPublishPlans();
-    }
-
-    private void RefreshPublishPlans()
-    {
-        IReadOnlyList<Core.PublishPlanView> views;
         try
         {
-            views = rustBridge.GetPublishPlans();
+            ShowPublishPlans(rustBridge.GetPublishPlans());
         }
         catch (Exception)
         {
-            // Before sign-in the core has no profile; the section re-reads when shown.
+            // Before sign-in the core has no profile; the page re-reads when shown.
+        }
+    }
+
+    private async void RefreshPublishPlansAsync()
+    {
+        if (publishPlansReading)
+        {
             return;
         }
 
+        publishPlansReading = true;
+        try
+        {
+            ShowPublishPlans(await Task.Run(() => rustBridge.GetPublishPlans()));
+        }
+        catch (Exception)
+        {
+            // Before sign-in the core has no profile; the page re-reads when shown.
+        }
+        finally
+        {
+            publishPlansReading = false;
+        }
+    }
+
+    // The editors are rebuilt only when a plan changed: a rebuild on every visit cost tens of
+    // milliseconds, and would close an editor somebody left open.
+    private void ShowPublishPlans(IReadOnlyList<Core.PublishPlanView> views)
+    {
+        string signature = string.Join('\n', views.Select(v => string.Join('|',
+            v.Publication,
+            v.Plan.Auto,
+            string.Join(';', v.Plan.Steps.Select(step => string.Join(',', step))),
+            string.Join(',', v.AllowedKinds),
+            string.Join(',', v.Unavailable),
+            v.Summary)));
+        if (signature == shownPublishPlans)
+        {
+            return;
+        }
+
+        shownPublishPlans = signature;
         foreach ((string publication, string name) in PublishPlanHosts)
         {
             Core.PublishPlanView? view = views.FirstOrDefault(v => v.Publication == publication);

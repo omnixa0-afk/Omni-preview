@@ -129,10 +129,13 @@ fn handle_incoming_courier_set(
         );
         return Ok(());
     }
+    // Only couriers out on the internet: the helper will call them for this device's pairs, and a
+    // contact must not make it reach into our own network or host (V-13). The helper checks the
+    // addresses a name resolves to again, at every connection.
     let usable = |urls: &[String]| -> Vec<String> {
         urls.iter()
             .map(|url| url.trim().to_string())
-            .filter(|url| is_valid_provider_url(url))
+            .filter(|url| is_valid_provider_url(url) && omni_rendezvous::is_public_courier_url(url))
             .collect()
     };
     let peer = omni_storage::PeerCourierSet { publish: usable(&set.publish), read: usable(&set.read) };

@@ -9,13 +9,16 @@ use crate::validation_identity::{
     validate_non_empty_field, validate_non_negative_i64, validate_positive_i64,
 };
 use crate::{
-    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_FILE_SIZE_MAX_BYTES,
+    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_FILE_SIZE_MAX_BYTES, CHAT_MESSAGE_ID_MAX_BYTES,
 };
 
 pub fn validate_attachment_offer_v1(offer: &AttachmentOfferV1) -> OmniResult<()> {
-    validate_non_empty_field("attachment offer message_id", &offer.message_id)?;
+    crate::validation_identity::validate_message_id("attachment offer message_id", &offer.message_id)?;
     validate_non_empty_field("attachment offer file_name", &offer.file_name)?;
     validate_non_empty_field("attachment offer content_id_hex", &offer.content_id_hex)?;
+    if let Some(reply_to) = &offer.reply_to {
+        validate_max_utf8_len("attachment offer reply_to", reply_to, CHAT_MESSAGE_ID_MAX_BYTES)?;
+    }
     validate_max_utf8_len(
         "attachment offer file_name",
         &offer.file_name,

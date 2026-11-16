@@ -10,7 +10,6 @@
   xmlns:shared="using:Omni.Windows.App.Features.Shared"
   mc:Ignorable="d">
   <UserControl.Resources>
-    <chats:ChatBubbleBrushConverter x:Key="BubbleBrushConverter" />
   </UserControl.Resources>
   <Grid
     x:Name="ChatsSectionRoot"
@@ -28,7 +27,6 @@
             <Setter Target="ChatConversationCard.Visibility" Value="Collapsed" />
             <Setter Target="ChatsRailColumn.Width" Value="*" />
             <Setter Target="ChatConversationColumn.Width" Value="*" />
-            <Setter Target="ChatsRailCard.CornerRadius" Value="14" />
             <Setter Target="ChatsRailCard.BorderThickness" Value="0" />
           </VisualState.Setters>
         </VisualState>
@@ -42,7 +40,6 @@
             <Setter Target="ChatsRailCard.Visibility" Value="Collapsed" />
             <Setter Target="ChatsRailColumn.Width" Value="*" />
             <Setter Target="ChatConversationColumn.Width" Value="*" />
-            <Setter Target="ChatConversationCard.CornerRadius" Value="14" />
           </VisualState.Setters>
         </VisualState>
         <VisualState x:Name="ChatsMedium">
@@ -71,6 +68,8 @@
       <ColumnDefinition x:Name="ChatsRailColumn" Width="275" />
       <ColumnDefinition x:Name="ChatConversationColumn" Width="*" />
     </Grid.ColumnDefinitions>
+    <!-- The list column's edge: its width is one for every section (Features/Shared/SectionRail.cs). -->
+    <shared:RailSplitter Grid.Column="0" Grid.RowSpan="10" />
 
     <Border
       x:Name="ChatsRailCard"
@@ -80,8 +79,7 @@
       Padding="8,3,8,12"
       Background="{ThemeResource OmniBgPanelBrush}"
       BorderBrush="{ThemeResource OmniStrokeBrush}"
-      BorderThickness="0,0,1,0"
-      CornerRadius="14,0,0,14">
+      BorderThickness="0,0,1,0">
       <Grid RowSpacing="12">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto" />
@@ -97,13 +95,13 @@
               Text="Чаты" />
             <Button
               x:Name="NewGroupButton"
-              HorizontalAlignment="Right"
+              Style="{StaticResource PaneHeaderButtonStyle}"
               AutomationProperties.AutomationId="NewGroupButton"
-              AutomationProperties.Name="Новая группа"
-              ToolTipService.ToolTip="Новая группа">
+              AutomationProperties.Name="Новый чат"
+              ToolTipService.ToolTip="Написать контакту или создать группу">
               <StackPanel Orientation="Horizontal" Spacing="6">
                 <FontIcon FontSize="12" Glyph="&#xE710;" />
-                <TextBlock Text="Группа" />
+                <TextBlock Text="Новый" />
               </StackPanel>
             </Button>
           </Grid>
@@ -129,8 +127,7 @@
       Grid.Row="0"
       Grid.RowSpan="2"
       Grid.Column="1"
-      Background="{ThemeResource OmniBgPanelBrush}"
-      CornerRadius="0,14,14,0">
+      Background="{ThemeResource OmniBgPanelBrush}">
       <Grid>
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
@@ -156,6 +153,14 @@
           Visibility="Collapsed">
           <shared:ConversationHeader.Actions>
             <StackPanel Orientation="Horizontal" Spacing="8">
+              <!-- No link: find the contact now instead of waiting for the next try. In the header with
+                   the other actions; the reason is the line under the name. -->
+              <Button
+                x:Name="ReconnectContactButton"
+                VerticalAlignment="Center"
+                Content="Подключиться"
+                ToolTipService.ToolTip="Найти контакт в сети и подключиться сейчас, не дожидаясь автоматической попытки"
+                Visibility="Collapsed" />
               <!-- Standing remote access (docs/decisions/remote-access-for-contacts.md): shown only when
                    this contact lets us control its computer; disabled while it is offline. -->
               <Button
@@ -189,6 +194,7 @@
             </StackPanel>
           </shared:ConversationHeader.Actions>
         </shared:ConversationHeader>
+        <shared:SelectionBar x:Name="ChatSelectionBar" Grid.Row="0" />
 
         <Border
           x:Name="ChatHeaderStatusBarBorder"
@@ -210,14 +216,6 @@
                 FontWeight="SemiBold"
                 Opacity="0.9"
                 Text="Статус: диалог не выбран" />
-              <Button
-                x:Name="ReconnectContactButton"
-                VerticalAlignment="Center"
-                Padding="9,2"
-                FontSize="11"
-                Content="Подключиться"
-                ToolTipService.ToolTip="Найти контакт в сети и переподключиться сейчас, не дожидаясь автоматической попытки"
-                Visibility="Collapsed" />
             </StackPanel>
             <TextBlock
               x:Name="ChatTrustWarningTextBlock"
@@ -228,6 +226,10 @@
             <!-- Session state / ping / endpoint: in Diagnostics → «Безопасность чата». -->
           </StackPanel>
         </Border>
+
+        <StackPanel Grid.Row="2">
+          <shared:PinnedBar x:Name="ChatPinnedBar" />
+        </StackPanel>
 
         <Border
           x:Name="MessagesHostBorder"
@@ -245,7 +247,7 @@
               ShowsScrollingPlaceholders="False">
               <ListView.ItemsPanel>
                 <ItemsPanelTemplate>
-                  <ItemsStackPanel ItemsUpdatingScrollMode="KeepScrollOffset" />
+                  <ItemsStackPanel CacheLength="2" ItemsUpdatingScrollMode="KeepScrollOffset" />
                 </ItemsPanelTemplate>
               </ListView.ItemsPanel>
               <ListView.ItemContainerTransitions>
@@ -253,195 +255,19 @@
               </ListView.ItemContainerTransitions>
               <ListView.ItemTemplate>
                 <DataTemplate>
-                  <StackPanel>
-                  <!-- «Сегодня» / «8 октября» over the first message of a day (TranscriptDayHeaders). -->
-                  <Border
-                    Margin="0,4,0,12"
-                    Padding="10,3"
-                    HorizontalAlignment="Center"
-                    Background="{ThemeResource OmniBgElevatedBrush}"
-                    CornerRadius="10"
-                    Visibility="{Binding DayHeaderVisibility}">
-                    <TextBlock
-                      FontSize="12"
-                      Foreground="{ThemeResource OmniMutedTextBrush}"
-                      Text="{Binding DayHeaderText}" />
-                  </Border>
-                  <Grid ColumnSpacing="8">
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="Auto" />
-                      <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <!-- The peer's avatar at the foot of each incoming run (TranscriptLayout). -->
-                    <shared:AvatarView
-                      Margin="0,0,0,10"
-                      VerticalAlignment="Bottom"
-                      Fill="{Binding Peer.AvatarBrush}"
-                      Opacity="{Binding AvatarOpacity}"
-                      Picture="{Binding Peer.AvatarImage}"
-                      Size="34"
-                      Text="{Binding Peer.AvatarText}"
-                      Visibility="{Binding AvatarSlotVisibility}" />
-                  <Border
-                    Grid.Column="1"
-                    Margin="{Binding BubbleMargin}"
-                    Padding="12,8,10,6"
-                    HorizontalAlignment="{Binding BubbleHorizontalAlignment}"
-                    Background="{Binding IsOutgoing, Converter={StaticResource BubbleBrushConverter}}"
-                    BorderBrush="{ThemeResource OmniBubbleStrokeBrush}"
-                    BorderThickness="1"
-                    CornerRadius="12"
-                    MaxWidth="{Binding BubbleMaxWidth}">
-                    <StackPanel Spacing="2">
-                      <TextBlock
-                        AutomationProperties.Name="{Binding Body}"
-                        Foreground="{ThemeResource OmniTextBrush}"
-                        Text="{Binding Body}"
-                        TextWrapping="Wrap"
-                        Visibility="{Binding BodyVisibility}" />
-                      <!-- A photo: the picture itself; a tap opens it on the whole window. -->
-                      <Button
-                        Margin="-8,-4,-6,2"
-                        Padding="0"
-                        AutomationProperties.Name="Фото"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Click="OnAttachmentPhotoClicked"
-                        Tag="{Binding MessageId}"
-                        Visibility="{Binding PhotoVisibility}">
-                        <!-- The photo's menu, as in Telegram; more actions join it here. -->
-                        <Button.ContextFlyout>
-                          <MenuFlyout Opening="OnPhotoMenuOpening">
-                            <MenuFlyoutItem Click="OnAttachmentPhotoClicked" Text="Открыть">
-                              <MenuFlyoutItem.Icon>
-                                <FontIcon Glyph="&#xE8A7;" />
-                              </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Click="OnAttachmentPhotoSaveClicked" Text="Сохранить как…">
-                              <MenuFlyoutItem.Icon>
-                                <FontIcon Glyph="&#xE896;" />
-                              </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                          </MenuFlyout>
-                        </Button.ContextFlyout>
-                        <shared:PhotoView
-                          Width="{Binding PhotoDisplayWidth}"
-                          Height="{Binding PhotoDisplayHeight}"
-                          DecodeWidth="{Binding PhotoDecodeWidth}"
-                          LocalPath="{Binding PhotoLocalPath}"
-                          PreviewBase64="{Binding PhotoPreviewBase64}" />
-                      </Button>
-                      <!-- A file: an icon, the name, the size and the state, flat in the bubble as in
-                           Telegram (it was a card inside the bubble, with a «Режим защиты» line). -->
-                      <Button
-                        Padding="0"
-                        HorizontalAlignment="Stretch"
-                        HorizontalContentAlignment="Stretch"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Click="OnAttachmentCardClicked"
-                        Tag="{Binding MessageId}"
-                        Visibility="{Binding AttachmentFileVisibility}">
-                        <Grid Padding="0,4" ColumnSpacing="10">
-                          <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                          </Grid.ColumnDefinitions>
-                          <Border
-                            Width="44"
-                            Height="44"
-                            VerticalAlignment="Top"
-                            Background="{ThemeResource AccentFillColorSecondaryBrush}"
-                            CornerRadius="22">
-                            <FontIcon
-                              HorizontalAlignment="Center"
-                              VerticalAlignment="Center"
-                              FontSize="18"
-                              Glyph="&#xE130;" />
-                          </Border>
-                          <StackPanel
-                            Grid.Column="1"
-                            VerticalAlignment="Center"
-                            Spacing="2">
-                            <TextBlock
-                              FontWeight="SemiBold"
-                              Text="{Binding AttachmentFileName}"
-                              TextWrapping="Wrap" />
-                            <TextBlock
-                              FontSize="12"
-                              Opacity="0.76"
-                              Text="{Binding AttachmentSizeText}" />
-                            <TextBlock
-                              FontSize="12"
-                              Opacity="0.86"
-                              Text="{Binding AttachmentStatusText}"
-                              TextWrapping="Wrap"
-                              Visibility="{Binding AttachmentStatusVisibility}" />
-                            <ProgressBar
-                              Height="4"
-                              Maximum="100"
-                              Minimum="0"
-                              Value="{Binding AttachmentProgressValue}"
-                              Visibility="{Binding AttachmentProgressVisibility}" />
-                          </StackPanel>
-                        </Grid>
-                      </Button>
-                      <!-- Time and ticks in the bubble's bottom-right corner, as in Telegram. -->
-                      <Grid HorizontalAlignment="Right" ColumnSpacing="4">
-                        <Grid.ColumnDefinitions>
-                          <ColumnDefinition Width="Auto" />
-                          <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock
-                          Grid.Column="0"
-                          FontSize="11"
-                          Foreground="{ThemeResource OmniMutedTextBrush}"
-                          Text="{Binding TimeText}" />
-                        <Grid
-                          Grid.Column="1"
-                          Width="20"
-                          Height="14"
-                          VerticalAlignment="Center"
-                          AutomationProperties.Name="{Binding DeliveryIndicatorAutomationName}"
-                          AutomationProperties.HelpText="{Binding DeliveryIndicatorToolTipText}"
-                          ToolTipService.ToolTip="{Binding DeliveryIndicatorToolTipText}"
-                          Visibility="{Binding DeliveryIndicatorVisibility}">
-                          <Grid Visibility="{Binding DeliveryIndicatorNeutralVisibility}">
-                            <FontIcon
-                              HorizontalAlignment="Center"
-                              VerticalAlignment="Center"
-                              FontFamily="{ThemeResource SymbolThemeFontFamily}"
-                              FontSize="11.5"
-                              Foreground="{ThemeResource OmniMutedTextBrush}"
-                              Glyph="{Binding DeliveryPrimaryGlyph}"
-                              IsTextScaleFactorEnabled="False"
-                              Margin="{Binding DeliveryPrimaryGlyphMargin}" />
-                            <FontIcon
-                              HorizontalAlignment="Center"
-                              VerticalAlignment="Center"
-                              FontFamily="{ThemeResource SymbolThemeFontFamily}"
-                              FontSize="11.5"
-                              Foreground="{ThemeResource OmniMutedTextBrush}"
-                              Glyph="{Binding DeliverySecondaryGlyph}"
-                              IsTextScaleFactorEnabled="False"
-                              Margin="{Binding DeliverySecondaryGlyphMargin}"
-                              Visibility="{Binding DeliverySecondaryGlyphVisibility}" />
-                          </Grid>
-                          <FontIcon
-                            HorizontalAlignment="Center"
-                            VerticalAlignment="Center"
-                            FontFamily="{ThemeResource SymbolThemeFontFamily}"
-                            FontSize="11.5"
-                            Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                            Glyph="{Binding DeliveryPrimaryGlyph}"
-                            IsTextScaleFactorEnabled="False"
-                            Visibility="{Binding DeliveryIndicatorErrorVisibility}" />
-                        </Grid>
-                      </Grid>
-                    </StackPanel>
-                  </Border>
-                  </Grid>
-                  </StackPanel>
+                  <shared:MessageBubble
+                    DeleteRequested="OnMessageDeleteRequested"
+                    FileClicked="OnAttachmentCardClicked"
+                    ForwardRequested="OnMessageForwardRequested"
+                    PhotoClicked="OnAttachmentPhotoClicked"
+                    PhotoSaveClicked="OnAttachmentPhotoSaveClicked"
+                    PinRequested="OnMessagePinRequested"
+                    QuoteOpened="OnMessageQuoteOpened"
+                    ReactionChosen="OnMessageReactionChosen"
+                    ReplyRequested="OnMessageReplyRequested"
+                    SelectRequested="OnMessageSelectRequested"
+                    SelectionToggled="OnMessageSelectionToggled"
+                    Row="{Binding}" />
                 </DataTemplate>
               </ListView.ItemTemplate>
               <ListView.ItemContainerStyle>

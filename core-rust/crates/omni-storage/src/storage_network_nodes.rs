@@ -6,7 +6,7 @@
 // invite) — no node is privileged (threat-model). Endpoints are HINTS: the
 // ed25519 challenge on every dial is the sole authority, so a stale/hostile entry can at worst waste a
 // dial. db-file scoped (per profile), like the sibling mesh_peer_book. See
-// docs/decisions/community-volunteer-nodes.md + docs/notes/roadmap-CONTINUE.md (Always-connect epic).
+// docs/decisions/community-volunteer-nodes.md.
 
 /// Source tag for the one seeded, still-removable base bootstrap node (the project VPS).
 pub const NETWORK_NODE_SOURCE_BASE: &str = "base";

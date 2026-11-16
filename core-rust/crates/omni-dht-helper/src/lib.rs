@@ -34,7 +34,7 @@
 //! async/tokio in an untrusted helper; sync `put/get_mutable` stay throughout `mainline` 7.x.
 #![allow(deprecated)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -437,6 +437,12 @@ pub fn run(args: Vec<String>) -> i32 {
         eprintln!("usage: omni-dht-helper --listen <addr>  |  --connect <addr> <command>");
         return 2;
     };
+    // No token, no listener: nobody could talk to us, and a listener anyone could talk to is what
+    // V-21 closed. The core always passes one.
+    if omni_rendezvous::helper_ipc::helper_token_from_env().is_none() {
+        eprintln!("cannot listen on {addr}: {} is not set", omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV);
+        return 2;
+    }
 
     // Listener mode shows no terminal window — detach any inherited console (the app should also spawn
     // us with CreateNoWindow). Client mode keeps its console for stdout.
@@ -512,23 +518,32 @@ pub fn run(args: Vec<String>) -> i32 {
     eprintln!("omni-dht-helper listening on {bound}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // A place before a thread: connections that never prove the token are bounded (pass 20).
+        let Some(slot) = omni_rendezvous::helper_ipc::reserve_auth_slot() else { continue };
         let engine = Arc::clone(&engine);
-        std::thread::spawn(move || serve(stream, &engine));
+        std::thread::spawn(move || serve(stream, &engine, slot));
     }
     0
 }
 
-fn serve(stream: TcpStream, engine: &DhtEngine) {
+fn serve(stream: TcpStream, engine: &DhtEngine, slot: omni_rendezvous::helper_ipc::AuthSlot) {
     let Ok(read_half) = stream.try_clone() else { return };
     let mut reader = BufReader::new(read_half);
     let mut writer = stream;
-    let mut line = String::new();
+    // Only a client holding the token the core gave us (V-21), within a few seconds (pass 20);
+    // requests bounded (V-12).
+    let token = omni_rendezvous::helper_ipc::process_helper_token();
+    if !omni_rendezvous::helper_ipc::accept_tcp_client(&writer, &mut reader, token, slot) {
+        return;
+    }
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+        let line = match omni_rendezvous::helper_ipc::read_line_capped(
+            &mut reader,
+            omni_rendezvous::helper_ipc::HELPER_REQUEST_MAX,
+        ) {
+            Ok(line) if !line.is_empty() => line,
+            _ => break,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -653,7 +668,12 @@ fn handle_relay_get(key_hex: Option<&str>, salt_hex: Option<&str>) -> String {
     }
 }
 
+/// A dev client: one command, the token from [`omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV`].
 fn run_client(endpoint: &str, command: &str) -> i32 {
+    let Some(token) = omni_rendezvous::helper_ipc::helper_token_from_env() else {
+        eprintln!("set {} to the helper's token", omni_rendezvous::helper_ipc::HELPER_TOKEN_ENV);
+        return 2;
+    };
     let mut stream = match TcpStream::connect(endpoint) {
         Ok(s) => s,
         Err(error) => {
@@ -661,14 +681,15 @@ fn run_client(endpoint: &str, command: &str) -> i32 {
             return 1;
         }
     };
-    if writeln!(stream, "{command}").is_err() {
+    if omni_rendezvous::helper_ipc::write_request(&mut stream, &token, command).is_err() {
         eprintln!("write failed");
         return 1;
     }
-    let _ = stream.flush();
-    let mut line = String::new();
-    match BufReader::new(stream).read_line(&mut line) {
-        Ok(_) => {
+    match omni_rendezvous::helper_ipc::read_line_capped(
+        &mut BufReader::new(stream),
+        omni_rendezvous::helper_ipc::HELPER_REPLY_MAX,
+    ) {
+        Ok(line) => {
             let line = line.trim_end();
             println!("{line}");
             i32::from(line.starts_with("ERR"))

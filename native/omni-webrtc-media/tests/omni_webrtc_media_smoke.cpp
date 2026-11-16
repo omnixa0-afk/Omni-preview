@@ -1,5 +1,6 @@
 #include "omni_webrtc_media.h"
 
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -963,6 +964,94 @@ int RunCodecLoopbackSmoke(const char* codec, const char* extra, int width = 320,
               << " drained=" << drained << '\n';
     if (decoded < 3) {
         return Fail("codec loopback: the receiver decoded (almost) nothing");
+    }
+    return 0;
+}
+
+/// A frame size no hardware encoder is made for — what ABR used to produce from a 4:3 camera
+/// (1440x1080 scaled down to 954x716; live 2026-10-18: the far end saw a green bottom quarter and
+/// skewed rows). The encoder must code a 16-aligned size no larger than the frame, and the whole
+/// picture must arrive: color bars are vertical, so the bottom quarter is as bright as the top one,
+/// and an unfilled (green) bottom is not.
+int RunOddSizeCodecSmoke(const char* codec, const char* extra, int width, int height)
+{
+    const std::string config = std::string(R"({"codec":")") + codec + R"(","width":)" +
+        std::to_string(width) + R"(,"height":)" + std::to_string(height) +
+        R"(,"fps":30,"bitrate_bps":2500000)" + extra + "}";
+    std::array<char, 512> error{};
+    size_t required = 0;
+    OmniWebRtcMediaSession* sender = nullptr;
+    if (CreateSession(config.c_str(), &sender, error.data(), error.size(), &required) !=
+            OMNI_WEBRTC_MEDIA_STATUS_OK ||
+        sender == nullptr) {
+        std::cerr << "[smoke] " << codec << " sender: " << error.data() << '\n';
+        return Fail("odd size: sender create failed");
+    }
+    std::vector<std::vector<uint8_t>> packets;
+    // Noisy big frames: a key frame alone spans hundreds of packets.
+    (void)CollectVideoRtpPackets(sender, width > 1000 ? 4000 : 1200, packets, width, height);
+    DestroySession(sender);
+    if (packets.empty()) {
+        return Fail("odd size: sender produced no media packets");
+    }
+    OmniWebRtcMediaSession* receiver = nullptr;
+    if (CreateSession(config.c_str(), &receiver, error.data(), error.size(), &required) !=
+            OMNI_WEBRTC_MEDIA_STATUS_OK ||
+        receiver == nullptr) {
+        return Fail("odd size: receiver create failed");
+    }
+    std::vector<uint8_t> picture(static_cast<size_t>(width) * static_cast<size_t>(height) * 2);
+    int32_t got_width = 0;
+    int32_t got_height = 0;
+    bool have_picture = false;
+    const auto drain = [&] {
+        int32_t frame_width = 0;
+        int32_t frame_height = 0;
+        uint32_t rtp_timestamp = 0;
+        int64_t timestamp_us = 0;
+        size_t needed = 0;
+        if (omni_webrtc_media_session_drain_i420_frame(
+                receiver, picture.data(), picture.size(), &frame_width, &frame_height,
+                &rtp_timestamp, &timestamp_us, &needed) == OMNI_WEBRTC_MEDIA_STATUS_OK &&
+            frame_width > 0 && frame_height > 0) {
+            got_width = frame_width;
+            got_height = frame_height;
+            have_picture = true;
+        }
+    };
+    for (const std::vector<uint8_t>& packet : packets) {
+        (void)PushOnePacket(receiver, packet);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        drain();
+    }
+    for (int i = 0; i < 100 && !have_picture; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        drain();
+    }
+    DestroySession(receiver);
+    if (!have_picture) {
+        return Fail("odd size: the receiver decoded nothing");
+    }
+    // Average luma of rows [from, to) in the decoded I420 picture (Y plane first, tightly packed).
+    const auto band = [&](int from, int to) {
+        double sum = 0.0;
+        for (int y = from; y < to; ++y) {
+            for (int x = 0; x < got_width; ++x) {
+                sum += picture[static_cast<size_t>(y) * static_cast<size_t>(got_width) + x];
+            }
+        }
+        return sum / (static_cast<double>(to - from) * got_width);
+    };
+    const double top = band(0, got_height / 4);
+    const double bottom = band(got_height * 3 / 4, got_height);
+    std::cerr << "[smoke] odd size " << codec << extra << " " << width << "x" << height
+              << " -> decoded " << got_width << "x" << got_height << ", luma top=" << top
+              << " bottom=" << bottom << '\n';
+    if (got_width % 16 != 0 || got_height % 16 != 0 || got_width > width || got_height > height) {
+        return Fail("odd size: the coded size is not 16-aligned within the frame");
+    }
+    if (std::abs(top - bottom) > 20.0) {
+        return Fail("odd size: the bottom of the picture did not arrive like the top");
     }
     return 0;
 }
@@ -5027,6 +5116,24 @@ int main()
                 return result;
             }
         }
+        // Sizes no hardware encoder is made for: a 4:3 camera, and ABR's step down from it.
+        for (const auto& [codec, extra] : std::initializer_list<std::pair<const char*, const char*>>{
+                 {"h264", ""}, {"av1", ""}}) {
+            for (const auto& [width, height] : {std::pair{954, 716}, std::pair{1440, 1080}}) {
+                if (const int result = RunOddSizeCodecSmoke(codec, extra, width, height); result != 0) {
+                    return result;
+                }
+            }
+        }
+        // The same on a pinned encoder, e.g. OMNI_SMOKE_ODD_EXTRA=,"encode_vendor_id":32902 for the
+        // Intel MFT (the kind of encoder the bug showed on; NVIDIA tolerated odd sizes).
+        if (const char* odd_extra = std::getenv("OMNI_SMOKE_ODD_EXTRA"); odd_extra != nullptr) {
+            for (const auto& [width, height] : {std::pair{954, 716}, std::pair{1440, 1080}}) {
+                if (const int result = RunOddSizeCodecSmoke("h264", odd_extra, width, height); result != 0) {
+                    return result;
+                }
+            }
+        }
         for (const auto& [codec, extra] : std::initializer_list<std::pair<const char*, const char*>>{
                  {"h264", ""}, {"av1", ""}, {"av1", R"(,"encode_software":1)"}}) {
             if (const int result = RunCodecLiveLoopSmoke(codec, extra); result != 0) {
@@ -5405,6 +5512,35 @@ int main()
         }
     }
     // Audio Phase 2b-step2: full opus + RTP roundtrip Sender→Receiver.
+    {
+        // A voice message: a tone into packets and back. The tone must come out, whole.
+        std::vector<int16_t> tone(48000);
+        for (size_t i = 0; i < tone.size(); ++i) {
+            tone[i] = static_cast<int16_t>(9000.0 * std::sin(2.0 * 3.14159265358979 * 440.0 * static_cast<double>(i) / 48000.0));
+        }
+        std::vector<uint8_t> packets(64 * 1024);
+        size_t packets_len = 0;
+        if (omni_webrtc_media_opus_encode_pcm(tone.data(), tone.size(), 24000, packets.data(), packets.size(), &packets_len) !=
+                OMNI_WEBRTC_MEDIA_STATUS_OK ||
+            packets_len == 0) {
+            return Fail("omni_webrtc_media_opus_encode_pcm failed");
+        }
+        std::vector<int16_t> sound(48000);
+        size_t decoded = 0;
+        if (omni_webrtc_media_opus_decode_packets(packets.data(), packets_len, 24000, sound.data(), sound.size(), &decoded) !=
+                OMNI_WEBRTC_MEDIA_STATUS_OK ||
+            decoded != 24000) {
+            return Fail("omni_webrtc_media_opus_decode_packets: wrong length");
+        }
+        double energy = 0.0;
+        for (size_t i = 4800; i < decoded; ++i) {
+            energy += static_cast<double>(sound[i]) * sound[i];
+        }
+        if (std::sqrt(energy / static_cast<double>(decoded - 4800)) < 1000.0) {
+            return Fail("omni_webrtc_media_opus_decode_packets: the tone did not come out");
+        }
+    }
+
     const OmniWebRtcMediaStatus audio_roundtrip_smoke =
         omni_webrtc_media_smoke_audio_sender_to_receiver();
     if (audio_roundtrip_smoke != OMNI_WEBRTC_MEDIA_STATUS_OK) {

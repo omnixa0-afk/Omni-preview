@@ -10,6 +10,9 @@ use serde::{de::DeserializeOwned, Serialize};
 #[repr(C)]
 pub struct OmniAppHandle {
     pub(crate) inner: OmniApp,
+    /// This app's entry in the media send path's table of live apps (`live_media_apps`): a send
+    /// target names the app by it, never by the handle's address.
+    pub(crate) media_app_id: u64,
 }
 
 #[derive(Serialize)]
@@ -58,14 +61,52 @@ impl std::ops::DerefMut for HandleGuard {
     }
 }
 
+/// The handles `omni_app_init` made and `omni_app_free` has not freed yet (their addresses). A call
+/// takes its handle's lock only while the handle is here, and checks again once it holds it;
+/// `omni_app_free` takes the handle out first, then waits for the call holding the lock, then frees
+/// it. A call that was waiting for the lock, or comes with the handle afterwards, is refused instead
+/// of reading freed memory, and a second free does nothing (blind audit 2026-11-10). Process-wide,
+/// not a profile's: a handle is the whole core.
+static LIVE_HANDLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn live_handles() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    LIVE_HANDLES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn register_live_handle(handle: *mut OmniAppHandle) {
+    live_handles().push(handle as usize);
+}
+
+/// Take `handle` out of the live ones: its lock, cloned while it was still live, or `None` when it
+/// was not live (freed already, or never made here).
+pub(crate) fn retire_live_handle(handle: *mut OmniAppHandle) -> Option<Arc<ReentrantMutex<()>>> {
+    let mut live = live_handles();
+    let at = live.iter().position(|known| *known == handle as usize)?;
+    live.swap_remove(at);
+    // SAFETY: it was live, and the free that retires it is the only one that frees it.
+    Some(unsafe { (*handle).inner.serializer.clone() })
+}
+
+pub(crate) fn handle_is_live(handle: *mut OmniAppHandle) -> bool {
+    live_handles().contains(&(handle as usize))
+}
+
+const HANDLE_FREED: &str = "the core was closed: this handle is no longer valid";
+
 pub(crate) fn require_handle(handle: *mut OmniAppHandle) -> OmniResult<HandleGuard> {
     if handle.is_null() {
         return Err(OmniError::InvalidInput("handle must not be null".to_string()));
     }
-    // SAFETY: pointer is non-null and FFI contract says it lives for the
-    // duration of the call. Clone the Arc out so it survives independently,
-    // then take the lock.
-    let arc: Arc<ReentrantMutex<()>> = unsafe { (*handle).inner.serializer.clone() };
+    // The lock is cloned out while the handle is known live (`omni_app_free` cannot free it in
+    // between: it retires it under the same lock first), then taken.
+    let arc: Arc<ReentrantMutex<()>> = {
+        let live = live_handles();
+        if !live.contains(&(handle as usize)) {
+            return Err(OmniError::InvalidInput(HANDLE_FREED.to_string()));
+        }
+        // SAFETY: live, so not freed; a free retires it under `live` before touching it.
+        unsafe { (*handle).inner.serializer.clone() }
+    };
     let lock_ptr: *const ReentrantMutex<()> = Arc::as_ptr(&arc);
     let lock: parking_lot::ReentrantMutexGuard<'_, ()> = unsafe { (*lock_ptr).lock() };
     // SAFETY: extend lifetime to 'static. The Arc is owned by the guard
@@ -77,11 +118,17 @@ pub(crate) fn require_handle(handle: *mut OmniAppHandle) -> OmniResult<HandleGua
         parking_lot::RawThreadId,
         (),
     > = unsafe { std::mem::transmute(lock) };
-    Ok(HandleGuard {
+    let guard = HandleGuard {
         handle,
         _arc: arc,
         _lock: lock_static,
-    })
+    };
+    // Freed while this call waited for the lock: the free took it out, then waited for whoever
+    // held the lock — not for this call.
+    if !handle_is_live(handle) {
+        return Err(OmniError::InvalidInput(HANDLE_FREED.to_string()));
+    }
+    Ok(guard)
 }
 
 pub(crate) fn parse_json_request<T: DeserializeOwned>(

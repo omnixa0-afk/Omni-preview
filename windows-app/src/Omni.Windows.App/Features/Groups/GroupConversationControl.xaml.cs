@@ -30,8 +30,9 @@ public sealed partial class GroupConversationControl : UserControl
     // The picture shown in the header (rebuilt only when the file changes).
     private string? shownAvatarPath;
 
-    /// The window's image-file dialog (the control has no window of its own); null = cancelled.
-    public Func<string?>? PickImageFile { get; set; }
+    /// The window's image-file dialog and crop frame (the control has no window of its own): the path
+    /// of the framed square, a temporary file this control deletes once the core took it; null = cancelled.
+    public Func<Task<string?>>? PickImageFile { get; set; }
     // The only admin of a group with others in it: may not just leave (the core refuses), but name
     // another admin or delete the group for everyone.
     private bool iAmSoleAdmin;
@@ -182,6 +183,20 @@ public sealed partial class GroupConversationControl : UserControl
     {
         InitializeComponent();
         GroupHeader.IdentityClicked += (_, _) => SetInfoOpen(!infoOpen);
+        GroupComposer.ReplyDismissed += (_, _) => SetReply(null);
+        Loaded += (_, _) =>
+        {
+            Shared.ColumnWidth.Details.Changed -= LayoutGroupInfoPanel;
+            Shared.ColumnWidth.Details.Changed += LayoutGroupInfoPanel;
+        };
+        Unloaded += (_, _) => Shared.ColumnWidth.Details.Changed -= LayoutGroupInfoPanel;
+        GroupMessagesList.SizeChanged += (_, _) =>
+        {
+            foreach (GroupMessageItem item in messages)
+            {
+                item.UpdateBubbleMaxWidth(BubbleMaxWidth());
+            }
+        };
         GroupHeader.BackRequested += (_, _) => BackRequested?.Invoke();
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(GroupHeader.IdentityButton, "Сведения о группе");
         GroupComposer.SendRequested += (_, _) => SendMessage();
@@ -193,25 +208,19 @@ public sealed partial class GroupConversationControl : UserControl
             }
         };
         GroupComposer.DraftRemoveRequested += (_, _) => ClearDraft();
+        GroupComposer.VoiceRecorded += OnVoiceRecorded;
+        GroupComposer.VideoNoteRecorded += OnVideoNoteRecorded;
+        GroupComposer.VoiceFailed += (_, why) => SetStatus(why);
         GroupComposer.DraftAsPhotoChanged += (_, asPhoto) => draftAsPhoto = asPhoto;
         GroupMessageInputTextBox.TextChanged += (_, _) => UpdateSendEnabled();
         GroupMessagesList.ItemsSource = messages;
+        // The composer takes files as the thread does (its text box takes drags of text itself).
+        GroupComposer.AllowDrop = true;
+        GroupComposer.AddHandler(DragOverEvent, new DragEventHandler(OnThreadDragOver), handledEventsToo: true);
+        GroupComposer.AddHandler(DropEvent, new DragEventHandler(OnThreadDrop), handledEventsToo: true);
         // Pinned to the newest line until the reader scrolls up — and kept there when the thread
         // grows on its own (a photo decoding after the rows were laid out pushed the end out of view).
-        GroupMessagesScroll.ViewChanged += (_, e) =>
-        {
-            if (!e.IsIntermediate)
-            {
-                pinnedToBottom = GroupMessagesScroll.VerticalOffset >= GroupMessagesScroll.ScrollableHeight - 24;
-            }
-        };
-        GroupMessagesList.SizeChanged += (_, _) =>
-        {
-            if (pinnedToBottom)
-            {
-                GroupMessagesScroll.ChangeView(null, GroupMessagesScroll.ScrollableHeight, null, true);
-            }
-        };
+        GroupMessagesList.Loaded += (_, _) => WatchFeedScroll();
         GroupMembersListView.ItemsSource = members;
         GroupInvitedList.ItemsSource = invited;
         speakingPollTimer.Tick += OnSpeakingPollTick;
@@ -225,6 +234,17 @@ public sealed partial class GroupConversationControl : UserControl
     }
 
     internal void Attach(RustBridge rustBridge) => bridge = rustBridge;
+
+    /// «Код» on the group's page: the shell opens the group in the Workspaces section.
+    public event Action<string>? WorkspaceRequested;
+
+    private void OnWorkspaceTileClicked(object sender, RoutedEventArgs e)
+    {
+        if (group is not null)
+        {
+            WorkspaceRequested?.Invoke(group.GroupId);
+        }
+    }
 
     /// The group currently shown, or null.
     public string? CurrentGroupId => group?.GroupId;
@@ -241,6 +261,8 @@ public sealed partial class GroupConversationControl : UserControl
         {
             focusedTileKey = null;
             threadFingerprint = string.Empty;
+            SetReply(null);
+            GroupComposer.CancelVoice();
             pinnedToBottom = true;
             lastThreadMark = string.Empty;
             messages.Clear();
@@ -292,7 +314,8 @@ public sealed partial class GroupConversationControl : UserControl
             // whole thread only then, not every tick.
             // A file arriving moves nothing in the summary: while one is on its way, look every tick
             // (a downloaded photo kept its «not here yet» line, and a click on it did nothing).
-            string threadMark = $"{fresh.LastActivityUnixMs}|{fresh.LastMessagePreview}";
+            // An emoji, a pin or a deleted line in the middle move nothing there either: the actions' mark does.
+            string threadMark = $"{fresh.LastActivityUnixMs}|{fresh.LastMessagePreview}|{bridge.GetMessageActions(fresh.DialogKey).Mark}";
             if (threadMark != lastThreadMark || threadFingerprint.Length == 0 || threadHasFilesInFlight)
             {
                 lastThreadMark = threadMark;
@@ -348,6 +371,7 @@ public sealed partial class GroupConversationControl : UserControl
         StartGroupCallButton.IsEnabled = active;
         GroupInfoCallTile.IsEnabled = active;
         GroupInfoInviteTile.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+        GroupInfoWorkspaceTile.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
         // Out of it (removed, or the group was deleted): what is left to do is delete the chat.
         LeaveGroupMenuItem.Text = active ? "Выйти из группы" : "Удалить чат";
         DeleteGroupMenuItem.Visibility = active && iAmAdmin ? Visibility.Visible : Visibility.Collapsed;
@@ -390,6 +414,11 @@ public sealed partial class GroupConversationControl : UserControl
             .Select(m => GroupMemberItem.From(m, iAmAdmin, LookOf(m.AccountId)))
             .ToList();
         GroupMembersHeaderTextBlock.Text = $"{fresh.Count} {MembersWord(fresh.Count)}";
+        GroupComposer.SetMentionCandidates(list
+            .Where(m => m.Status == "member" && !m.IsMe && m.AccountId.Length > 0)
+            .DistinctBy(m => m.AccountId)
+            .Select(m => new Shared.MentionCandidate(m.AccountId, m.DisplayName, string.Empty))
+            .ToList());
 
         if (!fresh.Select(m => m.Signature).SequenceEqual(members.Select(m => m.Signature)))
         {
@@ -430,35 +459,48 @@ public sealed partial class GroupConversationControl : UserControl
             return;
         }
 
+        HookMessageActions();
+        long readStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         IReadOnlyList<GroupMessageView> list = bridge.ListGroupMessages(group.GroupId);
+        MessageActionsView actions = bridge.GetMessageActions(group.DialogKey);
         threadHasFilesInFlight = list.Any(m => m.Attachment?.State is "preparing" or "requested" or "downloading" or "verifying" or "waiting_for_reconnect");
         // Files move on their own (a download's progress, a photo arriving): they are in it too.
         string files = string.Join(",", list
             .Where(m => m.Attachment is not null)
             .Select(m => $"{m.Attachment!.State}/{m.Attachment.BytesTransferred}/{m.Attachment.LocalCopyPath?.Length ?? 0}"));
+        // So do reactions, on any line.
+        string reactions = string.Join(",", list
+            .Where(m => m.Reactions is { Count: > 0 })
+            .Select(m => m.MessageId + string.Concat(m.Reactions!.Select(r => $"{r.Emoji}{r.Count}{r.Mine}"))));
         string fingerprint = list.Count == 0
             ? "0"
-            : $"{list.Count}:{list[^1].MessageId}:{list[^1].Status}:{files}:{members.Count}:{photosVersion}";
+            : $"{list.Count}:{list[^1].MessageId}:{list[^1].Status}:{files}:{reactions}:{actions.Mark}:{members.Count}:{photosVersion}";
         if (fingerprint == threadFingerprint)
         {
             return;
         }
 
         bool firstFill = threadFingerprint.Length == 0;
-        bool wasAtBottom = GroupMessagesScroll.VerticalOffset >= GroupMessagesScroll.ScrollableHeight - 24;
+        bool wasAtBottom = feedScroll is not { } shownScroll || shownScroll.VerticalOffset >= shownScroll.ScrollableHeight - 24;
         threadFingerprint = fingerprint;
+        GroupPinnedBar.Show(actions.Pinned);
         // The author's colour comes from their account, as in the member list.
         Dictionary<string, string> accountByMember = members.ToDictionary(m => m.MemberPub, m => m.AccountId);
         for (int i = 0; i < list.Count; i++)
         {
             GroupMessageView view = list[i];
             GroupMessageView? next = i + 1 < list.Count ? list[i + 1] : null;
-            // The last line of one author's run carries the avatar.
-            bool runTail = next is null || next.IsMine || next.Kind == "system" || next.SenderPub != view.SenderPub;
+            GroupMessageView? previous = i > 0 ? list[i - 1] : null;
+            // A run: one author's lines in a row on one day. Its first names them, its last has the avatar.
+            string? dayHeader = previous is null || DayOf(previous) != DayOf(view)
+                ? MainWindowPresentation.FormatDayHeader(view.CreatedAtUnixMs, DateTime.Today)
+                : null;
+            bool runHead = previous is null || dayHeader is not null || !SameRun(previous, view);
+            bool runTail = next is null || DayOf(next) != DayOf(view) || !SameRun(view, next);
             string accountId = view.SenderPub is { } pub && accountByMember.TryGetValue(pub, out string? account)
                 ? account
                 : view.SenderPub ?? string.Empty;
-            GroupMessageItem item = GroupMessageItem.From(view, accountId, runTail, LookOf(accountId));
+            GroupMessageItem item = GroupMessageItem.From(view, accountId, runHead, runTail, dayHeader, BubbleMaxWidth(), LookOf(accountId));
             // Only the lines that changed are replaced: clearing the whole list under an open menu
             // or a pressed button took its target away (live 2026-10-11 the window went down).
             if (i < messages.Count)
@@ -481,17 +523,143 @@ public sealed partial class GroupConversationControl : UserControl
         if (firstFill || wasAtBottom)
         {
             // Let the layout pass size the new rows, then pin to the newest message.
-            DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
-                GroupMessagesScroll.ChangeView(null, GroupMessagesScroll.ScrollableHeight, null, true));
+            pinnedToBottom = true;
+            DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, GoToNewest);
         }
 
         if (!firstFill)
         {
             GroupListChanged?.Invoke();
         }
+        else
+        {
+            MainWindow.TraceOpened(DispatcherQueue, $"group lines={list.Count}", readStarted);
+        }
     }
 
+    private ScrollViewer? feedScroll;
+    private double feedOffset;
+
+    // The list's own scroller, there once its template is. Pinned to the newest line until the reader
+    // scrolls up, and kept there when the thread grows on its own: a photo decoding, and rows being
+    // built below (their height is an estimate until then).
+    private void WatchFeedScroll()
+    {
+        if (feedScroll is not null || FindScroller(GroupMessagesList) is not { } scroll)
+        {
+            return;
+        }
+
+        feedScroll = scroll;
+        scroll.ViewChanged += (_, e) =>
+        {
+            if (e.IsIntermediate)
+            {
+                return;
+            }
+
+            if (scroll.VerticalOffset >= scroll.ScrollableHeight - 24)
+            {
+                pinnedToBottom = true;
+            }
+            else if (scroll.VerticalOffset < feedOffset - 1)
+            {
+                pinnedToBottom = false;
+            }
+
+            feedOffset = scroll.VerticalOffset;
+        };
+        scroll.RegisterPropertyChangedCallback(ScrollViewer.ExtentHeightProperty, (_, _) =>
+        {
+            if (pinnedToBottom)
+            {
+                scroll.ChangeView(null, scroll.ScrollableHeight, null, true);
+            }
+        });
+    }
+
+    private void GoToNewest()
+    {
+        if (messages.Count > 0)
+        {
+            GroupMessagesList.ScrollIntoView(messages[^1], ScrollIntoViewAlignment.Leading);
+        }
+
+        feedScroll?.ChangeView(null, feedScroll.ScrollableHeight, null, true);
+    }
+
+    private static ScrollViewer? FindScroller(DependencyObject parent)
+    {
+        for (int i = 0; i < Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChildrenCount(parent); i++)
+        {
+            DependencyObject child = Microsoft.UI.Xaml.Media.VisualTreeHelper.GetChild(parent, i);
+            if ((child as ScrollViewer ?? FindScroller(child)) is { } found)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static DateTime DayOf(GroupMessageView view)
+        => DateTimeOffset.FromUnixTimeMilliseconds(view.CreatedAtUnixMs).ToLocalTime().Date;
+
+    private static bool SameRun(GroupMessageView a, GroupMessageView b)
+        => a.Kind != "system" && b.Kind != "system" && a.IsMine == b.IsMine && a.SenderPub == b.SenderPub;
+
+    private double BubbleMaxWidth()
+        => MainWindowPresentation.CalculateTranscriptBubbleMaxWidth(GroupMessagesList.ActualWidth, MainWindowPresentation.TranscriptRowChromeWidth);
+
     private void OnSendMessageClicked(object sender, RoutedEventArgs e) => SendMessage();
+
+    /// Test channel: the composer's list after `@`.
+    internal string MentionsForUiTest(string? choose) => GroupComposer.MentionsForUiTest(choose);
+
+    // The line the next one answers, shown over the field until it goes or the cross is pressed.
+    private Shared.MessageRow? replyTo;
+
+    private void OnMessageReplyRequested(object? sender, Shared.MessageRow row) => SetReply(row);
+
+    private void OnMessageReactionChosen(object? sender, string emoji)
+    {
+        if (sender is not Shared.MessageBubble { Row: { } row } || bridge is null)
+        {
+            return;
+        }
+
+        try
+        {
+            bridge.ReactToMessage(row.MessageId, emoji);
+            RefreshMessages();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Не удалось поставить реакцию: {ex.Message}");
+        }
+    }
+
+    private void SetReply(Shared.MessageRow? row)
+    {
+        replyTo = row;
+        if (row is null)
+        {
+            GroupComposer.ClearReply();
+            return;
+        }
+
+        string text = row.Body.Length > 0 ? row.Body : row.AttachmentLabel;
+        GroupComposer.ShowReply(row.IsOutgoing ? "Вы" : row.SenderName, text.Length > 0 ? text : "Сообщение");
+    }
+
+    /// A quote goes to its line.
+    private void OnMessageQuoteOpened(object? sender, Shared.MessageRow row)
+    {
+        if (messages.FirstOrDefault(item => item.MessageId == row.QuotedMessageId) is { } target)
+        {
+            GroupMessagesList.ScrollIntoView(target, ScrollIntoViewAlignment.Leading);
+        }
+    }
 
     // ---- files ---------------------------------------------------------------------------------
 
@@ -517,7 +685,7 @@ public sealed partial class GroupConversationControl : UserControl
     /// A file dragged onto the thread becomes the draft, as with the paperclip (and as in the 1:1 chat).
     private void OnThreadDragOver(object sender, DragEventArgs e)
     {
-        bool canAccept = groupActive && e.DataView.Contains(StandardDataFormats.StorageItems);
+        bool canAccept = groupActive && Shared.DroppedFiles.CanAttach(e.DataView);
         e.AcceptedOperation = canAccept ? DataPackageOperation.Copy : DataPackageOperation.None;
         if (canAccept)
         {
@@ -527,25 +695,39 @@ public sealed partial class GroupConversationControl : UserControl
 
     private async void OnThreadDrop(object sender, DragEventArgs e)
     {
-        if (!groupActive || !e.DataView.Contains(StandardDataFormats.StorageItems))
+        if (!groupActive || !Shared.DroppedFiles.CanAttach(e.DataView))
         {
             return;
         }
 
         try
         {
-            IReadOnlyList<IStorageItem> items = await e.DataView.GetStorageItemsAsync();
-            if (items.OfType<StorageFile>().FirstOrDefault() is not { Path.Length: > 0 } file)
-            {
-                SetStatus("Можно перетащить только файл с диска.");
-                return;
-            }
-
-            SetDraft(file.Path);
+            AttachDropped(await Shared.DroppedFiles.ReadAsync(e.DataView));
         }
         catch (Exception ex)
         {
             SetStatus($"Не удалось прикрепить файл: {ex.Message}");
+        }
+    }
+
+    /// Files dropped on the group (its thread, its composer, its row in the chat list): the first
+    /// becomes the draft, as «Прикрепить» makes it.
+    internal void AttachDropped(IReadOnlyList<StorageFile> files)
+    {
+        if (!groupActive)
+        {
+            return;
+        }
+        if (files.FirstOrDefault() is not { Path.Length: > 0 } file)
+        {
+            SetStatus("Можно перетащить файл или картинку, а не папку.");
+            return;
+        }
+
+        SetDraft(file.Path);
+        if (Shared.DroppedFiles.MoreThanOneNote(files) is { } note)
+        {
+            SetStatus(note);
         }
     }
 
@@ -586,17 +768,6 @@ public sealed partial class GroupConversationControl : UserControl
             ? messages.FirstOrDefault(m => m.MessageId == messageId)
             : null;
 
-    private void OnPhotoMenuOpening(object? sender, object e)
-    {
-        if (sender is MenuFlyout { Target: FrameworkElement { Tag: string messageId } } menu)
-        {
-            foreach (MenuFlyoutItemBase item in menu.Items)
-            {
-                item.Tag = messageId;
-            }
-        }
-    }
-
     private void OnPhotoClicked(object sender, RoutedEventArgs e)
     {
         if (FindMessage(sender) is not { Attachment: { } attachment } item)
@@ -610,7 +781,7 @@ public sealed partial class GroupConversationControl : UserControl
             return;
         }
 
-        string author = item.IsMine ? "Вы" : item.SenderName;
+        string author = item.IsOutgoing ? "Вы" : item.SenderName;
         PhotoOpenRequested?.Invoke(attachment.LocalCopyPath, $"{author} · {item.TimeText}", attachment.FileName);
     }
 
@@ -663,6 +834,58 @@ public sealed partial class GroupConversationControl : UserControl
     }
 
 
+    /// A voice message from the composer: it answers what the text would have answered.
+    private async void OnVoiceRecorded(object? sender, Features.Shared.VoiceRecording recording)
+    {
+        if (bridge is not { } core || group is not { } here)
+        {
+            return;
+        }
+
+        string? answering = replyTo?.MessageId;
+        try
+        {
+            await Task.Run(() =>
+            {
+                string file = core.StageVoiceRecording(recording.Packets, recording.Waveform);
+                core.SendGroupAttachment(here.GroupId, string.Empty, file, null, false, answering, asVoice: true);
+            });
+            SetReply(null);
+            SetStatus(null);
+            RefreshMessages();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Голосовое не отправилось: {WorkspaceErrorText.ForCoreMessage(ex.Message)}");
+        }
+    }
+
+    /// A video message from the composer: it answers what the text would have answered.
+    private async void OnVideoNoteRecorded(object? sender, Features.Shared.VideoNoteRecording recording)
+    {
+        if (bridge is not { } core || group is not { } here)
+        {
+            return;
+        }
+
+        string? answering = replyTo?.MessageId;
+        try
+        {
+            await Task.Run(() =>
+            {
+                string file = core.StageVideoNote(recording.Video, recording.Preview);
+                core.SendGroupAttachment(here.GroupId, string.Empty, file, null, false, answering, asVideoNote: true);
+            });
+            SetReply(null);
+            SetStatus(null);
+            RefreshMessages();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Видеосообщение не отправилось: {WorkspaceErrorText.ForCoreMessage(ex.Message)}");
+        }
+    }
+
     private void SendMessage()
     {
         if (bridge is null || group is null)
@@ -681,20 +904,21 @@ public sealed partial class GroupConversationControl : UserControl
             if (draftPath is { } path)
             {
                 // The text goes as the file's caption, as in the 1:1 chat.
-                bridge.SendGroupAttachment(group.GroupId, body, path, draftName, draftAsPhoto);
+                bridge.SendGroupAttachment(group.GroupId, body, path, draftName, draftAsPhoto, replyTo?.MessageId);
                 ClearDraft();
             }
             else
             {
-                bridge.SendGroupText(group.GroupId, body);
+                bridge.SendGroupText(group.GroupId, body, replyTo?.MessageId, GroupComposer.TakeMentions());
             }
             GroupMessageInputTextBox.Text = string.Empty;
+            SetReply(null);
             SetStatus(null);
             RefreshMessages();
         }
         catch (Exception ex)
         {
-            SetStatus($"Не удалось отправить: {ex.Message}");
+            SetStatus($"Не удалось отправить: {WorkspaceErrorText.ForCoreMessage(ex.Message)}");
         }
     }
 
@@ -702,9 +926,6 @@ public sealed partial class GroupConversationControl : UserControl
 
     // Below this width the group's page would squeeze the conversation's header off screen — it
     // covers the conversation instead.
-    private const double InfoPanelSideBySideMinWidth = 760;
-    private const double InfoPanelWidth = 340;
-
     private bool infoOpen;
 
     /// The header (or «⋯») opens the group's page and closes it again, as in Telegram.
@@ -722,14 +943,18 @@ public sealed partial class GroupConversationControl : UserControl
         LayoutGroupInfoPanel();
     }
 
+    private Shared.RailSplitter? groupInfoEdge;
+
     private void LayoutGroupInfoPanel()
     {
-        bool sideBySide = ActualWidth <= 0 || ActualWidth >= InfoPanelSideBySideMinWidth;
+        bool sideBySide = ActualWidth <= 0 || ActualWidth >= Shared.DetailsPanel.SideBySideFrom;
         GroupInfoPanel.Visibility = infoOpen ? Visibility.Visible : Visibility.Collapsed;
-        GroupInfoColumn.Width = infoOpen && sideBySide ? new GridLength(InfoPanelWidth) : new GridLength(0);
+        GroupInfoColumn.Width = infoOpen && sideBySide ? new GridLength(Shared.DetailsPanel.Width) : new GridLength(0);
         Grid.SetColumn(GroupInfoPanel, sideBySide ? 1 : 0);
         Grid.SetColumnSpan(GroupInfoPanel, sideBySide ? 1 : 2);
         GroupInfoPanel.BorderThickness = sideBySide ? new Thickness(1, 0, 0, 0) : new Thickness(0);
+        groupInfoEdge ??= Shared.DetailsPanel.AddEdge(GroupInfoPanel);
+        groupInfoEdge.Visibility = sideBySide ? Visibility.Visible : Visibility.Collapsed;
     }
 
     /// The visible action tiles share the width equally (a member sees three, an admin four).
@@ -895,6 +1120,7 @@ public sealed partial class GroupConversationControl : UserControl
             await new ContentDialog
             {
                 XamlRoot = XamlRoot,
+                RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
                 Title = "Вы единственный админ",
                 Content = "Чтобы выйти, сначала сделайте админом кого-то из участников (меню у его имени). Или удалите группу для всех.",
                 CloseButtonText = "Понятно",
@@ -906,7 +1132,7 @@ public sealed partial class GroupConversationControl : UserControl
         bool confirmed = await ConfirmAsync(
             active ? "Выйти из группы?" : "Удалить чат?",
             active
-                ? $"Вы выйдете из «{name}», и её переписка удалится с этого устройства. Вернуться можно только по новому приглашению."
+                ? $"Вы выйдете из «{name}», и её переписка удалится с этого устройства. Вернуться можно только по новому приглашению.{ProjectsLeaveText(group.GroupId, forEveryone: false)}"
                 : $"Переписка «{name}» удалится с этого устройства.",
             active ? "Выйти и удалить чат" : "Удалить");
         if (confirmed)
@@ -924,7 +1150,7 @@ public sealed partial class GroupConversationControl : UserControl
 
         bool confirmed = await ConfirmAsync(
             "Удалить группу для всех?",
-            $"«{group.Name}» перестанет работать у всех участников: писать и звонить в неё больше нельзя. У вас чат удалится сразу, у остальных останется до тех пор, пока они его не удалят.",
+            $"«{group.Name}» перестанет работать у всех участников: писать и звонить в неё больше нельзя. У вас чат удалится сразу, у остальных останется до тех пор, пока они его не удалят.{ProjectsLeaveText(group.GroupId, forEveryone: true)}",
             "Удалить для всех");
         if (confirmed)
         {
@@ -932,11 +1158,48 @@ public sealed partial class GroupConversationControl : UserControl
         }
     }
 
+    /// What leaving (or deleting the group for everyone) takes of its projects, as a paragraph for the
+    /// dialog; empty when the group has none. History goes, working folders stay (the core removes
+    /// Omni's copy of a group we are no longer in — docs/decisions/workspace-files-storage.md).
+    private string ProjectsLeaveText(string groupId, bool forEveryone)
+    {
+        GroupLeaveNotice notice;
+        try
+        {
+            notice = bridge!.GetGroupLeaveNotice(groupId);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"GetGroupLeaveNotice failed: {ex.Message}");
+            return forEveryone
+                ? "\n\nИстория версий проектов группы, если они есть, удалится у всех участников. Файлы в рабочих папках останутся."
+                : "\n\nИстория версий проектов группы, если они есть, удалится с этого компьютера. Файлы в рабочих папках останутся.";
+        }
+
+        if (notice.Projects.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        static string Names(List<string> names) => string.Join(", ", names.ConvertAll(n => $"«{n}»"));
+        string where = forEveryone ? "у всех участников, в том числе у вас" : "с этого компьютера";
+        string text = $"\n\nИстория версий {(notice.Projects.Count == 1 ? "проекта" : "проектов")} {Names(notice.Projects)} удалится {where}. Файлы в рабочих папках останутся.";
+        if (!forEveryone && notice.OnlyCustodianOf.Count > 0)
+        {
+            text += notice.OnlyCustodianOf.Count == 1
+                ? $"\n\nПолная история проекта {Names(notice.OnlyCustodianOf)} хранится только у вас: после выхода её не будет и у группы."
+                : $"\n\nПолная история проектов {Names(notice.OnlyCustodianOf)} хранится только у вас: после выхода её не будет и у группы.";
+        }
+
+        return text;
+    }
+
     private async Task<bool> ConfirmAsync(string title, string text, string primary)
     {
         ContentDialog confirm = new()
         {
             XamlRoot = XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
             Title = title,
             Content = text,
             PrimaryButtonText = primary,
@@ -1035,14 +1298,36 @@ public sealed partial class GroupConversationControl : UserControl
 
     private async void OnLeaveCallClicked(object sender, RoutedEventArgs e) => await LeaveCallAsync();
 
-    private void OnChooseGroupAvatarClicked(object sender, RoutedEventArgs e)
+    private async void OnChooseGroupAvatarClicked(object sender, RoutedEventArgs e)
     {
-        if (bridge is null || group is null || PickImageFile?.Invoke() is not { Length: > 0 } path)
+        if (bridge is null || group is null || PickImageFile is null)
         {
             return;
         }
 
-        RunGroupAvatarChange(path);
+        string? path;
+        try
+        {
+            path = await PickImageFile();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Не удалось открыть изображение: {ex.Message}");
+            return;
+        }
+
+        if (path is { Length: > 0 })
+        {
+            RunGroupAvatarChange(path);
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+                // A leftover in the window's temp folder, swept when the window starts.
+            }
+        }
     }
 
     private void OnClearGroupAvatarClicked(object sender, RoutedEventArgs e) => RunGroupAvatarChange(null);
@@ -1779,72 +2064,56 @@ public sealed record MemberLook(Microsoft.UI.Xaml.Media.ImageSource? Image, stri
 }
 
 /// One line of the group thread.
-public sealed class GroupMessageItem
+public sealed class GroupMessageItem : Shared.MessageRow
 {
-    public string MessageId { get; init; } = string.Empty;
-    internal AttachmentRecord? Attachment { get; init; }
-    public string SenderName { get; init; } = string.Empty;
-    public string Body { get; init; } = string.Empty;
-    public string TimeText { get; init; } = string.Empty;
-    public bool IsMine { get; init; }
-    public bool IsSystem { get; init; }
+    private GroupMessageItem(string messageId) : base(messageId) { }
 
-    public HorizontalAlignment Alignment => IsMine ? HorizontalAlignment.Right : HorizontalAlignment.Left;
-    public Visibility SystemVisibility => IsSystem ? Visibility.Visible : Visibility.Collapsed;
-    public Visibility BubbleVisibility => IsSystem ? Visibility.Collapsed : Visibility.Visible;
-    public Visibility SenderVisibility => !IsSystem && !IsMine ? Visibility.Visible : Visibility.Collapsed;
-    public Visibility BodyVisibility => Body.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-
-    // The photo or file of the line — the same rules as the 1:1 bubble (ChatMessageListItem).
-    private AttachmentPresentation? Photo => Attachment?.Presentation is { IsPhoto: true } photo ? photo : null;
-    private (double Width, double Height) PhotoSize =>
-        Photo is { } photo ? MainWindowPresentation.FitPhotoInBubble(photo.Width, photo.Height) : (0, 0);
-    public Visibility PhotoVisibility => Photo is not null ? Visibility.Visible : Visibility.Collapsed;
-    public Visibility FileVisibility => Attachment is not null && Photo is null ? Visibility.Visible : Visibility.Collapsed;
-    public double PhotoDisplayWidth => PhotoSize.Width;
-    public double PhotoDisplayHeight => PhotoSize.Height;
-    public int PhotoDecodeWidth => (int)Math.Ceiling(PhotoSize.Width * 2);
-    public string? PhotoLocalPath => Photo is null ? null : Attachment!.LocalCopyPath;
-    public string? PhotoPreviewBase64 => Photo?.PreviewJpegBase64;
-    public string FileName => Attachment?.FileName ?? string.Empty;
-    public string FileSizeText => Attachment is null ? string.Empty : MainWindowPresentation.FormatFileSize(Attachment.FileSizeBytes);
-    public string FileStatusText => Attachment is null ? string.Empty : MainWindowPresentation.BuildGroupAttachmentStatusText(Attachment, IsMine);
-    public Visibility FileStatusVisibility => FileStatusText.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-    public double FileProgressValue => Attachment is null ? 0 : MainWindowPresentation.BuildAttachmentProgressValue(Attachment);
-    public Visibility FileProgressVisibility =>
-        Attachment is not null && MainWindowPresentation.ShouldShowAttachmentProgress(Attachment) ? Visibility.Visible : Visibility.Collapsed;
-
-    public Microsoft.UI.Xaml.Media.Brush? AvatarBrush { get; init; }
-    public string Initials { get; init; } = string.Empty;
-    public Microsoft.UI.Xaml.Media.ImageSource? Picture { get; init; }
+    internal AttachmentRecord? Attachment { get; private init; }
     private string PictureKey { get; init; } = string.Empty;
-    public bool IsRunTail { get; init; }
-    public Visibility AvatarSlotVisibility => IsMine || IsSystem ? Visibility.Collapsed : Visibility.Visible;
-    public double AvatarOpacity => IsRunTail ? 1d : 0d;
+    private string Seed { get; init; } = string.Empty;
 
     // What the row shows — a row is replaced only when this changes.
     internal string Signature => string.Join('|',
-        MessageId, Body, TimeText, IsRunTail, Initials, PictureKey, (AvatarBrush as Microsoft.UI.Xaml.Media.SolidColorBrush)?.Color.ToString(),
+        MessageId, Body, SystemText, TimeText, ReactionsSignature, IsPinned, QuotedMessageId, QuoteText, QuoteAuthor, IsRunTail, ShowSender, DayHeaderText, SenderName, Peer?.AvatarText, PictureKey, Seed,
         Attachment?.State, Attachment?.BytesTransferred, Attachment?.LocalCopyPath, Attachment?.Presentation is not null);
 
-    // UI thread only (the brush).
     internal static GroupMessageItem From(
-        GroupMessageView view, string accountId, bool runTail,
-        MemberLook look) => new()
+        GroupMessageView view, string accountId, bool runHead, bool runTail, string? dayHeader, double bubbleMaxWidth,
+        MemberLook look)
     {
-        Picture = look.Image,
-        PictureKey = look.Key,
-        AvatarBrush = Omni.Windows.App.Presentation.AvatarPalette.BrushFor(accountId),
-        Initials = GroupConversationControl.BuildInitials(look.Name ?? (string.IsNullOrWhiteSpace(view.SenderName) ? "?" : view.SenderName)),
-        IsRunTail = runTail,
-        MessageId = view.MessageId,
-        Attachment = view.Attachment,
-        SenderName = look.Name ?? (string.IsNullOrWhiteSpace(view.SenderName) ? "Участник" : view.SenderName),
-        Body = view.Body,
-        IsMine = view.IsMine,
-        IsSystem = view.Kind == "system",
-        TimeText = DateTimeOffset.FromUnixTimeMilliseconds(view.CreatedAtUnixMs).ToLocalTime().ToString("HH:mm"),
-    };
+        string name = look.Name ?? (string.IsNullOrWhiteSpace(view.SenderName) ? "Участник" : view.SenderName);
+        Chats.ChatTranscriptPeer peer = new();
+        peer.Set(GroupConversationControl.BuildInitials(look.Name ?? (string.IsNullOrWhiteSpace(view.SenderName) ? "?" : view.SenderName)), look.Image, accountId);
+        GroupMessageItem item = new(view.MessageId)
+        {
+            Attachment = view.Attachment,
+            PictureKey = look.Key,
+            Seed = accountId,
+            Peer = peer,
+            SenderName = name,
+            IsOutgoing = view.IsMine,
+            ShowSender = runHead,
+            IsRunTail = runTail,
+            TimeText = MainWindowPresentation.FormatBubbleTime(view.CreatedAtUnixMs),
+        };
+        if (view.Kind == "system")
+        {
+            item.SystemText = view.Body;
+        }
+        else
+        {
+            item.Body = view.Body;
+        }
+        item.SetDayHeader(dayHeader);
+        item.UpdateBubbleMaxWidth(bubbleMaxWidth);
+        item.ApplyReply(view.Reply, "Участник");
+        item.ApplyReactions(view.Reactions);
+        item.IsPinned = view.Pinned;
+        item.ApplyAttachment(
+            view.Attachment,
+            view.Attachment is null ? string.Empty : MainWindowPresentation.BuildGroupAttachmentStatusText(view.Attachment, view.IsMine));
+        return item;
+    }
 }
 
 /// One member row in the group panel.

@@ -1,3 +1,6 @@
+/// Profile meta: the time a chat with an account was forgotten up to.
+const CHAT_HISTORY_FLOOR_PREFIX: &str = "chat_history_floor:";
+
 impl Storage {
     pub fn add_contact(
         &self,
@@ -377,6 +380,35 @@ impl Storage {
             contact_id,
             now_unix_ms,
         )?;
+        let was_blocked: bool = self
+            .connection
+            .query_row(
+                "SELECT is_blocked FROM contacts WHERE contact_id = ?1 AND profile_id = ?2",
+                params![contact_id.0, profile_id.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some_and(|blocked| blocked != 0);
+        let blocking = matches!(relationship_state, omni_identity::ContactRelationshipState::Declined);
+        // The block's period: opened when it starts, closed when it is lifted.
+        if blocking && !was_blocked {
+            self.connection
+                .execute(
+                    "INSERT OR IGNORE INTO contact_block_periods (profile_id, contact_id, blocked_at_unix_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![profile_id.0, contact_id.0, now_unix_ms],
+                )
+                .map_err(map_sqlite_error)?;
+        } else if !blocking && was_blocked {
+            self.connection
+                .execute(
+                    "UPDATE contact_block_periods SET unblocked_at_unix_ms = ?3
+                     WHERE profile_id = ?1 AND contact_id = ?2 AND unblocked_at_unix_ms IS NULL",
+                    params![profile_id.0, contact_id.0, now_unix_ms],
+                )
+                .map_err(map_sqlite_error)?;
+        }
         let updated_rows = self
             .connection
             .execute(
@@ -414,6 +446,24 @@ impl Storage {
         }
 
         self.get_contact(&contact_id)
+    }
+
+    /// Whether the contact was blocked at `at_unix_ms` (a time its message names as written): what it
+    /// wrote while blocked is not shown, even when it arrives after the block was lifted.
+    pub fn contact_was_blocked_at(&self, contact_id: &ContactId, at_unix_ms: i64) -> OmniResult<bool> {
+        let profile_id = self.require_active_profile_id()?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM contact_block_periods
+                    WHERE profile_id = ?1 AND contact_id = ?2 AND blocked_at_unix_ms <= ?3
+                      AND (unblocked_at_unix_ms IS NULL OR ?3 < unblocked_at_unix_ms)
+                 )",
+                params![profile_id.0, contact_id.0, at_unix_ms],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(map_sqlite_error)
     }
 
     pub fn approve_contact(
@@ -571,6 +621,16 @@ impl Storage {
         }
     }
 
+    /// The time up to which a chat with `account_id` was forgotten ([`Self::forget_contact`]): no copy
+    /// of the chat brings back a line dated before it. Forgotten lines came back with the contact's
+    /// history sync once the account was a contact again (blind audit 2026-11-13, pass 22).
+    pub fn chat_history_floor(&self, account_id: &AccountId) -> OmniResult<i64> {
+        Ok(self
+            .get_profile_meta(&format!("{CHAT_HISTORY_FLOOR_PREFIX}{}", account_id.0))?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(i64::MIN))
+    }
+
     pub fn forget_contact(
         &self,
         contact_id: &ContactId,
@@ -611,6 +671,9 @@ impl Storage {
             self.delete_dialog_history(&dialog_key)?;
         }
         if let Some(account_id) = existing.remote_account_id.as_ref() {
+            // The talk so far is gone for good: a history sync does not bring it back, should the
+            // account be a contact again ([`Self::chat_history_floor`]).
+            self.upsert_profile_meta(&format!("{CHAT_HISTORY_FLOOR_PREFIX}{}", account_id.0), &now_unix_ms.to_string())?;
             // Where its devices post and look is nothing to us any more.
             self.connection
                 .execute(

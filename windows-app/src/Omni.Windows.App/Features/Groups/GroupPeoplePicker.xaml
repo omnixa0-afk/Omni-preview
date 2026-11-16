@@ -73,7 +73,7 @@
                 <ColumnDefinition Width="Auto" />
               </Grid.ColumnDefinitions>
               <Grid Width="40" Height="40">
-                <shared:AvatarView Picture="{x:Bind AvatarImage}" PictureTitle="{x:Bind Title}" Size="40" Text="{x:Bind Initials}" />
+                <shared:AvatarView Fill="{x:Bind AvatarBrush}" Picture="{x:Bind AvatarImage}" PictureTitle="{x:Bind Title}" Size="40" Text="{x:Bind Initials}" />
                 <Ellipse
                   Width="11"
                   Height="11"

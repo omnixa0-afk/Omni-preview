@@ -204,15 +204,25 @@ pub trait Interface: Debug + Send + Sync {
     /// keep (`Network::keep_direct_only_with`). Default: nothing to close (connectionless interfaces).
     async fn close_neighbor(&self, _neighbor: &NeighborId) {}
 
-    /// Our reflexive address as seen by public STUN servers, asked FROM THIS INTERFACE'S OWN SOCKET —
-    /// so the mapping is the one a peer's dial reaches. Default: `None` (only the native-UDP QUIC
+    /// What public STUN servers say about our address, asked FROM THIS INTERFACE'S OWN SOCKET — so
+    /// the mapping is the one a peer's dial reaches. Default: `None` (only the native-UDP QUIC
     /// carrier has a socket of its own to ask from). See `crate::stun_socket`.
-    async fn stun_reflexive(
+    async fn stun_probe(
         &self,
         servers: &[&str],
         timeout: Duration,
-    ) -> Option<omni_net_primitives::stun::Reflexive> {
+    ) -> Option<omni_net_primitives::stun::StunProbe> {
         let _ = (servers, timeout);
+        None
+    }
+
+    /// Channel binding of the connection `neighbor` names, for the identity challenge
+    /// (`crate::cert`): keying material exported from that connection's TLS session under
+    /// `CHANNEL_BINDING_LABEL`. Both ends of one session get the same bytes; a man in the middle
+    /// holds two sessions and cannot make them match. Default: `None` — an interface without a
+    /// TLS session per neighbour cannot verify a peer, and the network refuses a challenge on it.
+    fn channel_binding(&self, neighbor: &NeighborId) -> Option<[u8; crate::cert::CHANNEL_BINDING_BYTES]> {
+        let _ = neighbor;
         None
     }
 
@@ -270,6 +280,20 @@ pub trait Interface: Debug + Send + Sync {
         door_tcp: std::net::SocketAddr,
     ) -> io::Result<()> {
         let _ = (peer_quic, door_tcp);
+        Err(io::Error::other("interface does not support door routing"))
+    }
+
+    /// Route `peer` (its TCP punch address, which is how quinn will address it) over `stream`, a TCP
+    /// connection the hole punch already made to it from our door's `door_port`. Only the native-UDP
+    /// QUIC carrier supports this (it owns the `MuxRouter`); the default errors.
+    /// See docs/decisions/tcp-hole-punch.md.
+    fn route_peer_over_punched(
+        &self,
+        peer: std::net::SocketAddr,
+        stream: tokio::net::TcpStream,
+        door_port: u16,
+    ) -> io::Result<()> {
+        let _ = (peer, stream, door_port);
         Err(io::Error::other("interface does not support door routing"))
     }
 

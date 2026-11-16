@@ -15,10 +15,12 @@ Additive columns added via ensure_table_column are listed under each table.
 - [`account_key_moves`](#account-key-moves)
 - [`account_keys`](#account-keys)
 - [`account_working_keys`](#account-working-keys)
+- [`allowed_pair_couriers`](#allowed-pair-couriers)
 - [`app_meta`](#app-meta)
 - [`call_participants`](#call-participants)
 - [`call_sessions`](#call-sessions)
 - [`chat_history_checks`](#chat-history-checks)
+- [`contact_block_periods`](#contact-block-periods)
 - [`contact_dialog_links`](#contact-dialog-links)
 - [`contact_identity_observations`](#contact-identity-observations)
 - [`contact_presence`](#contact-presence)
@@ -35,9 +37,11 @@ Additive columns added via ensure_table_column are listed under each table.
 - [`durable_frames`](#durable-frames)
 - [`group_branches`](#group-branches)
 - [`group_feed_outbox`](#group-feed-outbox)
+- [`group_invitee_welcomes`](#group-invitee-welcomes)
 - [`group_invites`](#group-invites)
 - [`group_member_profiles`](#group-member-profiles)
 - [`group_members`](#group-members)
+- [`group_message_arrivals`](#group-message-arrivals)
 - [`group_message_meta`](#group-message-meta)
 - [`group_outbox`](#group-outbox)
 - [`group_own_changes`](#group-own-changes)
@@ -50,17 +54,28 @@ Additive columns added via ensure_table_column are listed under each table.
 - [`held_passports`](#held-passports)
 - [`history_imports`](#history-imports)
 - [`identity_keys`](#identity-keys)
+- [`inbound_bootstrap_marks`](#inbound-bootstrap-marks)
 - [`inbound_dedup`](#inbound-dedup)
 - [`local_account`](#local-account)
 - [`local_devices`](#local-devices)
 - [`mesh_bootstrap_invites`](#mesh-bootstrap-invites)
 - [`mesh_dialog_route`](#mesh-dialog-route)
 - [`mesh_peer_book`](#mesh-peer-book)
+- [`message_actions_mark`](#message-actions-mark)
 - [`message_attachments`](#message-attachments)
+- [`message_delete_requests`](#message-delete-requests)
+- [`message_delete_requests_by_profile`](#message-delete-requests-by-profile)
+- [`message_deletions`](#message-deletions)
+- [`message_deletions_by_profile`](#message-deletions-by-profile)
 - [`message_device_receipts`](#message-device-receipts)
+- [`message_mentions`](#message-mentions)
+- [`message_pins`](#message-pins)
+- [`message_reactions`](#message-reactions)
+- [`message_replies`](#message-replies)
 - [`message_security_metadata`](#message-security-metadata)
 - [`messages`](#messages)
 - [`mls_storage_key`](#mls-storage-key)
+- [`mls_storage_keys`](#mls-storage-keys)
 - [`network_nodes`](#network-nodes)
 - [`one_time_prekeys`](#one-time-prekeys)
 - [`outbound_queue`](#outbound-queue)
@@ -80,6 +95,13 @@ Additive columns added via ensure_table_column are listed under each table.
 - [`replay_windows`](#replay-windows)
 - [`sessions`](#sessions)
 - [`signed_prekeys`](#signed-prekeys)
+- [`workspace_approvals`](#workspace-approvals)
+- [`workspace_file_events`](#workspace-file-events)
+- [`workspace_file_local`](#workspace-file-local)
+- [`workspace_main_rules`](#workspace-main-rules)
+- [`workspace_member_refs`](#workspace-member-refs)
+- [`workspace_repo_files`](#workspace-repo-files)
+- [`workspace_repos`](#workspace-repos)
 
 ## `account_devices`
 
@@ -136,6 +158,15 @@ Additive columns added via ensure_table_column are listed under each table.
 | `version` | INTEGER NOT NULL |
 | `certificate_json` | TEXT NOT NULL |
 | `updated_at_unix_ms` | INTEGER NOT NULL |
+
+## `allowed_pair_couriers`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `url` | TEXT NOT NULL |
+| `allowed_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, url) |
 
 ## `app_meta`
 
@@ -195,6 +226,16 @@ Additive columns added via ensure_table_column are listed under each table.
 | `state` | TEXT NOT NULL |
 | `checked_at_unix_ms` | INTEGER NOT NULL |
 | _constraint_ | PRIMARY KEY (profile_id, chat_account_id) |
+
+## `contact_block_periods`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `contact_id` | TEXT NOT NULL |
+| `blocked_at_unix_ms` | INTEGER NOT NULL |
+| `unblocked_at_unix_ms` | INTEGER |
+| _constraint_ | PRIMARY KEY (profile_id, contact_id, blocked_at_unix_ms) |
 
 ## `contact_dialog_links`
 
@@ -349,16 +390,12 @@ Additive columns added via ensure_table_column are listed under each table.
 
 | Column / Constraint | Definition |
 |---|---|
-| `message_id` | TEXT PRIMARY KEY NOT NULL |
+| `message_id` | TEXT NOT NULL |
 | `dialog_key` | TEXT NOT NULL |
 | `delivered_at_unix_ms` | INTEGER NOT NULL |
 | `recorded_at_unix_ms` | INTEGER NOT NULL |
-
-**Added via `ensure_table_column` (additive migrations):**
-
-| Column | Type |
-|---|---|
 | `profile_id` | TEXT |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
 
 ## `device_keys`
 
@@ -437,6 +474,18 @@ Additive columns added via ensure_table_column are listed under each table.
 | `mls` | BLOB NOT NULL |
 | `created_at_unix_ms` | INTEGER NOT NULL |
 
+## `group_invitee_welcomes`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `dialog_key` | TEXT NOT NULL |
+| `account_id` | TEXT NOT NULL |
+| `welcome_json` | TEXT NOT NULL |
+| `made_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, dialog_key) |
+
 ## `group_invites`
 
 | Column / Constraint | Definition |
@@ -475,6 +524,17 @@ Additive columns added via ensure_table_column are listed under each table.
 | `status` | TEXT NOT NULL |
 | `node_hint_hex` | TEXT NOT NULL |
 | _constraint_ | PRIMARY KEY (profile_id, group_id, member_pub) |
+
+## `group_message_arrivals`
+
+| Column / Constraint | Definition |
+|---|---|
+| `seq` | INTEGER PRIMARY KEY AUTOINCREMENT |
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `message_id` | TEXT NOT NULL |
+| `arrived_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | UNIQUE (profile_id, message_id) |
 
 ## `group_message_meta`
 
@@ -585,6 +645,12 @@ Additive columns added via ensure_table_column are listed under each table.
 | `updated_at_unix_ms` | INTEGER NOT NULL |
 | _constraint_ | PRIMARY KEY (profile_id, group_id) |
 
+**Added via `ensure_table_column` (additive migrations):**
+
+| Column | Type |
+|---|---|
+| `newcomers_told` | TEXT |
+
 ## `held_passports`
 
 | Column / Constraint | Definition |
@@ -629,19 +695,30 @@ Additive columns added via ensure_table_column are listed under each table.
 | `signing_private_key_protection_scheme` | TEXT |
 | `signing_private_key_blob` | TEXT |
 
-## `inbound_dedup`
+## `inbound_bootstrap_marks`
 
 | Column / Constraint | Definition |
 |---|---|
-| `message_id` | TEXT PRIMARY KEY NOT NULL |
-| `dialog_key` | TEXT NOT NULL |
-| `first_seen_unix_ms` | INTEGER NOT NULL |
+| `remote_account_id` | TEXT NOT NULL |
+| `remote_device_id` | TEXT NOT NULL |
+| `created_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (remote_account_id, remote_device_id) |
 
 **Added via `ensure_table_column` (additive migrations):**
 
 | Column | Type |
 |---|---|
 | `profile_id` | TEXT |
+
+## `inbound_dedup`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT NOT NULL |
+| `dialog_key` | TEXT NOT NULL |
+| `first_seen_unix_ms` | INTEGER NOT NULL |
+| `profile_id` | TEXT |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
 
 ## `local_account`
 
@@ -694,6 +771,12 @@ Additive columns added via ensure_table_column are listed under each table.
 | `inviter_node` | BLOB |
 | `expires_at_ms` | INTEGER NOT NULL |
 
+**Added via `ensure_table_column` (additive migrations):**
+
+| Column | Type |
+|---|---|
+| `inviter_reply_key` | BLOB |
+
 ## `mesh_dialog_route`
 
 | Column / Constraint | Definition |
@@ -711,11 +794,18 @@ Additive columns added via ensure_table_column are listed under each table.
 | `expires_at_unix_ms` | INTEGER NOT NULL |
 | _constraint_ | PRIMARY KEY (node_address, dial_addr) |
 
+## `message_actions_mark`
+
+| Column / Constraint | Definition |
+|---|---|
+| `only_row` | INTEGER PRIMARY KEY CHECK (only_row = 1) |
+| `changed_at_unix_ms` | INTEGER NOT NULL |
+
 ## `message_attachments`
 
 | Column / Constraint | Definition |
 |---|---|
-| `message_id` | TEXT PRIMARY KEY NOT NULL |
+| `message_id` | TEXT NOT NULL |
 | `dialog_key` | TEXT NOT NULL |
 | `file_name` | TEXT NOT NULL |
 | `file_size_bytes` | INTEGER NOT NULL |
@@ -732,14 +822,8 @@ Additive columns added via ensure_table_column are listed under each table.
 | `created_at_unix_ms` | INTEGER NOT NULL |
 | `updated_at_unix_ms` | INTEGER NOT NULL |
 | `profile_id` | TEXT |
-
-**Added via `ensure_table_column` (additive migrations):**
-
-| Column | Type |
-|---|---|
 | `content_tree_blocks` | BLOB |
 | `content_blocks_have` | BLOB |
-| `profile_id` | TEXT |
 | `content_encryption` | TEXT |
 | `content_key_hex` | TEXT |
 | `content_nonce_seed_hex` | TEXT |
@@ -749,6 +833,54 @@ Additive columns added via ensure_table_column are listed under each table.
 | `local_source_size_bytes` | INTEGER |
 | `local_source_modified_unix_ms` | INTEGER |
 | `presentation_json` | TEXT |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
+
+## `message_delete_requests`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT NOT NULL |
+| `dialog_key` | TEXT NOT NULL |
+| `requester_pub` | TEXT NOT NULL |
+| `requester_account` | TEXT NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| `received_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (message_id, requester_pub, requester_account) |
+
+## `message_delete_requests_by_profile`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `message_id` | TEXT NOT NULL |
+| `dialog_key` | TEXT NOT NULL |
+| `requester_pub` | TEXT NOT NULL |
+| `requester_account` | TEXT NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| `received_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, message_id, requester_pub, requester_account) |
+
+## `message_deletions`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT PRIMARY KEY |
+| `dialog_key` | TEXT NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| `unsent` | INTEGER NOT NULL DEFAULT 0 |
+| `changed` | INTEGER NOT NULL DEFAULT 0 |
+
+## `message_deletions_by_profile`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `message_id` | TEXT NOT NULL |
+| `dialog_key` | TEXT NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| `unsent` | INTEGER NOT NULL DEFAULT 0 |
+| `changed` | INTEGER NOT NULL DEFAULT 0 |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
 
 ## `message_device_receipts`
 
@@ -758,13 +890,56 @@ Additive columns added via ensure_table_column are listed under each table.
 | `remote_device_id` | TEXT NOT NULL |
 | `delivered_at_unix_ms` | INTEGER NOT NULL |
 | `profile_id` | TEXT NOT NULL |
-| _constraint_ | PRIMARY KEY (message_id, remote_device_id) |
+| _constraint_ | PRIMARY KEY (profile_id, message_id, remote_device_id) |
+
+## `message_mentions`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT NOT NULL |
+| `accounts_json` | TEXT NOT NULL |
+| `profile_id` | TEXT NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
+
+## `message_pins`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT |
+| `dialog_key` | TEXT NOT NULL |
+| `pinned` | INTEGER NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| `unsent` | INTEGER NOT NULL DEFAULT 0 |
+| `profile_id` | TEXT NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
+
+## `message_reactions`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT NOT NULL |
+| `reactor` | TEXT NOT NULL |
+| `mine` | INTEGER NOT NULL |
+| `emoji` | TEXT NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| `unsent` | INTEGER NOT NULL DEFAULT 0 |
+| `profile_id` | TEXT NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, message_id, reactor) |
+
+## `message_replies`
+
+| Column / Constraint | Definition |
+|---|---|
+| `message_id` | TEXT NOT NULL |
+| `reply_to` | TEXT NOT NULL |
+| `profile_id` | TEXT NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
 
 ## `message_security_metadata`
 
 | Column / Constraint | Definition |
 |---|---|
-| `message_id` | TEXT PRIMARY KEY NOT NULL |
+| `message_id` | TEXT NOT NULL |
 | `dialog_key` | TEXT NOT NULL |
 | `contact_id` | TEXT |
 | `session_address` | TEXT |
@@ -775,34 +950,38 @@ Additive columns added via ensure_table_column are listed under each table.
 | `payload_kind` | TEXT |
 | `created_at_unix_ms` | INTEGER NOT NULL |
 | `updated_at_unix_ms` | INTEGER NOT NULL |
-| _constraint_ | FOREIGN KEY(contact_id) REFERENCES contacts(contact_id) |
-
-**Added via `ensure_table_column` (additive migrations):**
-
-| Column | Type |
-|---|---|
 | `profile_id` | TEXT |
+| _constraint_ | FOREIGN KEY(contact_id) REFERENCES contacts(contact_id) |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
 
 ## `messages`
 
 | Column / Constraint | Definition |
 |---|---|
-| `id` | TEXT PRIMARY KEY NOT NULL |
+| `id` | TEXT NOT NULL |
 | `body` | TEXT NOT NULL |
 | `status` | TEXT NOT NULL |
 | `created_at_unix_ms` | INTEGER NOT NULL |
-
-**Added via `ensure_table_column` (additive migrations):**
-
-| Column | Type |
-|---|---|
+| `direction` | TEXT NOT NULL DEFAULT 'outgoing' |
+| `updated_at_unix_ms` | INTEGER NOT NULL DEFAULT 0 |
+| `dialog_key` | TEXT |
+| `remote_delivered_at_unix_ms` | INTEGER |
+| `copied_from_device_id` | TEXT |
 | `profile_id` | TEXT |
+| _constraint_ | PRIMARY KEY (profile_id, id) |
 
 ## `mls_storage_key`
 
 | Column / Constraint | Definition |
 |---|---|
 | `id` | INTEGER PRIMARY KEY CHECK (id = 1) |
+| `protected_json` | TEXT NOT NULL |
+
+## `mls_storage_keys`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT PRIMARY KEY NOT NULL |
 | `protected_json` | TEXT NOT NULL |
 
 ## `network_nodes`
@@ -842,7 +1021,7 @@ Additive columns added via ensure_table_column are listed under each table.
 
 | Column / Constraint | Definition |
 |---|---|
-| `message_id` | TEXT PRIMARY KEY NOT NULL |
+| `message_id` | TEXT NOT NULL |
 | `dialog_key` | TEXT NOT NULL |
 | `status` | TEXT NOT NULL |
 | `attempt_count` | INTEGER NOT NULL DEFAULT 0 |
@@ -853,12 +1032,8 @@ Additive columns added via ensure_table_column are listed under each table.
 | `remote_delivered_at_unix_ms` | INTEGER |
 | `created_at_unix_ms` | INTEGER NOT NULL |
 | `updated_at_unix_ms` | INTEGER NOT NULL |
-
-**Added via `ensure_table_column` (additive migrations):**
-
-| Column | Type |
-|---|---|
 | `profile_id` | TEXT |
+| _constraint_ | PRIMARY KEY (profile_id, message_id) |
 
 ## `own_passport`
 
@@ -979,6 +1154,12 @@ Additive columns added via ensure_table_column are listed under each table.
 | `updated_at_unix_ms` | INTEGER NOT NULL |
 | _constraint_ | FOREIGN KEY(profile_id) REFERENCES profile_registry(profile_id) |
 | _constraint_ | FOREIGN KEY(account_id) REFERENCES local_account(account_id) |
+
+**Added via `ensure_table_column` (additive migrations):**
+
+| Column | Type |
+|---|---|
+| `profile_master_key_password_layer` | INTEGER NOT NULL DEFAULT 0 |
 
 ## `recovered_groups`
 
@@ -1126,4 +1307,88 @@ Additive columns added via ensure_table_column are listed under each table.
 | `updated_at_unix_ms` | INTEGER NOT NULL |
 | _constraint_ | PRIMARY KEY (device_id, prekey_id) |
 | _constraint_ | FOREIGN KEY(device_id) REFERENCES local_devices(device_id) |
+
+## `workspace_approvals`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `repo` | TEXT NOT NULL |
+| `account_id` | TEXT NOT NULL |
+| `oid` | TEXT NOT NULL |
+| `approved_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, repo, account_id, oid) |
+
+## `workspace_file_events`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `event_key` | TEXT NOT NULL |
+| `sender_account` | TEXT NOT NULL |
+| `sender_member` | TEXT NOT NULL |
+| `event_json` | TEXT NOT NULL |
+| `at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, event_key) |
+
+## `workspace_file_local`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `repo` | TEXT NOT NULL |
+| `setting` | TEXT NOT NULL |
+| `value` | TEXT NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, repo, setting) |
+
+## `workspace_main_rules`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `repo` | TEXT NOT NULL |
+| `main_needs_approval` | INTEGER NOT NULL DEFAULT 0 |
+| `changed_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, repo) |
+
+## `workspace_member_refs`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `repo` | TEXT NOT NULL |
+| `account_id` | TEXT NOT NULL |
+| `member_pub` | TEXT NOT NULL |
+| `ref_name` | TEXT NOT NULL |
+| `oid` | TEXT NOT NULL |
+| `announced_at_unix_ms` | INTEGER NOT NULL |
+| `fetched` | INTEGER NOT NULL DEFAULT 0 |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, repo, account_id, ref_name) |
+
+## `workspace_repo_files`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `repo` | TEXT NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, repo) |
+
+## `workspace_repos`
+
+| Column / Constraint | Definition |
+|---|---|
+| `profile_id` | TEXT NOT NULL |
+| `group_id` | TEXT NOT NULL |
+| `repo` | TEXT NOT NULL |
+| `published_path` | TEXT NOT NULL |
+| `work_path` | TEXT |
+| `announced_refs_json` | TEXT |
+| `created_at_unix_ms` | INTEGER NOT NULL |
+| _constraint_ | PRIMARY KEY (profile_id, group_id, repo) |
 

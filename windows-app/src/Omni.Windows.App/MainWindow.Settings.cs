@@ -28,23 +28,116 @@ public sealed partial class MainWindow
         SettingsProfileSummaryTextBlock.Text = BuildCurrentProfileSummaryText();
         RenderLocalPublicProfileEditor();
         RenderRecoverySummary();
+        RefreshAccountSettingsAsync();
+    }
 
+    private sealed record AccountSettingsRead(
+        string? ProfileId,
+        PasswordProtectionRefreshPayload Password,
+        string? Verification,
+        List<ContactRemoteAccessRecord>? Granted,
+        Dictionary<string, string>? Names,
+        List<OwnDeviceView>? Devices);
+
+    private bool accountSettingsReading;
+    private bool accountSettingsReadAgain;
+    private string shownRemoteAccess = string.Empty;
+    private string shownOwnDevices = string.Empty;
+
+    // What Settings and Diagnostics show about the account. The header above is updated on every section
+    // switch and refresh tick: read here on the UI thread, this held the window 50-120 ms each time, the
+    // whole contact list included, in sections that show none of it. So: off the UI thread, only where it
+    // is seen (once anywhere: the password state also decides what other screens offer), and the lists
+    // are rebuilt only when they changed.
+    private async void RefreshAccountSettingsAsync()
+    {
+        if (windowState.Onboarding.ShellMode != AppShellMode.Authenticated ||
+            !(ShouldRefreshCurrentProfileFootprintImmediately() || currentPasswordProtectionSummary is null))
+        {
+            return;
+        }
+
+        if (accountSettingsReading)
+        {
+            accountSettingsReadAgain = true;
+            return;
+        }
+
+        accountSettingsReading = true;
         try
         {
-            if (windowState.Onboarding.ShellMode == AppShellMode.Authenticated)
+            do
             {
-                RefreshPasswordProtectionSummary();
-                MyVerificationPayloadV1 payload = rustBridge.GetMyVerificationPayload();
-                MyVerificationPayloadTextBox.Text = JsonSerializer.Serialize(
-                    payload,
-                    ReadableJson.MyVerificationPayloadV1);
-                RenderRemoteAccessSettings();
-                RenderOwnDevicesSettings();
+                accountSettingsReadAgain = false;
+                string? profileId = GetCurrentProfileId();
+                AccountSettingsRead read = await Task.Run(() => ReadAccountSettings(profileId));
+                if (string.Equals(read.ProfileId, GetCurrentProfileId(), StringComparison.Ordinal) &&
+                    windowState.Onboarding.ShellMode == AppShellMode.Authenticated)
+                {
+                    ShowAccountSettings(read);
+                }
             }
+            while (accountSettingsReadAgain);
+        }
+        catch (Exception ex)
+        {
+            // Leave the last rendered state; the next tick reads again.
+            AppendNavRefreshLog("async.account_settings", ex);
+        }
+        finally
+        {
+            accountSettingsReading = false;
+        }
+    }
+
+    private AccountSettingsRead ReadAccountSettings(string? profileId)
+    {
+        string? verification = null;
+        try
+        {
+            verification = JsonSerializer.Serialize(rustBridge.GetMyVerificationPayload(), ReadableJson.MyVerificationPayloadV1);
         }
         catch
         {
-            // Leave last rendered settings state if verification payload is temporarily unavailable.
+            // Temporarily unavailable: the box keeps what it shows.
+        }
+
+        (List<ContactRemoteAccessRecord>? granted, Dictionary<string, string>? names) = ReadRemoteAccess();
+        return new AccountSettingsRead(
+            profileId,
+            FetchPasswordProtectionRefreshPayload(profileId),
+            verification,
+            granted,
+            names,
+            ReadOwnDevices());
+    }
+
+    private void ShowAccountSettings(AccountSettingsRead read)
+    {
+        ApplyPasswordProtectionRefreshPayload(read.Password);
+        if (read.Verification is not null && MyVerificationPayloadTextBox.Text != read.Verification)
+        {
+            MyVerificationPayloadTextBox.Text = read.Verification;
+        }
+
+        if (read.Granted is not null && read.Names is not null)
+        {
+            string remoteAccess = string.Join('\n', read.Granted) + '\n' + string.Join('\n', read.Names);
+            if (remoteAccess != shownRemoteAccess)
+            {
+                shownRemoteAccess = remoteAccess;
+                ShowRemoteAccess(read.Granted, read.Names);
+            }
+        }
+
+        if (read.Devices is not null)
+        {
+            string devices = string.Join('\n', read.Devices);
+            if (devices != shownOwnDevices)
+            {
+                shownOwnDevices = devices;
+                ShowOwnDevices(read.Devices);
+            }
         }
     }
 

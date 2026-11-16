@@ -3,6 +3,7 @@
     Build the portable release exe.
 
 .DESCRIPTION
+    0. Checks the dependencies (scripts/check-dependencies.ps1 -Release); a finding stops the release.
     1. Publishes the single-file standalone build (win-x64-standalone profile).
     2. Copies the exe to dist\Omni.exe and writes dist\SHA256SUMS.txt.
 
@@ -33,12 +34,18 @@ if (-not (Get-ChildItem (Join-Path $repo 'native\omni-webrtc-media\build') -Recu
     throw 'No native media DLL was built: an exe without it has no audio or video. Run scripts\build-omni-webrtc-media.ps1 -Configuration Release -UseLibWebRtc first (see DEVELOPING.md).'
 }
 
+# Dependency gate (docs/decisions/dependency-gate.md): a known vulnerability, a yanked version, a crate
+# from an unknown source or under an unknown license stops the release, and so does a check that
+# cannot run. OmniReleaseGate makes the NuGet audit of the shell's packages fail the build the same way.
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'check-dependencies.ps1') -Release
+if ($LASTEXITCODE -ne 0) { throw "dependency check failed ($LASTEXITCODE)" }
+
 if (-not $SkipBuild) {
-    dotnet publish (Join-Path $app 'Omni.Windows.App.csproj') -p:PublishProfile=win-x64-standalone "-p:OmniCoreTargetDir=$TargetDir"
+    dotnet publish (Join-Path $app 'Omni.Windows.App.csproj') -p:PublishProfile=win-x64-standalone -p:OmniReleaseGate=true "-p:OmniCoreTargetDir=$TargetDir"
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed ($LASTEXITCODE)" }
 }
 
-$exe = Join-Path $publishDir 'Omni.Windows.App.exe'
+$exe = Join-Path $publishDir 'Omni.exe'
 if (-not (Test-Path $exe)) { throw "Published exe not found: $exe" }
 
 New-Item -ItemType Directory -Force $dist | Out-Null

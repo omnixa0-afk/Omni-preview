@@ -22,7 +22,8 @@ internal sealed record NativeWebRtcMediaProbeResult(
     IReadOnlyList<NativeVideoDevice> VideoDevices,
     IReadOnlyList<string> SoftwareCodecs,
     string Diagnostics,
-    IReadOnlyList<string>? HardwareDecodeCodecs = null)
+    IReadOnlyList<string>? HardwareDecodeCodecs = null,
+    IReadOnlyDictionary<string, uint>? HardwareEncoderVendors = null)
 {
     internal string Summary
     {
@@ -331,7 +332,8 @@ internal static class NativeWebRtcMediaProbe
             ReadVideoDevices(root),
             ReadStringArray(root, "software_codecs"),
             diagnostics,
-            ReadStringArray(root, "hardware_decode_codecs"));
+            ReadStringArray(root, "hardware_decode_codecs"),
+            ReadHardwareEncoderVendors(root));
     }
 
     private static TDelegate LoadExport<TDelegate>(nint libraryHandle, string exportName)
@@ -444,6 +446,26 @@ internal static class NativeWebRtcMediaProbe
                string.Equals(fallbackCodec, "none", StringComparison.OrdinalIgnoreCase)
             ? []
             : [fallbackCodec];
+    }
+
+    // Codec -> PCI vendor of the hardware encoder that passed that codec's test (h264/h265/av1).
+    // Absent from an older native build: an explicitly chosen card is then trusted with H.264 only.
+    private static IReadOnlyDictionary<string, uint> ReadHardwareEncoderVendors(JsonElement root)
+    {
+        Dictionary<string, uint> vendors = new(StringComparer.OrdinalIgnoreCase);
+        if (root.TryGetProperty("hardware_encoder_vendors", out JsonElement element) &&
+            element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (JsonProperty property in element.EnumerateObject())
+            {
+                if (property.Value.ValueKind == JsonValueKind.Number && property.Value.TryGetUInt32(out uint vendor))
+                {
+                    vendors[property.Name] = vendor;
+                }
+            }
+        }
+
+        return vendors;
     }
 
     private static IReadOnlyList<NativeVideoDevice> ReadVideoDevices(JsonElement root)

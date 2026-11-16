@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::mpsc::{self};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::thread::JoinHandle;
 /// Стоимость канала для пользователя — платформенный факт, который подаёт оболочка (WinRT на
@@ -58,49 +58,154 @@ pub enum ReceivedTransportEvent {
     SessionActivated(ReceivedChatContext),
     SessionClosed(ReceivedChatContext),
     WireEnvelope(WireEnvelopeV1, ReceivedChatContext),
+    /// A wire-envelope from a durable (store-and-forward) frame: the handler's result goes to the
+    /// `DurableWireDone` once the app has handled it — the mesh marks the frame handled only then.
+    DurableWireEnvelope(WireEnvelopeV1, ReceivedChatContext, DurableWireDone),
     AttachmentTransferFrame(AttachmentTransferFrameV2, ReceivedChatContext),
     AttachmentTransferStream(AttachmentTransferStream, ReceivedChatContext),
     RealtimeMediaDatagram(Vec<u8>, ReceivedChatContext),
 }
+
+/// Told the result of handling a durable wire-envelope. Never called when the event is dropped
+/// unhandled (the dispatcher shut down): the frame then stays unhandled, as it should.
+pub type DurableWireDone = Box<dyn FnOnce(&OmniResult<()>) + Send>;
 
 type ReceiveCallback = Arc<dyn Fn(ReceivedTransportEvent) + Send + Sync + 'static>;
 
 /// Delivers inbound events to the app callback on one thread, in order. Shutting it down closes
 /// the channel FIRST and then joins: the forwarder that owns the sending half lives inside the
 /// `TransportManager` itself, so joining with the channel still open would wait forever.
+///
+/// The queue is bounded: an event handed in while it is full waits for room. It had no bound, and a
+/// peer sending faster than the app handles grew it for as long as it kept sending (blind audit
+/// 2026-11-11, pass 13). The wait is not for ever — the one handing in may hold what the callback
+/// needs, and the callback itself hands events in: past [`RECEIVE_QUEUE_WAIT`] (and from the
+/// dispatcher's own thread, at once) the event is queued over the bound — up to
+/// [`RECEIVE_QUEUE_CEILING`], which nothing passes but the two events that carry a session's state:
+/// past the wait every sender added one more for as long as the app was behind (pass 14). What is
+/// dropped there is what the network may lose anyway: a durable frame stays unhandled and is
+/// offered again, a plain one and a stream are asked again by their senders. Media does not wait
+/// at all: late media is worth nothing, and it is dropped as soon as the queue is full.
 struct ReceiveDispatcher {
-    event_tx: Mutex<Option<mpsc::Sender<ReceivedTransportEvent>>>,
+    queue: Mutex<ReceiveQueue>,
+    changed: Condvar,
     join_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct ReceiveQueue {
+    events: VecDeque<ReceivedTransportEvent>,
+    closed: bool,
+}
+
+/// How many inbound events wait for the app's callback.
+const RECEIVE_QUEUE_MAX: usize = 4096;
+/// What the queue never passes ([`ReceiveDispatcher`]).
+const RECEIVE_QUEUE_CEILING: usize = 2 * RECEIVE_QUEUE_MAX;
+/// What the states of sessions with none waiting may add over [`RECEIVE_QUEUE_CEILING`].
+const RECEIVE_QUEUE_STATE_CEILING: usize = RECEIVE_QUEUE_CEILING + RECEIVE_QUEUE_MAX;
+/// How long an event waits for room in a full queue before it is queued anyway.
+const RECEIVE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The session (peer, dialog) whose state `event` carries; `None` for any other event.
+fn session_of_state(event: &ReceivedTransportEvent) -> Option<(&str, &str)> {
+    match event {
+        ReceivedTransportEvent::SessionActivated(context) | ReceivedTransportEvent::SessionClosed(context) => {
+            Some((context.peer_id.as_str(), context.dialog_key.as_str()))
+        }
+        _ => None,
+    }
 }
 
 impl ReceiveDispatcher {
     fn spawn(callback: ReceiveCallback) -> (ReceiveCallback, Arc<Self>) {
-        let (event_tx, event_rx) = mpsc::channel::<ReceivedTransportEvent>();
+        let dispatch = Arc::new(Self {
+            queue: Mutex::new(ReceiveQueue { events: VecDeque::new(), closed: false }),
+            changed: Condvar::new(),
+            join_handle: Mutex::new(None),
+        });
+        let worker = Arc::clone(&dispatch);
         let join_handle = thread::spawn(move || {
-            while let Ok(event) = event_rx.recv() {
+            while let Some(event) = worker.next() {
                 callback(event);
             }
         });
-        let dispatch = Arc::new(Self {
-            event_tx: Mutex::new(Some(event_tx)),
-            join_handle: Mutex::new(Some(join_handle)),
-        });
+        let dispatcher_thread = join_handle.thread().id();
+        *lock_mutex_recover(&dispatch.join_handle, "receive dispatcher join handle") = Some(join_handle);
         let forwarder: ReceiveCallback = {
             let dispatch = Arc::clone(&dispatch);
-            Arc::new(move |event| {
-                if let Some(event_tx) =
-                    lock_mutex_recover(&dispatch.event_tx, "receive dispatcher sender").as_ref()
-                {
-                    let _ = event_tx.send(event);
-                }
-            })
+            Arc::new(move |event| dispatch.push(event, thread::current().id() != dispatcher_thread))
         };
 
         (forwarder, dispatch)
     }
 
+    /// Queue `event`; `may_wait` — for room, when the queue is full.
+    fn push(&self, event: ReceivedTransportEvent, may_wait: bool) {
+        let mut queue = lock_mutex_recover(&self.queue, "receive dispatcher queue");
+        let media = matches!(event, ReceivedTransportEvent::RealtimeMediaDatagram(..));
+        if media && queue.events.len() >= RECEIVE_QUEUE_MAX {
+            return;
+        }
+        if may_wait {
+            let deadline = std::time::Instant::now() + RECEIVE_QUEUE_WAIT;
+            while !queue.closed && queue.events.len() >= RECEIVE_QUEUE_MAX {
+                let Some(left) = deadline.checked_duration_since(std::time::Instant::now()).filter(|left| !left.is_zero()) else {
+                    break;
+                };
+                queue = match self.changed.wait_timeout(queue, left) {
+                    Ok((queue, _)) => queue,
+                    Err(poisoned) => poisoned.into_inner().0,
+                };
+            }
+        }
+        let state = session_of_state(&event).map(|(peer, dialog)| (peer.to_string(), dialog.to_string()));
+        // Past the ceiling a session's state replaces the one of that session already waiting: the
+        // app needs where a session ended up, and every flap of a link added one more for as long
+        // as the app was behind (blind audit 2026-11-12, pass 15). So the state events over the
+        // ceiling are at most one per session.
+        // States of ever new sessions passed the ceiling one by one (pass 16); making room by the
+        // oldest event that is no state took another session's durable frame or stream (pass 17).
+        // So a state has headroom of its own over the ceiling, and past that a new one is dropped.
+        if let Some((peer, dialog)) = &state {
+            if queue.events.len() >= RECEIVE_QUEUE_CEILING {
+                if let Some(at) = queue.events.iter().position(|queued| session_of_state(queued) == Some((peer, dialog))) {
+                    queue.events.remove(at);
+                } else if queue.events.len() >= RECEIVE_QUEUE_STATE_CEILING {
+                    return;
+                }
+            }
+        }
+        if !queue.closed && (state.is_some() || queue.events.len() < RECEIVE_QUEUE_CEILING) {
+            queue.events.push_back(event);
+            self.changed.notify_all();
+        }
+    }
+
+    /// The next event for the callback; `None` once the dispatcher is shut down.
+    fn next(&self) -> Option<ReceivedTransportEvent> {
+        let mut queue = lock_mutex_recover(&self.queue, "receive dispatcher queue");
+        loop {
+            // What was queued before the shutdown is still delivered.
+            if let Some(event) = queue.events.pop_front() {
+                self.changed.notify_all();
+                return Some(event);
+            }
+            if queue.closed {
+                return None;
+            }
+            queue = match self.changed.wait(queue) {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
     fn shutdown(&self) {
-        lock_mutex_recover(&self.event_tx, "receive dispatcher sender").take();
+        {
+            let mut queue = lock_mutex_recover(&self.queue, "receive dispatcher queue");
+            queue.closed = true;
+            self.changed.notify_all();
+        }
         if let Some(join_handle) =
             lock_mutex_recover(&self.join_handle, "receive dispatcher join handle").take()
         {
@@ -450,6 +555,17 @@ impl TransportManager {
         receive_context: ReceivedChatContext,
     ) {
         (self.on_receive)(ReceivedTransportEvent::WireEnvelope(envelope, receive_context));
+    }
+
+    /// [`Self::inject_inbound_wire_envelope`] for a durable frame: `done` gets the handler's result
+    /// after the app has handled it on the dispatcher thread (this call only queues it).
+    pub fn inject_inbound_durable_wire_envelope(
+        &self,
+        envelope: WireEnvelopeV1,
+        receive_context: ReceivedChatContext,
+        done: DurableWireDone,
+    ) {
+        (self.on_receive)(ReceivedTransportEvent::DurableWireEnvelope(envelope, receive_context, done));
     }
 
     /// Build a receive-context for an inbound frame on an established dialog when

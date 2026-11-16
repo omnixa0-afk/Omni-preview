@@ -535,7 +535,9 @@ internal sealed class PublishPlanEditor : UserControl
     private static Style Caption() => (Style)Application.Current.Resources["SettingCaptionTextStyle"];
 
     // The indexer, as SettingRow does: it also looks into the theme dictionaries (TryGetValue does not).
-    private static Brush Brush(string key) => (Brush)Application.Current.Resources[key];
+    // The window's theme, not the application's: picked «Светлая» over a dark Windows, a plain
+    // Application.Resources lookup gave the dark brushes.
+    private static Brush Brush(string key) => Presentation.MainWindowPresentation.ResolveThemeBrush(key, Transparent());
 
     private static Brush Transparent() => new SolidColorBrush(Microsoft.UI.Colors.Transparent);
 }

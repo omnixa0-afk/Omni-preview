@@ -12,6 +12,8 @@ include!("exports_impl_mesh.rs");
 
 include!("exports_impl_groups.rs");
 
+include!("exports_impl_workspace.rs");
+
 include!("exports_impl_screen_control.rs");
 
 include!("exports_impl_discoverability.rs");

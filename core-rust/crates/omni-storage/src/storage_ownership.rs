@@ -5,6 +5,9 @@ pub enum StorageOwnershipCategory {
     DeviceScoped,
     GlobalInstallScoped,
     DiagnosticsCacheOnly,
+    /// Rows of a message, keyed by its id (no profile column): a trigger takes them with the message,
+    /// the rest goes with the last profile.
+    MessageScoped,
 }
 
 // Single canonical ownership map for storage migration and future delete routing.
@@ -61,6 +64,229 @@ pub const STORAGE_OWNERSHIP_MAP: &[StorageOwnershipEntry] = &[
         ProfileOwned,
         "groups on MLS: profile-scoped projection / queues (the MLS state itself is wiped separately)"
     ),
+    ownership_entry!(
+        "group_message_arrivals",
+        ProfileOwned,
+        "groups on MLS: the order group lines came in here (an agent's read place)"
+    ),
+    ownership_entry!(
+        "group_signed_lines",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "group_member_profiles",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "group_branches",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "group_pending_welcomes",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "group_readd_requests",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "recovered_groups",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "history_imports",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "chat_history_checks",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "own_passport",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "passport_holders",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "held_passports",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "peer_courier_sets",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "allowed_pair_couriers",
+        ProfileOwned,
+        "profile-scoped (a profile_id column): goes with its profile"
+    ),
+    ownership_entry!(
+        "dialog_read_marks",
+        ProfileOwned,
+        "how far each chat of the profile is read"
+    ),
+    ownership_entry!(
+        "message_replies",
+        ProfileOwned,
+        "what a message answers: goes with its message (trigger)"
+    ),
+    ownership_entry!(
+        "message_mentions",
+        ProfileOwned,
+        "who a message names: goes with its message (trigger)"
+    ),
+    ownership_entry!(
+        "message_pins",
+        ProfileOwned,
+        "pins: go with their message (trigger)"
+    ),
+    ownership_entry!(
+        "message_reactions",
+        ProfileOwned,
+        "reactions: go with their message (trigger)"
+    ),
+    ownership_entry!(
+        "message_deletions",
+        ProfileOwned,
+        "tombstones of the profile's deleted lines"
+    ),
+    ownership_entry!(
+        "message_delete_requests",
+        ProfileOwned,
+        "deletions asked for the profile's lines not here yet"
+    ),
+    ownership_entry!(
+        "message_actions_mark",
+        MessageScoped,
+        "when a message action last changed: goes with the last profile"
+    ),
+    ownership_entry!(
+        "account_working_keys",
+        AccountDeviceScoped,
+        "newest working key seen per account"
+    ),
+    ownership_entry!(
+        "account_key_moves",
+        AccountDeviceScoped,
+        "working key moves per account"
+    ),
+    ownership_entry!(
+        "pending_key_move_devices",
+        AccountDeviceScoped,
+        "devices a key move still waits for"
+    ),
+    ownership_entry!(
+        "pending_key_move_seeds",
+        AccountDeviceScoped,
+        "a key move held until the password is at hand"
+    ),
+    ownership_entry!(
+        "pending_working_keys",
+        AccountDeviceScoped,
+        "a working key held until the password is at hand"
+    ),
+    ownership_entry!(
+        "device_revocations",
+        AccountDeviceScoped,
+        "revoked devices of accounts, as received"
+    ),
+    ownership_entry!(
+        "contact_block_periods",
+        ProfileOwned,
+        "when a contact was blocked, and until when"
+    ),
+    ownership_entry!(
+        "group_invitee_welcomes",
+        ProfileOwned,
+        "the Welcome made for an invitee, until it is heard in the group"
+    ),
+    ownership_entry!(
+        "inbound_bootstrap_marks",
+        ProfileOwned,
+        "which remote devices bootstrapped a session to this profile"
+    ),
+    ownership_entry!(
+        "durable_frames",
+        DeviceScoped,
+        "durable mesh feed frames of this node"
+    ),
+    ownership_entry!(
+        "durable_feed_seq",
+        DeviceScoped,
+        "durable mesh feed counters of this node"
+    ),
+    ownership_entry!(
+        "mesh_dialog_route",
+        DeviceScoped,
+        "mesh node -> dialog of this node"
+    ),
+    ownership_entry!(
+        "mesh_peer_book",
+        DeviceScoped,
+        "mesh peers this node met"
+    ),
+    ownership_entry!(
+        "mesh_bootstrap_invites",
+        DeviceScoped,
+        "mesh invites this node imported"
+    ),
+    ownership_entry!(
+        "mls_storage_key",
+        DeviceScoped,
+        "the MLS storage key from when there was one per database: the first profile to ask takes it"
+    ),
+    ownership_entry!(
+        "mls_storage_keys",
+        ProfileOwned,
+        "the key the profile's MLS state is sealed with (its rows go by it: retain_mls_rows)"
+    ),
+    ownership_entry!(
+        "network_nodes",
+        GlobalInstallScoped,
+        "relays the user added: the install keeps them"
+    ),
+    ownership_entry!(
+        "rendezvous_providers",
+        GlobalInstallScoped,
+        "couriers the user chose: the install keeps them"
+    ),
+    ownership_entry!(
+        "workspace_repos",
+        ProfileOwned,
+        "workspaces: the group's repositories here (published bare repo, bound working repo)"
+    ),
+    ownership_entry!(
+        "workspace_member_refs",
+        ProfileOwned,
+        "workspaces: the branches each member announced"
+    ),
+    ownership_entry!(
+        "workspace_main_rules",
+        ProfileOwned,
+        "workspaces: each code project's rule for its shared main"
+    ),
+    ownership_entry!(
+        "workspace_approvals",
+        ProfileOwned,
+        "workspaces: commits members approved for the shared main"
+    ),
+    ownership_entry!("workspace_repo_files", ProfileOwned, "file workspace repository modes"),
+    ownership_entry!("workspace_file_events", ProfileOwned, "authenticated file workspace roles, policy and reviews"),
+    ownership_entry!("workspace_file_local", ProfileOwned, "local folders and explicit download intent"),
     ownership_entry!(
         "group_feed_outbox",
         ProfileOwned,
@@ -240,6 +466,10 @@ pub const STORAGE_OWNERSHIP_MAP: &[StorageOwnershipEntry] = &[
 
 const PROFILE_OWNED_TABLES: &[&str] = &[
     "profile_registry",
+    "message_replies",
+    "message_mentions",
+    "message_pins",
+    "message_reactions",
     "message_device_receipts",
     "contact_sync_records",
     "contact_sync_device_marks",
@@ -254,6 +484,9 @@ const PROFILE_OWNED_TABLES: &[&str] = &[
     "contact_presence",
     "sessions",
     "replay_windows",
+    "inbound_bootstrap_marks",
+    "group_invitee_welcomes",
+    "contact_block_periods",
     "outbound_queue",
     "inbound_dedup",
     "delivery_receipts",
@@ -264,9 +497,34 @@ const PROFILE_OWNED_TABLES: &[&str] = &[
     "group_members",
     "group_invites",
     "group_pending_inbound",
+    "mls_storage_keys",
     "group_outbox",
     "group_own_changes",
     "group_message_meta",
+    "group_message_arrivals",
+    "group_signed_lines",
+    "group_member_profiles",
+    "group_branches",
+    "group_pending_welcomes",
+    "group_readd_requests",
+    "recovered_groups",
+    "history_imports",
+    "chat_history_checks",
+    "own_passport",
+    "passport_holders",
+    "held_passports",
+    "peer_courier_sets",
+    "allowed_pair_couriers",
+    "dialog_read_marks",
+    "message_deletions",
+    "message_delete_requests",
+    "workspace_repos",
+    "workspace_member_refs",
+    "workspace_main_rules",
+    "workspace_approvals",
+    "workspace_repo_files",
+    "workspace_file_events",
+    "workspace_file_local",
     "group_feed_outbox",
     "group_sent_invites",
     "contact_remote_access",
@@ -286,7 +544,7 @@ const DEVICE_SCOPED_TABLES: &[&str] = &[
     "one_time_prekeys",
 ];
 
-const GLOBAL_INSTALL_SCOPED_TABLES: &[&str] = &["app_meta"];
+const GLOBAL_INSTALL_SCOPED_TABLES: &[&str] = &["app_meta", "network_nodes", "rendezvous_providers"];
 
 const DIAGNOSTICS_CACHE_ONLY_TABLES: &[&str] = &[
     "remote_device_observations",
@@ -295,6 +553,10 @@ const DIAGNOSTICS_CACHE_ONLY_TABLES: &[&str] = &[
 
 pub const PROFILE_DELETE_TABLES: &[&str] = &[
     "local_account",
+    "message_replies",
+    "message_mentions",
+    "message_pins",
+    "message_reactions",
     "message_device_receipts",
     "contact_sync_records",
     "contact_sync_device_marks",
@@ -327,15 +589,44 @@ pub const PROFILE_DELETE_TABLES: &[&str] = &[
     "group_members",
     "group_invites",
     "group_pending_inbound",
+    "mls_storage_keys",
     "group_outbox",
     "group_own_changes",
     "group_message_meta",
+    "group_message_arrivals",
+    "group_signed_lines",
+    "group_member_profiles",
+    "group_branches",
+    "group_pending_welcomes",
+    "group_readd_requests",
+    "recovered_groups",
+    "history_imports",
+    "chat_history_checks",
+    "own_passport",
+    "passport_holders",
+    "held_passports",
+    "peer_courier_sets",
+    "allowed_pair_couriers",
+    "dialog_read_marks",
+    "message_deletions",
+    "message_delete_requests",
+    "workspace_repos",
+    "workspace_member_refs",
+    "workspace_main_rules",
+    "workspace_approvals",
+    "workspace_repo_files",
+    "workspace_file_events",
+    "workspace_file_local",
     "group_feed_outbox",
     "group_sent_invites",
     "contact_remote_access",
 ];
 
 pub const PROFILE_WIPE_TABLE_ORDER: &[&str] = &[
+    "message_replies",
+    "message_mentions",
+    "message_pins",
+    "message_reactions",
     "message_device_receipts",
     "contact_sync_records",
     "contact_sync_device_marks",
@@ -343,9 +634,34 @@ pub const PROFILE_WIPE_TABLE_ORDER: &[&str] = &[
     "group_members",
     "group_invites",
     "group_pending_inbound",
+    "mls_storage_keys",
     "group_outbox",
     "group_own_changes",
     "group_message_meta",
+    "group_message_arrivals",
+    "group_signed_lines",
+    "group_member_profiles",
+    "group_branches",
+    "group_pending_welcomes",
+    "group_readd_requests",
+    "recovered_groups",
+    "history_imports",
+    "chat_history_checks",
+    "own_passport",
+    "passport_holders",
+    "held_passports",
+    "peer_courier_sets",
+    "allowed_pair_couriers",
+    "dialog_read_marks",
+    "message_deletions",
+    "message_delete_requests",
+    "workspace_repos",
+    "workspace_member_refs",
+    "workspace_main_rules",
+    "workspace_approvals",
+    "workspace_repo_files",
+    "workspace_file_events",
+    "workspace_file_local",
     "group_feed_outbox",
     "group_sent_invites",
     "contact_remote_access",
@@ -364,6 +680,9 @@ pub const PROFILE_WIPE_TABLE_ORDER: &[&str] = &[
     "delivery_receipts",
     "sessions",
     "replay_windows",
+    "inbound_bootstrap_marks",
+    "group_invitee_welcomes",
+    "contact_block_periods",
     "one_time_prekeys",
     "signed_prekeys",
     "device_keys",

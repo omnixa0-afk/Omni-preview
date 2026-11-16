@@ -8,10 +8,10 @@ mod tests {
         bootstrap_initiator_session, bootstrap_responder_session, build_prekey_bundle,
         clear_platform_secret_wrap_key_override_for_tests, configure_platform_secret_wrap_key_hex,
         decrypt_at_rest_bytes, decrypt_delivery_receipt, decrypt_text_message,
-        derive_fingerprint_material, encrypt_at_rest_bytes,
-        encrypt_delivery_receipt, encrypt_text_message, establish_session, fingerprint_hex,
+        encrypt_at_rest_bytes,
+        encrypt_delivery_receipt, encrypt_text_message, establish_session,
         generate_local_key_hierarchy, generate_x25519_secret, new_replay_window_state,
-        protect_bytes, safety_number, secret_protection_scheme_for_target,
+        protect_bytes, secret_protection_scheme_for_target,
         session_rendezvous_pair_secret, sign_message,
         unprotect_bytes, verify_prekey_bundle, verify_signature, ProtectedSecret,
         SecretProtectionScheme,
@@ -79,43 +79,6 @@ mod tests {
         let bob_shared = bob_secret.diffie_hellman(&alice_public);
 
         assert_eq!(alice_shared.to_bytes(), bob_shared.to_bytes());
-    }
-
-    #[test]
-    fn fingerprint_and_safety_number_derivation_are_stable() {
-        let local = generate_local_key_hierarchy(
-            &account_id("acct-alice"),
-            &device_id("dev-alice"),
-            100,
-            1,
-        )
-        .unwrap();
-        let remote = generate_local_key_hierarchy(
-            &account_id("acct-bob"),
-            &device_id("dev-bob"),
-            200,
-            1,
-        )
-        .unwrap();
-
-        let material = derive_fingerprint_material(
-            &local.identity_key.account_id,
-            &local.device_key.device_id,
-            local.identity_key.public_key,
-            local.identity_key.signing_public_key,
-            local.device_key.public_key,
-            &remote.identity_key.account_id,
-            &remote.device_key.device_id,
-            remote.identity_key.public_key,
-            remote.identity_key.signing_public_key,
-            remote.device_key.public_key,
-        );
-
-        let fingerprint = fingerprint_hex(&material);
-        let safety_number_value = safety_number(&material);
-
-        assert_eq!(fingerprint.len(), 64);
-        assert!(safety_number_value.contains(' '));
     }
 
     #[test]
@@ -232,6 +195,63 @@ mod tests {
             crate::derive_rendezvous_pair_secret(&nonce).unwrap(),
             "bootstrap and durable derivations are domain-separated"
         );
+    }
+
+    /// The knock key is the same on every derivation from one seed (a restarted device still opens
+    /// knocks sealed to the key its beacon carried), its public half matches, and it is neither the
+    /// seed nor any invite's reply key from that seed.
+    #[test]
+    fn the_knock_key_is_stable_and_apart_from_invite_reply_keys() {
+        let seed = [0x31u8; 32];
+        let (secret, public) = crate::derive_knock_key(&seed).unwrap();
+        assert_eq!(crate::derive_knock_key(&seed).unwrap(), (secret, public));
+        assert_eq!(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).to_bytes(), public);
+        assert_ne!(secret, seed);
+        assert_ne!(crate::derive_knock_key(&[0x32u8; 32]).unwrap().1, public, "another device, another key");
+        assert_ne!(crate::derive_invite_reply_key(&seed, &[0u8; 32]).unwrap().0, secret);
+    }
+
+    /// The claim a request carries for an invite: it checks out for the request it was made for, and
+    /// for nothing else — not another request's keys (a durable holder moving it into its own), not
+    /// another invite, not the bare nonce-derived bootstrap secret, not garbage.
+    #[test]
+    fn an_invite_claim_holds_only_for_its_own_invite_and_request() {
+        let nonce = [0x5au8; 32];
+        let claim = hex::encode(crate::invite_claim(&nonce, "sign-a", "eph-a").unwrap());
+        assert!(crate::invite_claim_matches(&nonce, "sign-a", "eph-a", &claim));
+        assert!(!crate::invite_claim_matches(&nonce, "sign-b", "eph-a", &claim), "another sender");
+        assert!(!crate::invite_claim_matches(&nonce, "sign-a", "eph-b", &claim), "another request of the same sender");
+        assert!(!crate::invite_claim_matches(&[0x5bu8; 32], "sign-a", "eph-a", &claim), "another invite");
+        let secret = hex::encode(crate::derive_rendezvous_bootstrap_secret(&nonce).unwrap());
+        assert!(!crate::invite_claim_matches(&nonce, "sign-a", "eph-a", &secret), "the topic secret is not a claim");
+        assert!(!crate::invite_claim_matches(&nonce, "sign-a", "eph-a", "zz"));
+        assert!(!crate::invite_claim_matches(&nonce, "sign-a", "eph-a", &claim[..62]), "a cut claim");
+        // The key and the field separators make "ab"+"c" and "a"+"bc" different requests.
+        assert_ne!(crate::invite_claim(&nonce, "ab", "c").unwrap(), crate::invite_claim(&nonce, "a", "bc").unwrap());
+    }
+
+    /// A group-call frame is its sender's only: another member, who can derive the sender's media key
+    /// from the call secret, cannot sign under its name; nor does a signed frame pass in another call
+    /// or with a byte changed (security review 2026-11-09, F1).
+    #[test]
+    fn a_group_call_frame_signed_by_another_member_is_not_the_senders() {
+        let secret = crate::generate_group_key();
+        let alice = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let mallory = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let alice_pub = hex::encode(alice.verifying_key().to_bytes());
+        let alice_key = crate::derive_group_call_media_key(&secret, &alice_pub).unwrap();
+        let verifier = crate::GroupCallMediaVerifier::from_public_key(&alice.verifying_key().to_bytes()).unwrap();
+        let sealed = crate::seal_group_call_media(&alice_key, 0x4F4D4E41, 5, b"rtp").unwrap();
+
+        let by_alice = crate::sign_group_call_media(&crate::GroupCallMediaSigner::from_seed(&alice.to_bytes()), "call-1", sealed.clone());
+        assert_eq!(crate::verified_group_call_media(&verifier, "call-1", &by_alice), Some(sealed.as_slice()));
+        // Mallory holds the call secret, so Alice's media key too — but not Alice's signing key.
+        let by_mallory = crate::sign_group_call_media(&crate::GroupCallMediaSigner::from_seed(&mallory.to_bytes()), "call-1", sealed.clone());
+        assert!(crate::verified_group_call_media(&verifier, "call-1", &by_mallory).is_none());
+        assert!(crate::verified_group_call_media(&verifier, "call-2", &by_alice).is_none(), "another call");
+        let mut tampered = by_alice.clone();
+        tampered[3] ^= 1;
+        assert!(crate::verified_group_call_media(&verifier, "call-1", &tampered).is_none());
     }
 
     #[test]
@@ -491,6 +511,38 @@ mod tests {
         assert_eq!(decrypt_text_message(&mut bob, &mut bob_replay, &after).unwrap().body, "after");
     }
 
+    /// Junk on a new chain far past the gap (security review: up to `MAX_NEW_CHAIN_JUMP` HKDF steps
+    /// before the frame's own key could be checked) is refused on its header tag — one DH, one HKDF —
+    /// and leaves the session as it was; a frame without the tag does not jump far at all.
+    #[test]
+    fn a_far_new_chain_frame_is_checked_by_its_header_before_any_chain_steps() {
+        let (mut alice, mut bob, mut alice_replay, mut bob_replay) = established_pair("k");
+        let hello = encrypt_text_message(&mut alice, "msg-1", "hello", 400).unwrap();
+        decrypt_text_message(&mut bob, &mut bob_replay, &hello).unwrap();
+        let reply = encrypt_text_message(&mut bob, "msg-b1", "reply", 401).unwrap();
+        decrypt_text_message(&mut alice, &mut alice_replay, &reply).unwrap();
+        for n in 0..200 {
+            encrypt_text_message(&mut alice, &format!("lost-{n}"), "lost", 402).unwrap();
+        }
+        let through = encrypt_text_message(&mut alice, "msg-through", "through", 403).unwrap();
+        let before = bob.clone();
+
+        let mut forged = through.clone();
+        forged.counter = 16_000;
+        let error = decrypt_text_message(&mut bob, &mut bob_replay, &forged).unwrap_err().to_string();
+        assert!(error.contains("unknown ratchet chain"), "{error}");
+        let mut untagged = through.clone();
+        untagged.header_mac_hex = None;
+        let error = decrypt_text_message(&mut bob, &mut bob_replay, &untagged).unwrap_err().to_string();
+        assert!(error.contains("unknown ratchet chain"), "{error}");
+        let mut wrong_tag = through.clone();
+        wrong_tag.header_mac_hex = Some("00".repeat(32));
+        assert!(decrypt_text_message(&mut bob, &mut bob_replay, &wrong_tag).is_err());
+        assert_eq!(bob, before, "junk moved nothing");
+
+        assert_eq!(decrypt_text_message(&mut bob, &mut bob_replay, &through).unwrap().body, "through");
+    }
+
     /// Remembered keys survive a store and a load: the late frame may come after a restart.
     #[test]
     fn remembered_keys_survive_serialization() {
@@ -519,16 +571,32 @@ mod tests {
         assert_ne!(encrypted.ciphertext_hex, hex::encode(plaintext));
     }
 
+    /// V-16: plain hex only by explicit development opt-in, and never where the platform has a key
+    /// store; otherwise every non-Windows platform wraps with a host-supplied key (fail-closed).
     #[test]
-    fn android_target_never_uses_plaintext_secret_protection_scheme() {
-        assert_eq!(
-            secret_protection_scheme_for_target("android"),
-            SecretProtectionScheme::PlatformWrappedV1
-        );
-        assert_ne!(
-            secret_protection_scheme_for_target("android"),
-            SecretProtectionScheme::PlaintextFallbackV1
-        );
+    fn secrets_are_left_in_the_clear_only_by_explicit_opt_in_off_windows_and_android() {
+        for allowed in [false, true] {
+            assert_eq!(secret_protection_scheme_for_target("windows", allowed), SecretProtectionScheme::DpapiV1);
+            assert_eq!(
+                secret_protection_scheme_for_target("android", allowed),
+                SecretProtectionScheme::PlatformWrappedV1
+            );
+        }
+        for os in ["linux", "macos"] {
+            assert_eq!(secret_protection_scheme_for_target(os, false), SecretProtectionScheme::PlatformWrappedV1);
+            assert_eq!(secret_protection_scheme_for_target(os, true), SecretProtectionScheme::PlaintextFallbackV1);
+        }
+    }
+
+    /// V-16/V-23: where secrets are sealed by the platform, an unprotected one is not taken.
+    #[test]
+    #[cfg(windows)]
+    fn an_unprotected_secret_is_not_accepted_on_windows() {
+        let planted = ProtectedSecret {
+            scheme: SecretProtectionScheme::PlaintextFallbackV1,
+            blob_hex: hex::encode([7_u8; 32]),
+        };
+        assert!(unprotect_bytes(&planted).is_err());
     }
 
     #[test]
@@ -538,7 +606,7 @@ mod tests {
         assert_eq!(protected.scheme, SecretProtectionScheme::DpapiV1);
 
         let unprotected = unprotect_bytes(&protected).unwrap();
-        assert_eq!(unprotected, b"stage9-dpapi-check");
+        assert_eq!(unprotected.as_slice(), b"stage9-dpapi-check");
     }
 
     #[test]
@@ -556,7 +624,7 @@ mod tests {
                 blob_hex: hex::encode(wrapped_bytes),
             };
             let roundtrip = unprotect_bytes(&protected)?;
-            assert_eq!(roundtrip, b"stage9-platform-wrap");
+            assert_eq!(roundtrip.as_slice(), b"stage9-platform-wrap");
             Ok(())
         })();
 
@@ -577,6 +645,32 @@ mod tests {
             a,
             super::derive_group_call_media_key(&secret, "pub-a").expect("derive")
         );
+    }
+
+    #[test]
+    fn direct_call_media_keys_are_per_direction_per_call_and_need_both_shares() {
+        let caller = super::generate_group_key();
+        let callee = super::generate_group_key();
+        let (up, down) = super::derive_direct_call_media_keys(&caller, &callee, "call-1").expect("derive");
+        assert_ne!(up, down, "each direction has its own key");
+        assert_eq!(
+            (up, down),
+            super::derive_direct_call_media_keys(&caller, &callee, "call-1").expect("derive"),
+            "both ends derive the same pair"
+        );
+        let (other_call, _) = super::derive_direct_call_media_keys(&caller, &callee, "call-2").expect("derive");
+        assert_ne!(up, other_call, "another call, other keys");
+        let (other_share, _) =
+            super::derive_direct_call_media_keys(&caller, &super::generate_group_key(), "call-1").expect("derive");
+        assert_ne!(up, other_share, "a relay that knows one share still lacks the key");
+        assert!(super::derive_direct_call_media_keys(&caller[..16], &callee, "call-1").is_err());
+
+        let rtp = vec![0x80u8, 0x60, 9, 9, 9];
+        let sealed = super::seal_group_call_media(&up, 1, 7, &rtp).expect("seal");
+        // A 1:1 call's datagram carries no signature; the budget is the group's, which does.
+        assert_eq!(sealed.len() + super::GROUP_CALL_MEDIA_SIGNATURE_LEN, rtp.len() + super::CALL_MEDIA_SEAL_OVERHEAD_BYTES);
+        assert_eq!(super::open_group_call_media(&up, &sealed).expect("open"), rtp);
+        assert!(super::open_group_call_media(&down, &sealed).is_err(), "the other direction's key fails");
     }
 
     #[test]

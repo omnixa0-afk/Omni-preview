@@ -7,18 +7,15 @@ method: grep+read over the code; grounded in file:line
 
 # Audit: Media Stack Conformance to the "Vendor-Neutral + Cross-Platform + Zero-Copy" Policy
 
-The check: is anything in the messenger tied to a specific
-GPU/vendor, or does anything hinder an efficient Android port. The policy is in the ADR
-`video-render-architecture.md`.
+## Windows implementation verified against preview commit `db06ba3` (2026-11-15)
 
-**Result:** **PASS** on **vendor neutrality** (no ties at all). On
-**cross-platform and zero-copy there are 6 gaps**, almost all of them architectural debt for the
-Android iteration plus the redesign of video reception (V1). Nothing urgent on desktop
-except receive efficiency.
+H.264 and HEVC use Media Foundation hardware codecs. The native module probes encode, RTP and decode on the current device before advertising a codec. A D3D11 renderer is available for the Windows receive path. Device-specific fallback and the cost of a particular frame path still require measurements. See the [native module](../../native/omni-webrtc-media/README.md) and [renderer](../../native/omni-webrtc-media/src/d3d11_video_renderer.h).
 
----
+## Historical findings
 
-## ✅ Conforms (leave as is)
+The observations and V1–V6 estimates below describe the earlier software decode and bitmap-rendering implementation. The six items are the original audit inventory. Use the current implementation above when assessing Windows; Android readiness needs separate build and device validation.
+
+### Evidence at the time of the audit
 
 | # | What | Evidence |
 |---|---|---|
@@ -33,7 +30,7 @@ Conclusion on the worrying question (vendor lock): **clean**. Encode is already 
 
 ---
 
-## ⚠️ Gaps vs the policy
+### Gaps recorded in the original audit
 
 ### V1 — [EFFICIENCY, now + Android] Video receive: 3× CPU + pixels across FFI
 Decode is **software** (libwebrtc `builtin_video_decoder_factory`, I420) →
@@ -78,7 +75,7 @@ notes "bash counterparts are needed").
 
 ---
 
-## Severity / when to fix
+### Original prioritisation
 | Gap | Impact now (desktop) | Impact on Android | When |
 |---|---|---|---|
 | V1 | medium (CPU, soft image) | high (battery) | the HW-decode/GPU-render redesign (soon) |

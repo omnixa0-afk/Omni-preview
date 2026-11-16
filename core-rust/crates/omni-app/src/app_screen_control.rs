@@ -100,6 +100,12 @@ pub(crate) fn local_signing_identity(storage: &Storage) -> OmniResult<([u8; 32],
     Ok((seed, public))
 }
 
+/// Our signing identity (seed, public), if a grant, a send or a published passport already loaded
+/// it — for paths without storage, like the group passport that rides our media.
+pub(crate) fn cached_signing_identity(db_path: &str) -> Option<([u8; 32], [u8; 32])> {
+    identity_cache().lock().ok().and_then(|cache| cache.get(db_path).copied())
+}
+
 /// Our public identity key, if a grant or a send already loaded it. The receive path uses this: it
 /// has no storage, and a sharer always loaded it when granting.
 pub(crate) fn cached_public_identity(db_path: &str) -> Option<[u8; 32]> {
@@ -231,12 +237,17 @@ fn current_peer_identity(storage: &Storage) -> OmniResult<(String, String, [u8; 
 }
 
 /// The peer granted or withdrew control of THEIR screen (inbound `CallScreenControlV1`).
-pub(crate) fn handle_incoming_call_screen_control(storage: &Storage, control: &CallScreenControlV1) -> OmniResult<()> {
+pub(crate) fn handle_incoming_call_screen_control(
+    storage: &Storage,
+    control: &CallScreenControlV1,
+    from: &omni_crypto::SessionAddress,
+) -> OmniResult<()> {
     let db_path = storage.db_path().to_string_lossy().to_string();
     let Ok((call_id, dialog_key, peer_pub)) = current_peer_identity(storage) else {
         return Ok(()); // no live call: nothing to control
     };
-    if call_id != control.call_id {
+    // Only the call's peer grants or withdraws control on it, not any contact naming its id.
+    if call_id != control.call_id || !crate::current_call_event_is_from_its_peer(&db_path, &call_id, from) {
         return Ok(());
     }
     // Warm the identity cache now: sending must not touch storage.
@@ -434,7 +445,10 @@ impl OmniApp {
         let (Some(node), Some(mesh)) = (self.mesh_node_for_dialog(dialog_key)?, self.mesh_runtime()) else {
             return Err(OmniError::Transport(format!("no mesh link for screen control in '{dialog_key}'")));
         };
-        mesh.send_media(node, &wire)
+        // Sealed like the call's media: the signature proves who sent the input, the seal keeps the
+        // keystrokes from anyone on the path.
+        let sealed = crate::seal_direct_call_datagram(&db_path, dialog_key, &wire)?;
+        mesh.send_media(node, &sealed)
             .map_err(|error| OmniError::Transport(format!("screen control send failed: {error}")))
     }
 }
@@ -504,6 +518,7 @@ mod tests {
                 remote_device_id: crate::DeviceId("dev-peer".into()),
                 invite_expires_at_unix_ms: now,
                 invited_devices: Vec::new(),
+                media: Default::default(),
             }),
         )
         .unwrap();

@@ -128,7 +128,6 @@ public sealed class ShellStatePresenterTests
             IsUpdatingPublicProfile: false,
             HasQuickAddContactPetname: false,
             HasRemotePrekeyBundle: false,
-            HasAddContactIdentifier: false,
             HasAddContactPetname: false,
             HasAddContactPayload: false,
             IsOnboarding: false,

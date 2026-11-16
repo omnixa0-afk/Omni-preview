@@ -17,6 +17,11 @@ In the app the mark appears in the window title bar and on the taskbar button
 exe icon alone does not reach the window). The sidebar has no mark: it holds navigation only, and a
 ring with gaps at 24 px read as a loading indicator.
 
+The cached small and large native icons are reapplied after window activation as well as during
+construction (2026-10-31); their handles are released when the window closes. `ui.icon` on a dev
+stand checks the actual `WM_GETICON` values against them. A live stand uses the standalone publish,
+not a copied Debug output folder.
+
 `Assets/Square44x44Logo.targetsize-24_altform-unplated.png` is also the tray icon
 (`Core/TrayIcon.cs`): a flat, colored, small version that reads on both dark and light taskbars.
 The other PNGs (`Square150…`, `Wide310…`, `SplashScreen…`, `StoreLogo`, and the white `LockScreenLogo`)

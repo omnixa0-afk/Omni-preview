@@ -17,16 +17,19 @@
 //!
 //! See docs/decisions/daemon-ipc-phase2.md + docs/decisions/embedded-daemon-in-shell.md.
 
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::sync::mpsc::{RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use omni_app::{CoreEvent, DiscoverabilityMode, OmniApp};
 use omni_identity::{AccountId, ContactRelationshipState};
 
 pub mod frame;
+pub mod secure_channel;
 #[cfg(windows)]
 pub mod pipe;
 
@@ -77,7 +80,100 @@ pub fn is_pipe_endpoint(endpoint: &str) -> bool {
 /// The pump drains the core hook once and broadcasts each `CoreEvent` to every subscriber;
 /// each subscriber formats for its OWN protocol (line watch → `EVENT ...` text, framed watch
 /// → a JSON event frame). Any number of clients can watch at once (no destructive contention).
-pub type Subscribers = Arc<Mutex<Vec<Sender<CoreEvent>>>>;
+pub type Subscribers = Arc<Mutex<Vec<SyncSender<CoreEvent>>>>;
+
+/// How many events wait for one watcher at most. A watcher that falls this far behind is let go —
+/// its stream ends (the line protocol says `EVENT lagged` first) and the client catches up by
+/// listing: a client that stopped reading never grows the daemon's memory, and never holds the
+/// pump for the other watchers (F08, audit 2026-11-09).
+pub const EVENTS_QUEUED_PER_WATCHER: usize = 1024;
+
+/// The longest command line the line protocol gathers (F08, audit 2026-11-09): a line with no end
+/// is not read into memory without a bound. The framed protocol has its own cap per frame.
+pub const MAX_LINE_BYTES: u64 = 1 << 20;
+
+/// Clients served at once at most, and of them still proving the token (F07, audit 2026-11-09): a
+/// client that connects and says nothing holds its thread only until the handshake deadline, and no
+/// number of them takes the daemon's threads. Over the cap a connection is closed at once.
+pub const MAX_CONNECTIONS: usize = 64;
+pub const MAX_HANDSHAKES: usize = 8;
+/// How long a TCP client has to prove the token — all its reads together, so a byte at a time does
+/// not hold the handshake open.
+pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// A write a TCP client does not take in this long ends its connection (a watcher that stopped reading).
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The shortest token a daemon reachable from other hosts takes: a person's word is guessed offline
+/// from one recorded handshake; the token a daemon makes itself is 64 hex characters.
+pub const MIN_REMOTE_TOKEN_CHARS: usize = 32;
+
+/// Hand `events` to every watcher; one whose queue is full or whose stream ended is dropped.
+fn broadcast(subscribers: &Subscribers, events: Vec<CoreEvent>) {
+    let mut subs = subscribers.lock().unwrap_or_else(|p| p.into_inner());
+    if subs.is_empty() {
+        return; // live-tail: nobody watching, drop the drained events
+    }
+    for event in events {
+        subs.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        });
+    }
+}
+
+/// A watcher's queue, joined to the fan-out.
+fn subscribe(subscribers: &Subscribers) -> std::sync::mpsc::Receiver<CoreEvent> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<CoreEvent>(EVENTS_QUEUED_PER_WATCHER);
+    subscribers.lock().unwrap_or_else(|p| p.into_inner()).push(tx);
+    rx
+}
+
+/// One of a bounded number of places (connections, handshakes); given back when dropped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(taken: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        if taken.fetch_add(1, Ordering::SeqCst) >= max {
+            taken.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(Arc::clone(taken)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A TCP read half whose first `budget` bytes — the client's half of the handshake — must come by
+/// `deadline`, all reads together: a timeout per read alone lets a client send a byte at a time for
+/// ever (F07, audit 2026-11-09). After them a read waits as long as the client is idle.
+struct HandshakeDeadline {
+    stream: TcpStream,
+    budget: usize,
+    deadline: Instant,
+}
+
+impl Read for HandshakeDeadline {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.budget == 0 {
+            return self.stream.read(buf);
+        }
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        let wanted = buf.len().min(self.budget);
+        let n = self.stream.read(&mut buf[..wanted])?;
+        self.budget -= n;
+        if self.budget == 0 {
+            self.stream.set_read_timeout(None)?;
+        }
+        Ok(n)
+    }
+}
 
 /// Background pump: every ~250 ms it drains the core event hook (under the serializer) and
 /// broadcasts each `CoreEvent` to every live `watch` subscriber. Formatting is deferred to
@@ -92,15 +188,8 @@ pub fn spawn_event_pump<A: AsOmniApp + 'static>(app: Arc<A>, subscribers: Subscr
             app.drain_events()
         })
         .unwrap_or_default();
-        if events.is_empty() {
-            continue;
-        }
-        let mut subs = subscribers.lock().unwrap_or_else(|p| p.into_inner());
-        if subs.is_empty() {
-            continue; // live-tail: nobody watching, drop the drained events
-        }
-        for event in events {
-            subs.retain(|tx| tx.send(event.clone()).is_ok());
+        if !events.is_empty() {
+            broadcast(&subscribers, events);
         }
     });
 }
@@ -161,18 +250,92 @@ pub trait IpcListener {
     /// connection's thread (and the write half is then shared with the event pusher), so
     /// both must be `Send` and `'static`.
     fn accept(&self) -> io::Result<(Box<dyn BufRead + Send>, Box<dyn Write + Send>)>;
+
+    /// The token a client must prove it holds (`secure_channel`: the token itself never goes over
+    /// the wire), or `None` when the transport is access-controlled by the OS (the named pipe's DACL).
+    fn auth_token(&self) -> Option<Arc<str>> {
+        None
+    }
 }
 
-/// TCP-over-localhost transport: dependency-free and cross-platform, but NOT access-
-/// controlled — any local process that can reach 127.0.0.1 may drive the core. The
-/// named-pipe (Windows) transport replaces this for production (OS ACL).
+/// The variable a TCP daemon and its clients share the access token through. Unset on the
+/// daemon side, a fresh random token is made and written to [`TOKEN_FILE`] in the app dir.
+pub const TOKEN_ENV: &str = "OMNI_DAEMON_TOKEN";
+/// The file in the app dir that holds the TCP daemon's token for local clients.
+pub const TOKEN_FILE: &str = "daemon.token";
+
+/// Who may drive a TCP daemon (V-11). TCP has no OS access control: every process that can
+/// reach the port — any local user, and with a non-loopback bind any host on the network —
+/// could otherwise drive the core, read and write files through it, and export its keys. So
+/// every connection proves a token first, and a bind outside loopback needs `allow_remote`.
+pub struct TcpPolicy {
+    token: Arc<str>,
+    allow_remote: bool,
+}
+
+impl TcpPolicy {
+    /// The token from [`TOKEN_ENV`], or `None` when it is not set.
+    pub fn from_env(allow_remote: bool) -> Option<Self> {
+        let token = std::env::var(TOKEN_ENV).ok()?;
+        let token = token.trim();
+        (!token.is_empty()).then(|| Self { token: token.into(), allow_remote })
+    }
+
+    /// The token from [`TOKEN_ENV`], or a fresh random one; either way written to
+    /// `<dir>/daemon.token` (owner-only where the platform has modes), so a client on this host
+    /// can read it — and only one that can read the profile's folder.
+    pub fn for_app_dir(dir: &Path, allow_remote: bool) -> io::Result<Self> {
+        let policy = match Self::from_env(allow_remote) {
+            Some(policy) => policy,
+            None => {
+                let mut bytes = [0u8; 32];
+                rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes);
+                Self { token: hex::encode(bytes).into(), allow_remote }
+            }
+        };
+        write_owner_only(&dir.join(TOKEN_FILE), policy.token.as_bytes())?;
+        Ok(policy)
+    }
+}
+
+fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
+
+/// TCP transport: dependency-free and cross-platform, with no OS access control — so it is
+/// gated by a [`TcpPolicy`] token instead. The named pipe (Windows) is the shell's transport.
 pub struct TcpIpcListener {
     listener: TcpListener,
+    token: Arc<str>,
+    handshake_deadline: Duration,
 }
 
 impl TcpIpcListener {
-    pub fn bind(addr: &str) -> io::Result<Self> {
-        Ok(Self { listener: TcpListener::bind(addr)? })
+    /// Bind `addr`. Refused outside loopback unless the policy allows remote clients (a stand
+    /// driven from another host); the token is required either way.
+    pub fn bind(addr: &str, policy: &TcpPolicy) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        if !policy.allow_remote && !listener.local_addr()?.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{addr} is not a loopback address; a daemon reachable from other hosts needs --allow-remote"),
+            ));
+        }
+        if policy.allow_remote && policy.token.chars().count() < MIN_REMOTE_TOKEN_CHARS {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("a daemon reachable from other hosts needs a token of at least {MIN_REMOTE_TOKEN_CHARS} characters ({TOKEN_ENV}); leave it unset for a random one"),
+            ));
+        }
+        Ok(Self { listener, token: Arc::clone(&policy.token), handshake_deadline: HANDSHAKE_DEADLINE })
     }
 
     pub fn describe(&self) -> String {
@@ -186,10 +349,19 @@ impl TcpIpcListener {
 impl IpcListener for TcpIpcListener {
     fn accept(&self) -> io::Result<(Box<dyn BufRead + Send>, Box<dyn Write + Send>)> {
         let (stream, _addr) = self.listener.accept()?;
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         // Duplicate the socket so one half reads requests while the other writes responses
         // and pushes events (those two share the write half behind a mutex in serve_framed).
-        let read_half = stream.try_clone()?;
+        let read_half = HandshakeDeadline {
+            stream: stream.try_clone()?,
+            budget: secure_channel::CLIENT_HELLO_BYTES,
+            deadline: Instant::now() + self.handshake_deadline,
+        };
         Ok((Box::new(BufReader::new(read_half)), Box::new(stream)))
+    }
+
+    fn auth_token(&self) -> Option<Arc<str>> {
+        Some(Arc::clone(&self.token))
     }
 }
 
@@ -207,15 +379,51 @@ pub fn run_daemon<A, L>(
     A: AsOmniApp + 'static,
     L: IpcListener,
 {
+    let (connections, handshakes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let mut failures: u32 = 0;
     loop {
         let (reader, writer) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(_) => continue, // transient accept error — keep serving
+            Ok(connection) => {
+                failures = 0;
+                connection
+            }
+            Err(_) => {
+                // A transient accept error: keep serving — but not in a hot loop when the error is
+                // not transient (no handles, no memory): 10 ms doubling up to a second.
+                failures = failures.saturating_add(1);
+                std::thread::sleep(Duration::from_millis((10_u64 << failures.min(7)).min(1000)));
+                continue;
+            }
+        };
+        let token = listener.auth_token();
+        // Over a cap the connection is closed at once (its halves dropped).
+        let Some(connection) = Slot::take(&connections, MAX_CONNECTIONS) else { continue };
+        let handshake = match token {
+            Some(_) => match Slot::take(&handshakes, MAX_HANDSHAKES) {
+                Some(slot) => Some(slot),
+                None => continue,
+            },
+            None => None,
         };
         let app = Arc::clone(&app);
         let subscribers = Arc::clone(&subscribers);
         let on_shutdown = Arc::clone(&on_shutdown);
         std::thread::spawn(move || {
+            let _connection = connection;
+            // On the connection's own thread, so a client that never sends a line holds up
+            // only itself, not the accept loop.
+            let (reader, writer) = match token {
+                // TCP: the client proves the token without sending it, and the rest goes sealed.
+                Some(token) => {
+                    let halves = secure_channel::accept(reader, writer, &token);
+                    drop(handshake);
+                    match halves {
+                        Some(halves) => halves,
+                        None => return,
+                    }
+                }
+                None => (reader, writer),
+            };
             if serve(&*app, reader, writer, &subscribers) {
                 on_shutdown();
             }
@@ -223,23 +431,32 @@ pub fn run_daemon<A, L>(
     }
 }
 
-/// Bind `endpoint` (named pipe iff `\\…`, else localhost TCP), spawn the event pump, and run
-/// the accept loop (blocks). Returns `Err` only on a bind failure; otherwise it runs until
-/// `on_shutdown` ends the process (omni-node) or the host process exits (embedded shell).
+/// Bind `endpoint` (named pipe iff `\\…`, else TCP), spawn the event pump, and run the accept
+/// loop (blocks). A TCP endpoint needs `tcp` — who may connect; without it TCP is refused.
+/// Returns `Err` only on a bind failure; otherwise it runs until `on_shutdown` ends the process
+/// (omni-node) or the host process exits (embedded shell).
 pub fn serve_endpoint<A: AsOmniApp + 'static>(
     endpoint: &str,
     app: Arc<A>,
     on_shutdown: Arc<dyn Fn() + Send + Sync>,
+    tcp: Option<TcpPolicy>,
 ) -> io::Result<()> {
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
-    spawn_event_pump(Arc::clone(&app), Arc::clone(&subscribers));
     #[cfg(windows)]
     if is_pipe_endpoint(endpoint) {
         let listener = pipe::PipeListener::bind(endpoint)?;
+        spawn_event_pump(Arc::clone(&app), Arc::clone(&subscribers));
         run_daemon(&listener, app, subscribers, on_shutdown);
         return Ok(());
     }
-    let listener = TcpIpcListener::bind(endpoint)?;
+    let Some(policy) = tcp else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("a TCP daemon endpoint needs a token ({TOKEN_ENV})"),
+        ));
+    };
+    let listener = TcpIpcListener::bind(endpoint, &policy)?;
+    spawn_event_pump(Arc::clone(&app), Arc::clone(&subscribers));
     run_daemon(&listener, app, subscribers, on_shutdown);
     Ok(())
 }
@@ -261,8 +478,13 @@ pub fn serve<S: AppAccess + ?Sized, R: BufRead, W: Write + Send + 'static>(
     let mut raw = String::new();
     loop {
         raw.clear();
-        match reader.read_line(&mut raw) {
+        match (&mut reader).take(MAX_LINE_BYTES + 1).read_line(&mut raw) {
             Ok(0) => break, // EOF
+            Ok(_) if raw.len() as u64 > MAX_LINE_BYTES => {
+                let _ = writeln!(writer, "ERR the command is longer than {MAX_LINE_BYTES} bytes");
+                let _ = writer.flush();
+                break;
+            }
             Ok(_) => {}
             Err(_) => break,
         }
@@ -296,8 +518,7 @@ pub fn serve<S: AppAccess + ?Sized, R: BufRead, W: Write + Send + 'static>(
         // events that arrive after `watch` are delivered (use list/poll for catch-up).
         // The client filters by `<dialog>` itself. See daemon-ipc-phase2.md §Events.
         if cmd == "watch" {
-            let (tx, rx) = std::sync::mpsc::channel::<CoreEvent>();
-            subscribers.lock().unwrap_or_else(|p| p.into_inner()).push(tx);
+            let rx = subscribe(subscribers);
             if writeln!(writer, "OK watching").is_err() {
                 return false;
             }
@@ -316,7 +537,12 @@ pub fn serve<S: AppAccess + ?Sized, R: BufRead, W: Write + Send + 'static>(
                         }
                         let _ = writer.flush();
                     }
-                    Err(RecvTimeoutError::Disconnected) => return false,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // Let go by the pump: the client fell too far behind.
+                        let _ = writeln!(writer, "EVENT lagged");
+                        let _ = writer.flush();
+                        return false;
+                    }
                 }
             }
         }
@@ -376,8 +602,7 @@ fn serve_framed<S: AppAccess + ?Sized, R: BufRead, W: Write + Send + 'static>(
             }
             if !watching {
                 watching = true;
-                let (tx, rx) = std::sync::mpsc::channel::<CoreEvent>();
-                subscribers.lock().unwrap_or_else(|p| p.into_inner()).push(tx);
+                let rx = subscribe(subscribers);
                 let event_writer = Arc::clone(&writer);
                 std::thread::spawn(move || loop {
                     let event_frame = match rx.recv_timeout(Duration::from_millis(5000)) {
@@ -947,9 +1172,45 @@ fn handle(app: &OmniApp, cmd: &str, rest: &str) -> String {
                 Err(error) => format!("ERR {error}"),
             }
         }
-        // `send-file <who> <absolute path>` — headless attachment send, for validating the bulk
-        // transfer lane on a real 2-host stand without the GUI. The path is taken whole (after the
-        // first space) so names with spaces or commas need no quoting.
+        // `block <who>` — block a contact, for checking on a real stand that what goes to them stops
+        // (a call, a file being sent: docs/decisions/serve-right-recheck.md).
+        "block" => {
+            let contacts = match app.list_contacts() {
+                Ok(contacts) => contacts,
+                Err(error) => return format!("ERR {error}"),
+            };
+            let who = rest.trim();
+            let found = contacts.into_iter().find(|c| {
+                !who.is_empty() && (c.petname == who || c.petname.contains(who) || c.remote_account_id.as_ref().is_some_and(|a| a.0.contains(who)))
+            });
+            match found {
+                Some(contact) => match app.block_contact(&contact.contact_id) {
+                    Ok(_) => "OK".to_string(),
+                    Err(error) => format!("ERR {error}"),
+                },
+                None => "ERR contact not found".to_string(),
+            }
+        }
+        // `unblock <who>` — take a blocked contact back (approve it again).
+        "unblock" => {
+            let who = rest.trim();
+            let found = app.list_contacts().ok().and_then(|contacts| {
+                contacts.into_iter().find(|c| {
+                    !who.is_empty() && (c.petname == who || c.petname.contains(who) || c.remote_account_id.as_ref().is_some_and(|a| a.0.contains(who)))
+                })
+            });
+            match found {
+                Some(contact) => match app.approve_contact(&contact.contact_id) {
+                    Ok(_) => "OK".to_string(),
+                    Err(error) => format!("ERR {error}"),
+                },
+                None => "ERR contact not found".to_string(),
+            }
+        }
+        // `send-file <who> <path>` — headless attachment send, for validating the bulk transfer
+        // lane on a real 2-host stand without the GUI. The path is taken whole (after the first
+        // space) so names with spaces or commas need no quoting; it must lie in the files folder
+        // (`FILES_ROOT`, V-11), a relative one is taken from there.
         "send-file" => {
             let mut a = rest.splitn(2, ' ');
             let who = a.next().unwrap_or("");
@@ -957,6 +1218,10 @@ fn handle(app: &OmniApp, cmd: &str, rest: &str) -> String {
             if path.is_empty() {
                 return "ERR usage: send-file <contact> <path>".to_string();
             }
+            let path = match confine_to_files_root(path, true) {
+                Ok(path) => path.to_string_lossy().into_owned(),
+                Err(error) => return format!("ERR {error}"),
+            };
             match find_contact_dialog(app, who) {
                 Ok(Some(dialog)) => match app.send_attachment(
                     &dialog,
@@ -972,7 +1237,8 @@ fn handle(app: &OmniApp, cmd: &str, rest: &str) -> String {
                 Err(error) => format!("ERR {error}"),
             }
         }
-        // `recv-file <message_id> <absolute save path>` — the receiving half of `send-file`.
+        // `recv-file <message_id> <save path>` — the receiving half of `send-file`, into the files
+        // folder as well.
         // A download is an explicit act (the GUI's "save as"), so a headless run has to ask for it
         // too. Path taken whole after the first space, like send-file.
         "recv-file" => {
@@ -982,7 +1248,11 @@ fn handle(app: &OmniApp, cmd: &str, rest: &str) -> String {
             if message_id.is_empty() || path.is_empty() {
                 return "ERR usage: recv-file <message_id> <save path>".to_string();
             }
-            match app.request_attachment_download(message_id, path) {
+            let path = match confine_to_files_root(path, false) {
+                Ok(path) => path.to_string_lossy().into_owned(),
+                Err(error) => return format!("ERR {error}"),
+            };
+            match app.request_attachment_download(message_id, &path) {
                 Ok(record) => format!("OK {}", record.id),
                 Err(error) => format!("ERR {error}"),
             }
@@ -1056,6 +1326,139 @@ fn handle(app: &OmniApp, cmd: &str, rest: &str) -> String {
                 Err(error) => format!("ERR {error}"),
             }
         }
+        // Groups and workspaces, for stands (the shell has its own screens for these).
+        // `group-create <name>` → `OK <group_id>`.
+        "group-create" => match app.create_group(rest.trim()) {
+            Ok(group) => format!("OK {}", group.group_id),
+            Err(error) => format!("ERR {error}"),
+        },
+        // `group-invite <group_id> <contact>` — the contact by petname or account id.
+        "group-invite" => {
+            let (group_id, who) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            match find_contact_dialog(app, who.trim()) {
+                Ok(Some(dialog)) => match app.invite_contacts_to_group(group_id, &[dialog]) {
+                    Ok(()) => "OK invited".to_string(),
+                    Err(error) => format!("ERR {error}"),
+                },
+                Ok(None) => "ERR contact not found".to_string(),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `group-invites` → `OK <group_id>:<status> …` of the invitations we received.
+        "group-invites" => match app.list_group_invites() {
+            Ok(invites) => format!("OK {}", invites.iter().map(|i| format!("{}:{}", i.group_id, i.status)).collect::<Vec<_>>().join(" ")),
+            Err(error) => format!("ERR {error}"),
+        },
+        "group-accept" => match app.accept_group_invite(rest.trim()) {
+            Ok(()) => "OK accepted".to_string(),
+            Err(error) => format!("ERR {error}"),
+        },
+        // `groups` → `OK <group_id>:<status>:<members> …`.
+        "groups" => match app.list_group_summaries() {
+            Ok(groups) => format!(
+                "OK {}",
+                groups.iter().map(|g| format!("{}:{}:{}", g.group_id, g.my_status, g.member_count)).collect::<Vec<_>>().join(" ")
+            ),
+            Err(error) => format!("ERR {error}"),
+        },
+        // `ws-add-repo <group_id> <repo> [<working repo path>]` → `OK <published path>`; the working
+        // repository gets the remote `omni`.
+        "ws-add-repo" => {
+            let mut a = rest.trim().splitn(3, ' ');
+            let (group_id, repo) = (a.next().unwrap_or(""), a.next().unwrap_or(""));
+            let work = a.next().map(str::trim).filter(|w| !w.is_empty());
+            match app.workspace_add_repo(group_id, repo, work) {
+                Ok(record) => format!("OK {}", record.published_path),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `ws-publish <group_id> <repo>` — announce our branches now.
+        "ws-publish" => {
+            let (group_id, repo) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            match app.workspace_publish(group_id, repo.trim()) {
+                Ok(()) => "OK published".to_string(),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `ws-branches <group_id> <repo>` → `OK <account>:<branch>:<oid>:<here|wanted> …`.
+        "ws-branches" => {
+            let (group_id, repo) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            match app.workspace_member_branches(group_id, repo.trim()) {
+                Ok(refs) => format!(
+                    "OK {}",
+                    refs.iter()
+                        .map(|r| format!("{}:{}:{}:{}", r.account_id, r.ref_name, r.oid, if r.fetched { "here" } else { "wanted" }))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `ws-main <gid> <repo>` → `OK <commit|-> any|approval waiting=acct:oid,... forks=acct:oid,...`
+        "ws-main" => {
+            let (group_id, repo) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            let pairs = |list: &[(String, String)]| list.iter().map(|(a, o)| format!("{a}:{o}")).collect::<Vec<_>>().join(",");
+            match app.workspace_main(group_id, repo.trim()) {
+                Ok(main) => format!(
+                    "OK {} {} waiting={} forks={}",
+                    main.oid.as_deref().unwrap_or("-"),
+                    if main.needs_approval { "approval" } else { "any" },
+                    pairs(&main.waiting),
+                    pairs(&main.forks)
+                ),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `ws-rule <gid> <repo> any|approval`
+        "ws-rule" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let needs_approval = match parts[..] {
+                [_, _, "any"] => false,
+                [_, _, "approval"] => true,
+                _ => return "ERR usage: ws-rule <gid> <repo> any|approval".to_string(),
+            };
+            match app.workspace_set_main_rule(parts[0], parts[1], needs_approval) {
+                Ok(()) => "OK".to_string(),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `ws-approve <gid> <repo> <commit>`
+        "ws-approve" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let [group_id, repo, oid] = parts[..] else { return "ERR usage: ws-approve <gid> <repo> <commit>".to_string() };
+            match app.workspace_approve(group_id, repo, oid) {
+                Ok(()) => "OK".to_string(),
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `create-profile-with-phrase <name> <device>` — `create-profile` that answers with the recovery
+        // phrase, for a stand that restores the profile from a backup (`backup-export`, then
+        // `omni-node --restore-backup`). A test profile's phrase; the daemon is a dev tool.
+        "create-profile-with-phrase" => {
+            let mut a = rest.splitn(2, ' ');
+            let name = a.next().filter(|s| !s.is_empty()).unwrap_or("Node");
+            let device = a.next().filter(|s| !s.is_empty()).unwrap_or("Device");
+            match app.create_account(name, device) {
+                Ok(account) => {
+                    if let Some(profile) = account.local_profile_summary.as_ref() {
+                        if let Err(error) = app.select_active_profile(&profile.profile_id) {
+                            return format!("ERR select profile: {error}");
+                        }
+                    }
+                    match account.recovery_phrase_v2.as_ref() {
+                        Some(phrase) => format!("OK {}", phrase.mnemonic),
+                        None => "ERR the account came without a phrase".to_string(),
+                    }
+                }
+                Err(error) => format!("ERR {error}"),
+            }
+        }
+        // `backup-export <path>` — save a backup of this node's database (the plain bundle), as the
+        // shell's "save a backup" does. `<path>` must not exist yet.
+        "backup-export" => match app.export_current_database_backup_bundle(Path::new(rest.trim())) {
+            Ok(()) => "OK".to_string(),
+            Err(error) => format!("ERR {error}"),
+        },
         "quit" => "OK bye".to_string(),
         other => format!("ERR unknown command '{other}'"),
     }
@@ -1063,6 +1466,49 @@ fn handle(app: &OmniApp, cmd: &str, rest: &str) -> String {
 
 /// Resolve a contact's primary dialog_key by a substring of its petname or
 /// remote account-id (the driver passes the stable account-id).
+/// The folder `send-file` and `recv-file` may read from and write to (V-11): whoever holds the token
+/// acts as the user anyway, but not on every file of the user. Set once by the process that hosts
+/// the daemon (omni-node: `--files-dir`, default `<app-dir>/files`); unset — both commands refuse.
+static FILES_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Allow the file commands inside `dir` (created if missing). The first call wins.
+pub fn set_files_root(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let _ = FILES_ROOT.set(dir.canonicalize()?);
+    Ok(())
+}
+
+/// `path` checked to lie inside the files folder; a relative one is taken from it. `existing` — a
+/// file to read, it must be there; otherwise a file to write, whose folder must be. Returns the
+/// path to hand on (not the canonical one, which on Windows starts with `\\?\`).
+fn confine_to_files_root(path: &str, existing: bool) -> Result<PathBuf, String> {
+    let root = FILES_ROOT
+        .get()
+        .ok_or_else(|| "file commands are off: the daemon was started without a files folder".to_string())?;
+    confine_within(root, path, existing)
+}
+
+/// [`confine_to_files_root`] against a given canonical `root`.
+fn confine_within(root: &Path, path: &str, existing: bool) -> Result<PathBuf, String> {
+    let given = Path::new(path);
+    let joined = if given.is_absolute() { given.to_path_buf() } else { root.join(given) };
+    let resolved = if existing || joined.exists() {
+        // An existing target is resolved whole, links included.
+        joined.canonicalize().map_err(|error| format!("{path}: {error}"))?
+    } else {
+        let name = joined.file_name().ok_or_else(|| format!("{path}: no file name"))?;
+        let parent = joined.parent().ok_or_else(|| format!("{path}: no folder"))?;
+        parent.canonicalize().map_err(|error| format!("{path}: {error}"))?.join(name)
+    };
+    if !resolved.starts_with(root) {
+        return Err(format!("{path} is outside the files folder {}", root.display()));
+    }
+    if resolved.is_dir() {
+        return Err(format!("{path} is a folder, not a file"));
+    }
+    Ok(joined)
+}
+
 fn find_contact_dialog(app: &OmniApp, who: &str) -> Result<Option<String>, String> {
     let contacts = app.list_contacts().map_err(|e| e.to_string())?;
     for c in contacts {
@@ -1072,4 +1518,199 @@ fn find_contact_dialog(app: &OmniApp, who: &str) -> Result<Option<String>, Strin
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V-11: the file commands stay inside the files folder — absolute or relative, by `..` or not.
+    #[test]
+    fn file_command_paths_stay_inside_the_files_folder() {
+        let base = std::env::temp_dir().join(format!("omni-daemon-files-{}", std::process::id()));
+        let root = base.join("files");
+        std::fs::create_dir_all(root.join("in")).unwrap();
+        std::fs::write(root.join("in").join("a.bin"), b"a").unwrap();
+        std::fs::write(base.join("outside.bin"), b"o").unwrap();
+        let root = root.canonicalize().unwrap();
+
+        assert!(confine_within(&root, "in/a.bin", true).is_ok(), "relative, inside");
+        let absolute = root.join("in").join("a.bin");
+        assert!(confine_within(&root, absolute.to_str().unwrap(), true).is_ok(), "absolute, inside");
+        assert!(confine_within(&root, "../outside.bin", true).is_err(), "out by ..");
+        let outside = base.join("outside.bin");
+        assert!(confine_within(&root, outside.to_str().unwrap(), true).is_err(), "absolute, outside");
+        assert!(confine_within(&root, "in/missing.bin", true).is_err(), "a file to send must be there");
+
+        assert!(confine_within(&root, "in/received.bin", false).is_ok(), "a new file inside");
+        assert!(confine_within(&root, "../received.bin", false).is_err(), "a new file outside");
+        assert!(confine_within(&root, "nowhere/received.bin", false).is_err(), "its folder must exist");
+        assert!(confine_within(&root, "in/..", false).is_err(), "a folder, not a file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    use std::net::TcpStream;
+
+    /// A daemon with no core behind it: every command answers `NO_CORE`, which is enough to
+    /// see whether a connection got past the token.
+    struct NoCore;
+
+    impl AppAccess for NoCore {
+        fn with_app(&self, _f: &mut dyn FnMut(&OmniApp)) {}
+    }
+
+    fn policy(token: &str, allow_remote: bool) -> TcpPolicy {
+        TcpPolicy { token: token.into(), allow_remote }
+    }
+
+    fn start_daemon(token: &str) -> String {
+        start_daemon_with_deadline(token, HANDSHAKE_DEADLINE)
+    }
+
+    fn start_daemon_with_deadline(token: &str, deadline: Duration) -> String {
+        let mut listener = TcpIpcListener::bind("127.0.0.1:0", &policy(token, false)).unwrap();
+        listener.handshake_deadline = deadline;
+        let addr = listener.describe();
+        std::thread::spawn(move || {
+            run_daemon(&listener, Arc::new(NoCore), Arc::new(Mutex::new(Vec::new())), Arc::new(|| {}));
+        });
+        addr
+    }
+
+    /// `lines` over a sealed channel opened with `token`; what came back (nothing when the channel
+    /// did not open).
+    fn exchange(addr: &str, token: &str, lines: &[&str]) -> Vec<String> {
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let Ok((mut reader, mut writer)) = secure_channel::connect(stream.try_clone().unwrap(), stream, token) else {
+            return Vec::new();
+        };
+        let mut replies = Vec::new();
+        for line in lines {
+            if writeln!(writer, "{line}").is_err() {
+                break;
+            }
+            let mut reply = String::new();
+            match reader.read_line(&mut reply) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => replies.push(reply.trim_end().to_string()),
+            }
+        }
+        replies
+    }
+
+    /// V-11: a TCP client reaches the core only after proving the token; a wrong token, or a
+    /// plain command sent straight away, ends the connection with nothing served.
+    #[test]
+    fn a_tcp_daemon_serves_only_a_client_that_proved_the_token() {
+        let addr = start_daemon("s3cret");
+        assert_eq!(exchange(&addr, "s3cret", &["contacts"]), [NO_CORE]);
+        assert!(exchange(&addr, "wrong", &["contacts"]).is_empty());
+        // The old plain first line gets nothing back.
+        let plain = TcpStream::connect(&addr).unwrap();
+        plain.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut writer = plain.try_clone().unwrap();
+        writeln!(writer, "auth s3cret").unwrap();
+        writeln!(writer, "contacts").unwrap();
+        let mut reply = String::new();
+        let _ = BufReader::new(plain).read_line(&mut reply);
+        assert!(!reply.contains(NO_CORE), "{reply:?}");
+    }
+
+    /// V-11: a TCP daemon listens outside loopback only when asked to, and never without a token.
+    #[test]
+    fn a_tcp_daemon_binds_beyond_loopback_only_when_allowed() {
+        let long = "t".repeat(MIN_REMOTE_TOKEN_CHARS);
+        let refused = TcpIpcListener::bind("0.0.0.0:0", &policy(&long, false)).map(|_| ()).expect_err("refused");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(TcpIpcListener::bind("0.0.0.0:0", &policy(&long, true)).is_ok());
+        // A short token is a word to guess from a recorded handshake: not beyond loopback.
+        let weak = TcpIpcListener::bind("0.0.0.0:0", &policy("s3cret", true)).map(|_| ()).expect_err("refused");
+        assert_eq!(weak.kind(), io::ErrorKind::PermissionDenied);
+        assert!(TcpIpcListener::bind("127.0.0.1:0", &policy("t", false)).is_ok());
+        let no_token = serve_endpoint("127.0.0.1:0", Arc::new(NoCore), Arc::new(|| {}), None);
+        assert_eq!(no_token.expect_err("refused").kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// F07 (audit 2026-11-09): clients that connect and do not prove the token — silent, or a byte
+    /// at a time — are let go at the handshake deadline; while they hold every handshake place a
+    /// new client is turned away, and once they are gone it is served.
+    #[test]
+    fn clients_that_do_not_prove_the_token_are_let_go_at_the_deadline() {
+        let deadline = Duration::from_millis(400);
+        let addr = start_daemon_with_deadline("s3cret", deadline);
+        let started = Instant::now();
+        let mut silent: Vec<TcpStream> = (0..MAX_HANDSHAKES)
+            .map(|_| {
+                let stream = TcpStream::connect(&addr).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+            })
+            .collect();
+        // Every one got the server's nonce: all are in their handshake now.
+        for stream in &mut silent {
+            let mut nonce = [0u8; 32];
+            stream.read_exact(&mut nonce).unwrap();
+        }
+        assert!(exchange(&addr, "s3cret", &["contacts"]).is_empty(), "no handshake place left");
+        // One of them sends a byte at a time: the deadline is for all its reads together.
+        let mut drip = silent.pop().unwrap();
+        for _ in 0..6 {
+            if drip.write_all(&[0]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for mut stream in silent.into_iter().chain([drip]) {
+            let mut rest = [0u8; 1];
+            let ended = matches!(stream.read(&mut rest), Ok(0) | Err(_));
+            assert!(ended, "the connection is closed");
+        }
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert_eq!(exchange(&addr, "s3cret", &["contacts"]), [NO_CORE], "served once they are gone");
+    }
+
+    /// F08 (audit 2026-11-09): a command line is not gathered past its cap.
+    #[test]
+    fn a_command_line_past_its_cap_ends_the_connection() {
+        let addr = start_daemon("s3cret");
+        let long = "x".repeat(MAX_LINE_BYTES as usize + 10);
+        let replies = exchange(&addr, "s3cret", &[&long, "contacts"]);
+        assert_eq!(replies.len(), 1, "{:?}", replies.iter().map(|r| r.len()).collect::<Vec<_>>());
+        assert!(replies[0].starts_with("ERR the command is longer"), "{}", replies[0]);
+    }
+
+    /// F08 (audit 2026-11-09): a watcher that stopped reading is let go when its queue is full; one
+    /// that reads keeps every event.
+    #[test]
+    fn a_watcher_that_falls_behind_is_let_go_and_others_keep_their_events() {
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        let (stalled, reading) = (subscribe(&subscribers), subscribe(&subscribers));
+        let event = |n: usize| CoreEvent::GroupChanged { group_id: format!("g{n}") };
+        let mut seen = 0;
+        for n in 0..EVENTS_QUEUED_PER_WATCHER + 10 {
+            broadcast(&subscribers, vec![event(n)]);
+            while reading.try_recv().is_ok() {
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, EVENTS_QUEUED_PER_WATCHER + 10, "the reading watcher has every event");
+        assert_eq!(subscribers.lock().unwrap().len(), 1, "the stalled one is let go");
+        assert_eq!(stalled.try_iter().count(), EVENTS_QUEUED_PER_WATCHER, "its queue held no more than the cap");
+        assert!(matches!(stalled.recv_timeout(Duration::from_millis(10)), Err(RecvTimeoutError::Disconnected)));
+    }
+
+    /// The token a daemon makes for itself lands in the app dir, where a local client reads it.
+    #[test]
+    fn a_daemon_without_a_given_token_writes_a_random_one_to_its_app_dir() {
+        let dir = std::env::temp_dir().join(format!("omni-daemon-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if std::env::var(TOKEN_ENV).is_err() {
+            let first = TcpPolicy::for_app_dir(&dir, false).unwrap();
+            assert_eq!(first.token.len(), 64);
+            assert_eq!(std::fs::read_to_string(dir.join(TOKEN_FILE)).unwrap(), &*first.token);
+            let second = TcpPolicy::for_app_dir(&dir, false).unwrap();
+            assert_ne!(first.token, second.token, "a fresh token each start");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

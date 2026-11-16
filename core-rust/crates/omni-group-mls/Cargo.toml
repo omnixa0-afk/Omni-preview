@@ -2,6 +2,7 @@
 name = "omni-group-mls"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Group crypto + membership on MLS (RFC 9420) via OpenMLS — docs/decisions/group-crypto-mls.md.
 # Pure Rust (RustCrypto provider; no aws-lc/openssl/ring): the same group bytes on every platform.

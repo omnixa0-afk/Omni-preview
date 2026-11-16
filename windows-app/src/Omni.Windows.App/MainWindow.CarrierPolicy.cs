@@ -128,21 +128,16 @@ public sealed partial class MainWindow
         const string applies = " Применяется сразу.";
         // A connection the new mode refuses is closed at once (QA 2026-10-17: a call over UDP ended
         // when the contact had no TCP door to move to).
-        const string breaks = " Связь, которую режим запрещает, рвётся сразу — идущий звонок может прерваться.";
+        const string breaks = " Идущий звонок может прерваться.";
         // The setting is about the first hop only: to the relay, or straight to the contact.
         SettingsCarrierPolicySummaryTextBlock.Text = policy switch
         {
             "tcp" or "relay_tcp_only" =>
-                "Связь от вас до ближайшего узла — релея или самого контакта — только по TCP: до релея через " +
-                "его TCP-вход, до контакта через его TCP-дверь. Работает там, где провайдер режет UDP; " +
-                "медленнее. Дальше релей и контакт решают сами. С контактом без TCP-двери — только через релей." +
-                applies + breaks,
+                "До ближайшего узла только по TCP: для сетей, где режут UDP. Медленнее." + applies + breaks,
             "quic" or "quic_forced" =>
-                "Связь от вас до ближайшего узла — только QUIC по UDP. Быстрее всего, но если сеть режет " +
-                "UDP, связь не поднимется — тогда выберите «Авто» или «TCP»." + applies + breaks,
+                "До ближайшего узла только по UDP. Если сеть его режет, связи не будет." + applies + breaks,
             _ =>
-                "Связь от вас до ближайшего узла — релея или самого контакта — по QUIC, где он проходит, " +
-                "иначе по TCP; при обрыве переключается сама. Подходит большинству." + applies,
+                "Подходит большинству.",
         };
     }
 }

@@ -14,10 +14,20 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::Zeroize;
+/// Secrets in the clear are handed out in this: wiped from memory when dropped.
+pub use zeroize::Zeroizing;
 
 pub const CRYPTO_SUITE_VERSION_V2: u16 = 2;
 pub const CRYPTO_SUITE_VERSION_CURRENT: u16 = CRYPTO_SUITE_VERSION_V2;
 pub const DEFAULT_ONE_TIME_PREKEY_COUNT: usize = 8;
+/// How long a signed prekey may be used by an initiator: its `expires_at` in the bundle. A new one
+/// is made well before (the storage rotates weekly), so a bundle a contact holds stays usable while
+/// it keeps hearing from us; an older one is refused and the contact waits for a fresh bundle. The
+/// receiving device keeps the private half a little past this (late durable delivery), then erases
+/// it — what limits how far back a stolen database decrypts session starts (security review
+/// 2026-10-18, V-09).
+pub const SIGNED_PREKEY_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 const REPLAY_WINDOW_LIMIT: usize = 64;
 
@@ -280,20 +290,6 @@ pub struct ReplayWindowState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FingerprintMaterial {
-    pub local_account_id: AccountId,
-    pub local_device_id: DeviceId,
-    pub local_identity_key: IdentityPublicKey,
-    pub local_identity_signing_key: IdentitySigningPublicKey,
-    pub local_device_key: DevicePublicKey,
-    pub remote_account_id: AccountId,
-    pub remote_device_id: DeviceId,
-    pub remote_identity_key: IdentityPublicKey,
-    pub remote_identity_signing_key: IdentitySigningPublicKey,
-    pub remote_device_key: DevicePublicKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionBootstrapMessage {
     pub suite_version: u16,
     pub initiator_account_id: AccountId,
@@ -316,6 +312,11 @@ pub struct EncryptedPayload {
     pub nonce_hex: String,
     pub ciphertext_hex: String,
     pub mac_hex: String,
+    /// The header's tag under the root key the sender's chain was made from (32 bytes hex): the
+    /// receiver of a NEW chain checks it with one DH and one HKDF before any work that grows with the
+    /// counter. None from a sender older than it (such a frame cannot jump far into a new chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_mac_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -23,6 +23,8 @@ impl OmniApp {
         display_name: impl Into<String>,
         device_label: impl Into<String>,
     ) -> OmniResult<LocalAccountSnapshot> {
+        // A new profile becomes the active one.
+        self.stop_the_active_profile_unless(None);
         let snapshot = self.storage.create_local_account(
             &display_name.into(),
             &device_label.into(),
@@ -52,6 +54,7 @@ impl OmniApp {
     pub fn get_current_account_export_manifest(
         &self,
     ) -> OmniResult<Option<AccountExportManifestV1>> {
+        let _ = self.ensure_runtime_profile_active("get_current_account_export_manifest")?;
         self.storage.get_current_account_export_manifest()
     }
 
@@ -60,6 +63,8 @@ impl OmniApp {
         manifest: &AccountExportManifestV1,
         mnemonic: impl AsRef<str>,
     ) -> OmniResult<LocalAccountSnapshot> {
+        // A new profile becomes the active one.
+        self.stop_the_active_profile_unless(None);
         let snapshot = self.storage.restore_local_account_from_export_manifest(
             manifest,
             mnemonic.as_ref(),
@@ -86,6 +91,8 @@ impl OmniApp {
         device_label: impl Into<String>,
     ) -> OmniResult<LocalAccountSnapshot> {
         let device_label = device_label.into();
+        // A new profile becomes the active one.
+        self.stop_the_active_profile_unless(None);
         let snapshot = self.storage.restore_local_account_from_mnemonic(
             display_name.as_ref(),
             mnemonic.as_ref(),
@@ -141,6 +148,7 @@ impl OmniApp {
                 .into_omni_error());
             }
         }
+        self.stop_the_active_profile_unless(Some(profile_id));
         let reopened = self.storage.reopen_local_profile(profile_id)?;
         self.current_active_profile_context_required()?;
         self.sync_transport_local_identity()?;
@@ -201,14 +209,30 @@ impl OmniApp {
     }
 
     pub fn select_active_profile(&self, profile_id: &LocalProfileId) -> OmniResult<()> {
+        self.stop_the_active_profile_unless(Some(profile_id));
         self.storage.set_active_profile_id(Some(profile_id))?;
         self.sync_transport_local_identity()
     }
 
     pub fn clear_active_profile(&self) -> OmniResult<()> {
+        self.stop_the_active_profile_unless(None);
         self.storage.set_active_profile_id(None)?;
         self.clear_transport_local_identity();
         Ok(())
+    }
+
+    /// Leaving the active profile for another one (or for none) stops what ran for it first, as
+    /// signing out does: its mesh (with its node identity), its call, its registries. They are kept
+    /// by the database path, which the next profile shares — it saw the previous profile's call and
+    /// could not place its own, and the mesh kept the previous identity (blind audit 2026-11-10).
+    /// Choosing the active profile again stops nothing.
+    fn stop_the_active_profile_unless(&self, kept: Option<&LocalProfileId>) {
+        let Ok(Some(active)) = self.storage.get_active_profile_id() else {
+            return;
+        };
+        if kept != Some(&active) {
+            let _ = self.profile_lifecycle_coordinator().stop_runtime_context();
+        }
     }
 
     pub fn list_local_profiles(&self) -> OmniResult<SavedProfileList> {

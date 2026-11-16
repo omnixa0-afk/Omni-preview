@@ -14,28 +14,18 @@ namespace Omni.Windows.App
             InitializeComponent();
             appDirectory = ResolveAppDirectory(Environment.GetCommandLineArgs());
 
-#if OMNI_DEV_TOOLS
-            // Dev builds route the Rust core's trace log to OmniData\logs\trace.log so a normal
-            // double-click launch produces the trace. Must be set BEFORE the core is created (the core
-            // caches the path on its first trace call). Release builds never do this: the trace names
-            // peers, addresses and timings, is fsynced per line and is not rotated — it stays off
-            // unless someone sets OMNI_TRACE_FILE by hand.
+            // The diagnostic trace (OmniData\logs\trace.log) follows the settings switch «Журнал для
+            // разработчика»: off by default in a product build — it names peers, addresses and
+            // timings — on in a dev build. Applied before the window, so startup is traced too. A
+            // hand-set OMNI_TRACE_FILE wins over the switch.
             try
             {
-                string logsDir = Path.Combine(appDirectory, "logs");
-                Directory.CreateDirectory(logsDir);
-                if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OMNI_TRACE_FILE")))
-                {
-                    Environment.SetEnvironmentVariable(
-                        "OMNI_TRACE_FILE",
-                        Path.Combine(logsDir, "trace.log"));
-                }
+                AppTrace.SetEnabled(appDirectory, TraceLogPreference.Load(appDirectory));
             }
             catch
             {
                 // Never let a diagnostics-setup failure block startup.
             }
-#endif
 
             // Without these, an unhandled UI-thread exception terminates the WinUI 3 process
             // silently with no artifact. Live-observed 2026-07-20: switching to Contacts after a

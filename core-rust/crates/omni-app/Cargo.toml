@@ -2,6 +2,7 @@
 name = "omni-app"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 [features]
 # Test-stand knobs (fault injection) in a release build; debug builds always have them.
@@ -12,7 +13,7 @@ dev-tools = []
 aes-gcm-siv = "0.11"
 base64.workspace = true
 # The group-attachment pull preamble on a mesh bulk stream (app_group_attachments.rs).
-tokio = { version = "1", features = ["io-util", "rt"] }
+tokio = { version = "1", features = ["io-util", "rt", "net", "macros", "time"] }
 ed25519-dalek.workspace = true
 # The account passport is packed before it is sealed (runtime_account_passport.rs).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -24,6 +25,8 @@ omni-crypto = { path = "../omni-crypto" }
 omni-identity = { path = "../omni-identity" }
 omni-mesh-runtime = { path = "../omni-mesh-runtime" }
 omni-messaging = { path = "../omni-messaging" }
+# The diagnostic trace sink (trace_log.rs).
+omni-net-primitives = { path = "../omni-net-primitives" }
 omni-protocol = { path = "../omni-protocol" }
 omni-rendezvous = { path = "../omni-rendezvous" }
 omni-storage = { path = "../omni-storage" }
@@ -31,10 +34,15 @@ omni-transport = { path = "../omni-transport" }
 omni-types = { path = "../omni-types" }
 serde.workspace = true
 serde_json.workspace = true
+toml = "1"
 sha2.workspace = true
+cap-std = "4"
+cap-fs-ext = "4"
 
 [dev-dependencies]
 image.workspace = true
+# Tests stand in for an inviter's reply key (invite beacons sealed to it).
+x25519-dalek.workspace = true
 
 [lints]
 workspace = true

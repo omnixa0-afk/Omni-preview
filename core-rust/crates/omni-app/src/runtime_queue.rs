@@ -10,7 +10,6 @@ const OPEN_CHAT_KEEPALIVE_INTERVAL_MS: i64 = 10_000;
 const ACTIVE_SESSION_ACK_GRACE_MS: i64 = 4_000;
 #[cfg(test)]
 const ACTIVE_SESSION_ACK_GRACE_MS: i64 = 600;
-const ATTACHMENT_SERVING_RECHECK_BYTES: i64 = 1024 * 1024;
 
 // TM-005 (docs/decisions/attachment-transfer-quotas.md): how many downloads of one dialog a
 // contact's photos may start on their own. Past it a photo waits for a tap; the offer is never refused.
@@ -83,9 +82,11 @@ fn run_queue_worker(
             Err(RecvTimeoutError::Timeout) => {}
         }
 
+        crate::tick_cost::begin();
         let error = process_queue_tick(&storage, &transport, &session_lock, &mut worker_state)
             .err()
             .map(|error| error.to_string());
+        crate::tick_cost::report_if_due("queue/tick-cost");
         if error != last_tick_error {
             if let Some(error) = error.as_deref() {
                 omni_app_trace_log("queue/tick", &format!("tick failed: {error}"));
@@ -107,9 +108,12 @@ fn process_queue_tick(
 
     let now = current_unix_ms();
     let snapshot = transport.snapshot();
+    crate::tick_cost::mark("signed-in+snapshot");
     {
         let _session_guard = lock_app_session_guard(session_lock)?;
+        crate::tick_cost::mark("session-lock");
         promote_overdue_sent_messages(storage, &snapshot, now)?;
+        crate::tick_cost::mark("promote-overdue");
 
         if !matches!(
             snapshot.state,
@@ -128,12 +132,14 @@ fn process_queue_tick(
             })?;
         }
 
+        crate::tick_cost::mark("pause-downloads");
         let mut download_dialog_keys = Vec::new();
         if let Some(dialog_key) = snapshot.dialog_key.as_deref() {
             process_pending_for_active_dialog(storage, transport, dialog_key)?;
             process_pending_attachment_downloads_for_active_dialog(storage, transport, dialog_key)?;
             download_dialog_keys.push(dialog_key.to_string());
         }
+        crate::tick_cost::mark("active-dialog");
         // Copies of our own messages download their files from our other devices, whichever dialog
         // is active. Best effort: a device that is away must not stall the rest of the tick.
         for (_device_id, device_dialog_key) in storage.list_own_device_dialogs()? {
@@ -169,6 +175,7 @@ fn process_queue_tick(
                 download_dialog_keys.push(downloading_dialog_key);
             }
         }
+        crate::tick_cost::mark("download-dialogs");
         // A chat that is not the active transport dialog keeps its own queue: without this walk a
         // message parked there (no route at send time) waited until that chat became active.
         // Best effort: one unreachable chat must not stall the others.
@@ -176,12 +183,16 @@ fn process_queue_tick(
             Some(dialog_key) => Some(storage.chat_dialog_key_for(dialog_key)?),
             None => None,
         };
-        for pending_dialog_key in storage.dialogs_with_due_pending_queue(now)? {
+        let due_dialogs = storage.dialogs_with_due_pending_queue(now)?;
+        crate::tick_cost::mark("due-list");
+        for pending_dialog_key in due_dialogs {
             if active_chat_key.as_deref() == Some(pending_dialog_key.as_str()) {
                 continue;
             }
             let _ = process_pending_for_active_dialog(storage, transport, &pending_dialog_key);
         }
+        crate::tick_cost::mark("due-attempts");
+        crate::tick_cost::mark("due-queues");
         retry_stalled_attachment_downloads(
             storage,
             transport,
@@ -189,6 +200,7 @@ fn process_queue_tick(
             &download_dialog_keys,
             now,
         )?;
+        crate::tick_cost::mark("stalled-downloads");
 
         if matches!(
             snapshot.state,
@@ -213,6 +225,7 @@ fn process_queue_tick(
             }
         }
 
+        crate::tick_cost::mark("profile+relay-sync");
         // A link that just came up, or a courier set the user just changed, is told now. The check
         // is one lock and a hash per tick; the pass itself walks the contacts, so it runs only when
         // something changed (and on every reconcile below).
@@ -233,6 +246,7 @@ fn process_queue_tick(
         // Our own few devices only (a contact coming and going does not buy a reconcile pass): a
         // session read per device per tick. The link alone is not enough — it is up before the
         // session, and a pass then only sends the bootstrap.
+        crate::tick_cost::mark("couriers");
         let ready = ready_own_device_dialogs(storage, transport);
         let own_device_came_online =
             ready.iter().any(|dialog| !worker_state.own_devices_ready.contains(dialog));
@@ -242,6 +256,7 @@ fn process_queue_tick(
         let reconcile_requests = RECONCILE_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
         let reconcile_requested = reconcile_requests != worker_state.reconcile_requests_seen;
         worker_state.reconcile_requests_seen = reconcile_requests;
+        crate::tick_cost::mark("own-devices-ready");
         if own_device_came_online || reconcile_requested || reconcile_due {
             reconcile_own_devices(
                 storage,
@@ -269,9 +284,13 @@ fn process_queue_tick(
                 omni_app_trace_log("attachment/prepare", &format!("resume scan failed: {error}"));
             }
         }
+        crate::tick_cost::mark("reconcile+prep-scan");
         process_contact_presence_tick(storage, transport, &snapshot, now)?;
+        crate::tick_cost::mark("presence");
         maintain_open_chat_session_leases(storage, transport, now)?;
+        crate::tick_cost::mark("leases");
         expire_stale_contact_presence(storage, now)?;
+        crate::tick_cost::mark("expire-presence");
     }
 
     Ok(())
@@ -319,13 +338,57 @@ fn process_pending_for_active_dialog(
     transport: &TransportManager,
     dialog_key: &str,
 ) -> OmniResult<()> {
+    process_pending_for_dialog_due_by(storage, transport, dialog_key, current_unix_ms())
+}
+
+/// The dialog's session just came up (a bootstrap of the peer's taken, or ours answered): all it has
+/// waiting goes now, not only what is due. A message that kept failing while there was no link was
+/// put off for longer each time — a minute after an outage — and then sat out its wait on a session
+/// that worked (live 2026-11-10: 60 s after a restored device and its contact met again).
+///
+/// A message already sent and waiting for its receipt goes again too: it went out on the session
+/// this one replaced, so no receipt is coming, and it sat out the receipt wait first (live: 18 s).
+/// A copy that did arrive is dropped by the receiver by its id.
+fn process_pending_for_dialog_whose_session_came_up(
+    storage: &Storage,
+    transport: &TransportManager,
+    dialog_key: &str,
+) -> OmniResult<()> {
+    // A group Welcome kept for this dialog's invitee goes again too (maintainers' decision 2026-11-11).
+    crate::app_groups::resend_kept_welcomes(storage, transport, dialog_key);
+    let chat_dialog_key = storage.chat_dialog_key_for(dialog_key)?;
+    let queued_under = omni_types::normalize_dialog_key(dialog_key);
+    let now = current_unix_ms();
+    for item in storage.outbound_queue_snapshot()?.items {
+        if item.status == MessageStatus::Sent
+            && (item.dialog_key == chat_dialog_key || item.dialog_key == queued_under)
+        {
+            if let Err(error) = storage.mark_queue_retry(
+                &item.message_id,
+                QueueFailureKind::NoActiveSession,
+                "the session it went out on was replaced: sending it again",
+                now,
+                now,
+            ) {
+                omni_app_trace_log("queue/pending", &format!("message={} not re-sent: {error}", item.message_id));
+            }
+        }
+    }
+    process_pending_for_dialog_due_by(storage, transport, dialog_key, i64::MAX)
+}
+
+fn process_pending_for_dialog_due_by(
+    storage: &Storage,
+    transport: &TransportManager,
+    dialog_key: &str,
+    now: i64,
+) -> OmniResult<()> {
     // A device's dialog flushes its contact's chat: the queue lives under the chat. And under the
     // key it was queued with: the chat's key moves when the contact's primary dialog does (an
     // account dialog gives way to a device's once its link is up), and a message queued a moment
     // before stayed under the old key — the tick named that key as due every time, then looked
     // under the new one and found nothing; the message sat queued for good, never once attempted
     // (core gate 2026-10-15, `a_device_that_got_a_contact_from_another_device_of_ours_can_write_to_it`).
-    let now = current_unix_ms();
     let chat_dialog_key = storage.chat_dialog_key_for(dialog_key)?;
     let mut pending = storage.pending_queue_for_dialog(&chat_dialog_key, now)?;
     let queued_under = omni_types::normalize_dialog_key(dialog_key);
@@ -1171,7 +1234,19 @@ fn attempt_send_existing_message(
             }
             sent
         }
-        Ok(SendExistingMessageOutcome::DeferredUntilVerification) => Ok(existing),
+        Ok(SendExistingMessageOutcome::DeferredUntilVerification) => {
+            // No contact to send to, and nothing that happens this tick brings one. Without a
+            // pause the message is tried again on every tick, for as long as it stays.
+            let now = current_unix_ms();
+            storage.mark_queue_retry(
+                message_id,
+                QueueFailureKind::NoActiveSession,
+                "waiting for a contact to send to",
+                now + delivery_retry_backoff_ms(1),
+                now,
+            )?;
+            Ok(existing)
+        }
         Ok(SendExistingMessageOutcome::HeldByReceiveWindow) => {
             // Ждём расписок, а не чинки: линк цел, сессия цела, просто окно приёма заполнено.
             // Счётчик попыток НЕ трогаем — иначе штатное противодавление копило бы «неудачи» и
@@ -1192,7 +1267,7 @@ fn attempt_send_existing_message(
             storage.mark_queue_retry(
                 message_id,
                 QueueFailureKind::NoActiveSession,
-                "waiting to read the recipient account's revocations",
+                WAITING_FOR_REVOCATIONS,
                 now + delivery_retry_backoff_ms(1),
                 now,
             )?;
@@ -1324,6 +1399,11 @@ fn attempt_send_attachment_download_request(
             .ok_or_else(|| {
                 OmniError::Transport("attachment contact is not available for the current dialog".to_string())
             })?;
+        // A contact blocked or declined since is asked nothing more (A03, audit 2026-11-09 #6): the
+        // request itself tells them we still want their file.
+        if contact.relationship_state != ContactRelationshipState::Approved || contact.is_blocked {
+            return Err(OmniError::Transport("the file's contact is not an approved contact: nothing is asked of them".to_string()));
+        }
         let remote_account_id = contact.remote_account_id.clone().ok_or_else(|| {
             OmniError::Transport("attachment contact does not have a remote_account_id".to_string())
         })?;
@@ -1858,10 +1938,13 @@ fn established_session_with_own_device(
             let Some(bundle) = storage.get_remote_prekey_bundle(own_account_id, device_id)? else {
                 return Ok(None);
             };
-            let (_session, bootstrap, _observed_at) =
+            let (session, bootstrap, _observed_at) =
                 bootstrap_session_for_remote_bundle(storage, &bundle, now_unix_ms)?;
             let envelope = omni_messaging::wrap_session_bootstrap(bootstrap)?;
-            transport.send_wire_envelope_for_dialog_key(device_dialog_key, &envelope)?;
+            if let Err(error) = transport.send_wire_envelope_for_dialog_key(device_dialog_key, &envelope) {
+                bootstrap_did_not_go_out(storage, session);
+                return Err(error);
+            }
             omni_app_trace_log(
                 "own_devices/copy",
                 &format!("device={} session bootstrap sent ({waits})", device_id.0),
@@ -1911,6 +1994,7 @@ fn send_sent_transcript_to_own_device(
             body: message.body.clone(),
             created_at_unix_ms: message.created_at_unix_ms,
             attachment,
+            reply_to: storage.message_reply_to(&message.id)?,
         }),
         SecurityPayloadKind::SentTranscript,
         now_unix_ms,
@@ -2113,6 +2197,10 @@ fn send_existing_message_encrypted(
     }
 }
 
+/// Why a message waits before going to a contact's device: its account's revocations are not read
+/// yet. The chat's header says so (`get_chat_header_contact_summary`).
+pub(crate) const WAITING_FOR_REVOCATIONS: &str = "waiting to read the recipient account's revocations";
+
 fn send_existing_message_to_device(
     storage: &Storage,
     transport: &TransportManager,
@@ -2174,7 +2262,10 @@ fn send_existing_message_to_device(
             let (session, bootstrap, observed_at) =
                 bootstrap_session_for_remote_bundle(storage, &bundle, now_unix_ms)?;
             let envelope = omni_messaging::wrap_session_bootstrap(bootstrap.clone())?;
-            transport.send_wire_envelope_for_dialog_key(&target.dialog_key, &envelope)?;
+            if let Err(error) = transport.send_wire_envelope_for_dialog_key(&target.dialog_key, &envelope) {
+                bootstrap_did_not_go_out(storage, session);
+                return Err(error);
+            }
             storage.upsert_message_security_metadata(
                 &format!(
                     "bootstrap::{}::{}::{}",
@@ -2200,7 +2291,10 @@ fn send_existing_message_to_device(
             let (session, bootstrap, observed_at) =
                 bootstrap_session_for_remote_bundle(storage, &bundle, now_unix_ms)?;
             let envelope = omni_messaging::wrap_session_bootstrap(bootstrap.clone())?;
-            transport.send_wire_envelope_for_dialog_key(&target.dialog_key, &envelope)?;
+            if let Err(error) = transport.send_wire_envelope_for_dialog_key(&target.dialog_key, &envelope) {
+                bootstrap_did_not_go_out(storage, session);
+                return Err(error);
+            }
             storage.upsert_message_security_metadata(
                 &format!(
                     "bootstrap::{}::{}::{}",
@@ -2303,6 +2397,7 @@ fn send_existing_message_to_device(
             &session,
             &existing.id,
             &existing.body,
+            storage.message_reply_to(&existing.id)?.as_deref(),
             existing.created_at_unix_ms,
             current_unix_ms(),
         )?
@@ -2386,6 +2481,15 @@ fn finish_encrypted_send(
     Ok(SendExistingMessageOutcome::Sent)
 }
 
+/// A bootstrap that did not leave (no path to the peer): its session says so, `updated_at` 0 — as if
+/// none were waiting for the contact to take. Otherwise it looked sent for the reissue interval, and
+/// a frame of the contact's that came meanwhile (the link just up) did not send it again: live
+/// 2026-11-11, 10 s until the contact's next frame.
+fn bootstrap_did_not_go_out(storage: &Storage, mut session: omni_crypto::SessionRecord) {
+    session.updated_at_unix_ms = 0;
+    let _ = storage.store_session_record(&mut session);
+}
+
 fn bootstrap_session_for_remote_bundle(
     storage: &Storage,
     bundle: &omni_crypto::PrekeyBundle,
@@ -2422,6 +2526,7 @@ fn bootstrap_session_for_remote_bundle(
         created_at_unix_ms: bootstrap.created_at_unix_ms,
         initiator_instance_id: storage.get_or_create_local_instance_id()?,
         initiator_device_certificate_chain_json: local_device_certificate_chain_json(storage)?,
+        invite_claim_hex: None,
     };
 
     Ok((session, bootstrap_v1, now_unix_ms))

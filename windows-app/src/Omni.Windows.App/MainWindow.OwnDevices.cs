@@ -18,17 +18,27 @@ public sealed partial class MainWindow
 {
     private void RenderOwnDevicesSettings()
     {
-        List<OwnDeviceView> devices;
+        if (ReadOwnDevices() is { } devices)
+        {
+            ShowOwnDevices(devices);
+        }
+    }
+
+    private List<OwnDeviceView>? ReadOwnDevices()
+    {
         try
         {
-            devices = rustBridge.ListOwnDevices().ToList();
+            return rustBridge.ListOwnDevices().ToList();
         }
         catch (Exception)
         {
             // Profile not ready — leave the last rendered state; the next settings render retries.
-            return;
+            return null;
         }
+    }
 
+    private void ShowOwnDevices(List<OwnDeviceView> devices)
+    {
         SettingsDevicesList.ItemsSource = devices
             .Where(device => !device.Revoked)
             .OrderByDescending(device => device.IsThisDevice)
@@ -53,8 +63,8 @@ public sealed partial class MainWindow
             ? $"{string.Join(", ", added.Select(device => $"«{device.DeviceLabel}»"))}. Если это не вы — отзовите: устройство сотрёт свой профиль, как только выйдет в сеть."
             : string.Empty;
         SettingsDevicesSummaryTextBlock.Text = others == 0
-            ? "В аккаунте только это устройство. Другое появится здесь, когда вы скопируете папку профиля на другой компьютер."
-            : "Отозванное устройство перестаёт получать сообщения и стирает свой профиль, как только выходит в сеть.";
+            ? "В аккаунте только это устройство. Чтобы добавить другое, скопируйте на него папку профиля."
+            : "Отозванное устройство стирает свой профиль, как только выходит в сеть.";
         UpdateNewDevicesBadge(added);
     }
 
@@ -310,6 +320,7 @@ public sealed partial class MainWindow
             PrimaryButtonText = "Перейти на новый ключ",
             CloseButtonText = "Отмена",
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary)
         {
@@ -350,6 +361,15 @@ public sealed partial class MainWindow
                  + "• Отозвать можно только с устройства, у которого в этой папке есть ключ аккаунта.",
             TextWrapping = TextWrapping.WrapWholeWords,
         });
+        // V-17 (review 2026-10-18), an accepted risk said out loud: a revocation is signed by the
+        // account key, and a stolen device keeps it.
+        content.Children.Add(new TextBlock
+        {
+            Text = "Если устройство украдено, одного отзыва мало: на нём остался ключ аккаунта, а с ним можно "
+                 + "отзывать ваши устройства и открывать ваши резервные копии. Тогда после отзыва нажмите "
+                 + "«Сменить ключ…» в разделе «Ключ аккаунта украден» — понадобится фраза восстановления.",
+            TextWrapping = TextWrapping.WrapWholeWords,
+        });
         // A folder under a password keeps the account key under it: the password signs this one act.
         PasswordBox? passwordBox = null;
         if (currentPasswordProtectionSummary?.Enabled == true)
@@ -370,6 +390,7 @@ public sealed partial class MainWindow
             PrimaryButtonText = "Отозвать",
             CloseButtonText = "Отмена",
             XamlRoot = Content.XamlRoot,
+            RequestedTheme = Presentation.MainWindowPresentation.ActiveTheme,
         };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary)
         {

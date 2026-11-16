@@ -371,6 +371,18 @@ function Write-StorageSchema {
         }
     }
 
+    # The per-profile message migration rebuilds these tables and renames them into place.
+    $messageKeys = Get-Content -LiteralPath (Join-Path (Split-Path $migrationsPath) 'message_keys_per_profile.sql') -Raw
+    $rebuiltTables = @{}
+    foreach ($m in $regex.Matches($messageKeys)) {
+        $name = $m.Groups[1].Value -replace '_scoped$', ''
+        $table = $tables | Where-Object Symbol -eq $name
+        if ($table) {
+            $table.Body = $m.Groups[2].Value
+            $rebuiltTables[$name] = $true
+        }
+    }
+
     # Ensure deterministic order.
     $tables = $tables | Sort-Object Symbol
 
@@ -446,7 +458,7 @@ function Write-StorageSchema {
             }
         }
 
-        if ($alterByTable.ContainsKey($t.Symbol)) {
+        if ($alterByTable.ContainsKey($t.Symbol) -and -not $rebuiltTables.ContainsKey($t.Symbol)) {
             [void]$sb.AppendLine('')
             [void]$sb.AppendLine('**Added via `ensure_table_column` (additive migrations):**')
             [void]$sb.AppendLine('')

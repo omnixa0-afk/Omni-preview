@@ -33,6 +33,14 @@ fn file_at_rest_disk_chunk_bytes(chunk: u64) -> u64 {
     chunk + FILE_AT_REST_CHUNK_OVERHEAD
 }
 
+/// Inspect an already opened file and leave it ready to read from the beginning.
+pub fn opened_file_is_at_rest(file: &mut std::fs::File) -> OmniResult<bool> {
+    use std::io::Seek as _;
+    let encrypted = read_file_at_rest_header(file)?.is_some();
+    file.rewind().map_err(file_at_rest_io)?;
+    Ok(encrypted)
+}
+
 /// Plaintext length of an encrypted file of `disk_len` bytes on disk (header included).
 fn file_at_rest_plain_len(disk_len: u64, chunk: u64) -> u64 {
     let body = disk_len.saturating_sub(FILE_AT_REST_HEADER_BYTES);
@@ -160,9 +168,14 @@ pub struct FileAtRestReader {
 
 impl FileAtRestReader {
     pub fn open(path: &std::path::Path, dek: &[u8; 32]) -> OmniResult<Self> {
-        let mut file = std::fs::File::open(path).map_err(|error| {
+        let file = std::fs::File::open(path).map_err(|error| {
             OmniError::Storage(format!("failed to open '{}': {error}", path.display()))
         })?;
+        Self::from_file(file, dek)
+    }
+
+    /// Read an already opened file without resolving its name a second time.
+    pub fn from_file(mut file: std::fs::File, dek: &[u8; 32]) -> OmniResult<Self> {
         let disk_len = file.metadata().map_err(file_at_rest_io)?.len();
         let header = match read_file_at_rest_header(&mut file)? {
             Some(bytes) => Some(FileAtRestHeader::from_bytes(dek, bytes)?),
@@ -253,11 +266,16 @@ pub struct FileAtRestWriter {
 impl FileAtRestWriter {
     /// A new file at `path` (an existing one is replaced).
     pub fn create(path: &std::path::Path, dek: &[u8; 32]) -> OmniResult<Self> {
-        use std::io::Write as _;
-        let header = FileAtRestHeader::new(dek)?;
-        let mut file = std::fs::File::create(path).map_err(|error| {
+        let file = std::fs::File::create(path).map_err(|error| {
             OmniError::Storage(format!("failed to create '{}': {error}", path.display()))
         })?;
+        Self::from_empty_file(file, dek)
+    }
+
+    /// Encrypt into a new empty file opened by the caller.
+    pub fn from_empty_file(mut file: std::fs::File, dek: &[u8; 32]) -> OmniResult<Self> {
+        use std::io::Write as _;
+        let header = FileAtRestHeader::new(dek)?;
         file.write_all(&header.bytes).map_err(file_at_rest_io)?;
         Ok(Self { file, header, pending: Vec::new(), next_index: 0 })
     }
@@ -275,6 +293,13 @@ impl FileAtRestWriter {
         let writer = Self::create(path, dek)?;
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(file_at_rest_io)?;
         Ok(Self { file, ..writer })
+    }
+
+    /// Resume an already opened encrypted partial download without reopening its name.
+    pub fn resume_file(mut file: std::fs::File, dek: &[u8; 32]) -> OmniResult<Self> {
+        let bytes = read_file_at_rest_header(&mut file)?.ok_or_else(|| OmniError::Storage("partial attachment is not encrypted".into()))?;
+        let header = FileAtRestHeader::from_bytes(dek, bytes)?;
+        Ok(Self { file, header, pending: Vec::new(), next_index: 0 })
     }
 
     /// Write `data` at plaintext `offset`. The offset is a chunk boundary, and `data` is whole chunks

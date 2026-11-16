@@ -45,10 +45,125 @@ pub type MeshMediaCallback = Arc<dyn Fn(MeshNodeAddress, Vec<u8>) + Send + Sync>
 /// ReceivedChatContext and dispatches it like a legacy transport event.
 pub type MeshWireCallback = Arc<dyn Fn(MeshNodeAddress, Vec<u8>) + Send + Sync>;
 
+/// What the app made of a durable frame addressed to us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshDurableOutcome {
+    /// Handled — taken in, or rejected for good (a frame that will never open). It is marked
+    /// handled: our high-water covers it and holders may drop their copy.
+    Handled,
+    /// It failed on something that passes (storage busy, no route or session yet): offer it to the
+    /// app again later, and keep it unhandled meanwhile so no holder drops it.
+    Retry,
+    /// It may open later, but nothing says when (a group message of an epoch we are far from): offered
+    /// again through the pauses, then left unhandled for this run — a holder offers it after a restart.
+    /// Held for as long as the network holds it, such frames took every place the app has for frames
+    /// on their way (`DurableInFlight`), and new ones were not taken in (blind audit 2026-11-13, pass 21).
+    RetryAWhile,
+}
+
+/// What waits for the app's single wire thread, at most: it drains frames one by one while the
+/// network takes them in at link speed. Unbounded, a peer sending faster than the app could handle
+/// filled the memory (blind audit 2026-11-10).
+const ON_WIRE_QUEUE_BYTES_MAX: usize = 64 * 1024 * 1024;
+const ON_WIRE_QUEUE_FRAMES_MAX: usize = 16 * 1024;
+
+type OnWireItem = (MeshNodeAddress, Vec<u8>, Option<MeshDurableDone>);
+
+/// The queue to the app's wire thread, with what is in it counted against
+/// [`ON_WIRE_QUEUE_BYTES_MAX`] / [`ON_WIRE_QUEUE_FRAMES_MAX`].
+#[derive(Clone)]
+struct OnWireQueue {
+    tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<OnWireItem>>>,
+    counts: OnWireCounts,
+}
+
+/// What is in the queue: bytes and frames. The wire thread holds only these.
+#[derive(Clone, Default)]
+struct OnWireCounts {
+    bytes: Arc<std::sync::atomic::AtomicUsize>,
+    frames: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl OnWireCounts {
+    /// One frame of `size` bytes left the queue.
+    fn taken(&self, size: usize) {
+        use std::sync::atomic::Ordering;
+        self.frames.fetch_sub(1, Ordering::SeqCst);
+        self.bytes.fetch_sub(size, Ordering::SeqCst);
+    }
+}
+
+impl OnWireQueue {
+    fn new() -> (Self, std::sync::mpsc::Receiver<OnWireItem>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queue = OnWireQueue { tx: Arc::new(std::sync::Mutex::new(tx)), counts: OnWireCounts::default() };
+        (queue, rx)
+    }
+
+    fn counts(&self) -> OnWireCounts {
+        self.counts.clone()
+    }
+
+    /// Queue it, or hand it back when the queue is full (or the wire thread is gone).
+    fn push(&self, item: OnWireItem) -> Result<(), OnWireItem> {
+        use std::sync::atomic::Ordering;
+        let size = item.1.len();
+        let frames = self.counts.frames.fetch_add(1, Ordering::SeqCst);
+        let bytes = self.counts.bytes.fetch_add(size, Ordering::SeqCst);
+        if frames >= ON_WIRE_QUEUE_FRAMES_MAX || bytes + size > ON_WIRE_QUEUE_BYTES_MAX {
+            self.counts.taken(size);
+            return Err(item);
+        }
+        let sent = match self.tx.lock() {
+            Ok(tx) => tx.send(item).map_err(|error| error.0),
+            Err(_) => Err(item),
+        };
+        if sent.is_err() {
+            self.counts.taken(size);
+        }
+        sent
+    }
+}
+
+/// Answer for one durable frame, called once the app has finished with it. Dropped unanswered (the
+/// app is shutting down), it leaves the frame unhandled: a holder offers it again after a restart.
+pub type MeshDurableDone = Box<dyn FnOnce(MeshDurableOutcome) + Send>;
+
+/// Called for each durable (store-and-forward) frame addressed to us; like [`MeshWireCallback`],
+/// plus the answer. `None` in [`MeshCallbacks`]: `on_wire` handles durable frames too, and a frame
+/// counts as handled when it returns.
+pub type MeshDurableWireCallback = Arc<dyn Fn(MeshNodeAddress, Vec<u8>, MeshDurableDone) + Send + Sync>;
+
+/// Pauses before each new offer of a durable frame the app answered `Retry`; past the last one the
+/// frame is offered at that pause for as long as the network holds it ([`durable_retry_delay`]).
+const DURABLE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
+
+/// How long until a durable frame answered `Retry` for the `attempts`-th time is offered again;
+/// `None` — it is given up. Given up after the last pause, a frame the app could not take for eight
+/// minutes (no session to read it with yet) never reached it in this run: the network's marks said
+/// we had it, so no holder offered it again (blind audit 2026-11-11, M4). A frame the network no
+/// longer holds — gone by its TTL or a quota — is given up; the frames waiting are bounded by what
+/// the store holds and by `DurableInFlight`.
+fn durable_retry_delay(attempts: usize, still_held: bool) -> Option<Duration> {
+    match DURABLE_RETRY_DELAYS.get(attempts) {
+        Some(delay) => Some(*delay),
+        None if still_held => DURABLE_RETRY_DELAYS.last().copied(),
+        None => None,
+    }
+}
+
 /// Builds the app-level hello blob (a serialized `SessionHelloV1`) to send as
 /// the first reliable frame when a Link comes up, given the verified peer. The
 /// facade stays identity-agnostic — it only ships the bytes omni-app produces.
-pub type MeshHelloMaker = Arc<dyn Fn(MeshNodeAddress) -> Vec<u8> + Send + Sync>;
+/// The flag: we brought this link up (a dial of ours), not the peer. Empty — no
+/// hello to this peer on link-up.
+pub type MeshHelloMaker = Arc<dyn Fn(MeshNodeAddress, bool) -> Vec<u8> + Send + Sync>;
 
 /// Called when a peer becomes fully unreachable (its last mesh path was pruned), so
 /// the app can tear down stale session state (a stale verified-connection would
@@ -116,6 +231,9 @@ pub type MeshBulkStreamCallback = Arc<dyn Fn(MeshNodeAddress, BulkStream) + Send
 #[derive(Clone)]
 pub struct MeshCallbacks {
     pub on_wire: Option<MeshWireCallback>,
+    /// Optional: durable frames addressed to us, with an answer (see [`MeshDurableWireCallback`]).
+    /// Used only together with `on_wire`.
+    pub on_durable_wire: Option<MeshDurableWireCallback>,
     pub on_media: MeshMediaCallback,
     pub make_hello: Option<MeshHelloMaker>,
     /// Optional: fired when a peer's last mesh path drops (proactive teardown).
@@ -294,7 +412,12 @@ impl MeshConfig {
             signing_key_bytes,
             quic_bind: "127.0.0.1:0".parse().expect("valid loopback addr"),
             multicast_loopback: true,
-            multicast_iface: Ipv4Addr::UNSPECIFIED,
+            // The default route's adapter, not the OS's pick: left UNSPECIFIED, Windows joins the
+            // group on the 224.0.0.0/4 route with the lowest metric — a VPN adapter (Radmin, metric 1)
+            // that refuses the join (10065), and the mesh started without LAN multicast. Nor
+            // 127.0.0.1: Windows loops multicast back only through a real adapter (2026-10-27; the
+            // same finding as omni-network's `test_iface`, 2026-10-16). No network — loopback.
+            multicast_iface: detect_primary_lan_ipv4().unwrap_or(Ipv4Addr::LOCALHOST),
             advertise_ipv4: None,
             advertise_ipv6: None,
             announce_interval: DEFAULT_ANNOUNCE_INTERVAL,
@@ -429,6 +552,9 @@ pub struct MeshRuntime {
     configured_direct_tcp_port: Option<u16>,
     /// The port the direct-TCP door actually listens on this run (`None` = no door).
     direct_tcp_port: Option<u16>,
+    /// The TCP hole punch: our door's external address and the running windows.
+    /// See docs/decisions/tcp-hole-punch.md.
+    tcp_punch: Arc<tcp_punch::TcpPunchState>,
     /// R1a connection-quality ladder — the relay TLS-over-TCP bridge endpoint we bound a dual TCP
     /// carrier for (`Some` only in dual-carrier Auto). The autoconnect dials THIS relay over both
     /// carriers (`dial_relay_dual_carrier`); other registry relays stay single-carrier UDP. See
@@ -454,8 +580,17 @@ pub struct MeshRuntime {
 pub const CARRIER_SWITCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Durable store-and-forward TTL for a 1:1 message: held this long for an offline
-/// recipient before GC. Generous so non-overlapping online windows still bridge.
+/// recipient before GC, counted from the send. Generous so non-overlapping online windows still
+/// bridge.
 const DURABLE_TTL_SECS: u32 = 7 * 24 * 60 * 60;
+
+/// Seconds since the unix epoch: the send time a durable frame carries.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Upper bound on one reliable send (`send_wire` / `send_durable`). A QUIC uni-stream open can
 /// park INDEFINITELY when the peer's MAX_STREAMS credit updates can't reach us (asymmetric mobile
@@ -468,22 +603,20 @@ const RELIABLE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// UPnP port-mapping lease (seconds); refreshed at ~80% so the mapping never lapses.
 const MESH_UPNP_LEASE_SECS: u32 = 60 * 60;
 
-/// Whether an IPv4 is genuinely internet-routable — so a UPnP mapping's external address
-/// is worth advertising. A private/CGNAT external means inbound from the internet is still
-/// blocked by an upstream NAT, so the mapping doesn't help a remote peer reach us.
-fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_documentation()
-        || ip.is_broadcast()
-        || o[0] == 0
-        || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000) // 100.64.0.0/10 CGNAT
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-        || (o[0] == 198 && (o[1] & 0xfe) == 18)
-        || (o[0] & 240 == 240))
+/// Why the router did or did not give us a port: stderr for the headless harness, `trace.log`
+/// (`net/port-map`) for the app, which has no stderr. Stand 2026-11-08: neither side got a TCP door,
+/// the trace said only `mapped_tcp=None`, and the reason — no gateway, a refused mapping, a non-public
+/// external address — was lost. See docs/bugs/contact-request-said-sent-without-a-link.md.
+fn port_map_trace(message: &str) {
+    eprintln!("[omni-upnp] {message}");
+    omni_net_primitives::trace_line("net/port-map", message);
+}
+
+/// The TCP front door's own listener (bind, adopt, end): same two sinks as [`port_map_trace`],
+/// `net/tcp-door` in the trace. A door that never bound has no port for the router to map.
+fn tcp_door_trace(message: &str) {
+    eprintln!("[omni-mesh] {message}");
+    omni_net_primitives::trace_line("net/tcp-door", message);
 }
 
 /// Best-effort: ask the local router (UPnP-IGD) to forward a UDP port to our mesh QUIC
@@ -507,7 +640,7 @@ async fn map_upnp(
     let gateway = match igd_next::aio::tokio::search_gateway(options).await {
         Ok(gateway) => gateway,
         Err(error) => {
-            eprintln!("[omni-upnp] {protocol:?}: no IGD gateway on {lan_ip} ({error})");
+            port_map_trace(&format!("{protocol:?}: no IGD gateway on {lan_ip} ({error})"));
             return None;
         }
     };
@@ -525,7 +658,7 @@ async fn map_upnp(
         Ok(()) => match gateway.get_external_ip().await {
             Ok(ip) => SocketAddr::new(ip, internal_port),
             Err(error) => {
-                eprintln!("[omni-upnp] {protocol:?}: mapped {internal_port} but get_external_ip failed ({error})");
+                port_map_trace(&format!("{protocol:?}: mapped {internal_port} but get_external_ip failed ({error})"));
                 return None;
             }
         },
@@ -534,22 +667,24 @@ async fn map_upnp(
             .await
         {
             Ok(external) => {
-                eprintln!("[omni-upnp] {protocol:?}: fixed-port add_port({internal_port}) rejected ({add_error}); router chose {external} (may rotate)");
+                port_map_trace(&format!("{protocol:?}: fixed-port add_port({internal_port}) rejected ({add_error}); router chose {external} (may rotate)"));
                 external
             }
             Err(error) => {
-                eprintln!("[omni-upnp] {protocol:?}: AddPortMapping+AddAnyPortMapping both failed ({error})");
+                port_map_trace(&format!("{protocol:?}: AddPortMapping+AddAnyPortMapping both failed ({error})"));
                 return None;
             }
         },
     };
     match external.ip() {
-        IpAddr::V4(ip) if is_public_ipv4(ip) => {
-            eprintln!("[omni-upnp] {protocol:?}: mapped {lan_ip}:{internal_port} -> {external} (public)");
+        // A private/CGNAT external means inbound from the internet is still blocked by an upstream
+        // NAT: the mapping would not help a remote peer reach us.
+        ip @ IpAddr::V4(_) if omni_net_primitives::is_public_ip(ip) => {
+            port_map_trace(&format!("{protocol:?}: mapped {lan_ip}:{internal_port} -> {external} (public)"));
             Some(external)
         }
         other => {
-            eprintln!("[omni-upnp] {protocol:?}: external {other} is not internet-public (CGNAT) — withheld");
+            port_map_trace(&format!("{protocol:?}: external {other} is not internet-public (CGNAT) — withheld"));
             None
         }
     }
@@ -560,6 +695,10 @@ async fn map_upnp(
 /// security setups with UPnP off), so trying it as a fallback reaches more home routers —
 /// the same "any reachable path" approach a torrent client takes. The UDP exchange +
 /// gateway discovery are in `map_nat_pmp_udp`. Encoding is fixed-width + big-endian.
+mod bulk_guard;
+mod tcp_punch;
+pub use tcp_punch::{tcp_punch_epoch, tcp_punch_role, TcpPunchRole, TcpPunchStart, TCP_PUNCH_EPOCH_SECS};
+
 mod nat_pmp {
     use std::net::Ipv4Addr;
 
@@ -690,24 +829,50 @@ async fn map_nat_pmp(
     internal_port: u16,
     protocol: igd_next::PortMappingProtocol,
 ) -> Option<SocketAddr> {
+    match try_map_nat_pmp(lan_ip, gateway, internal_port, protocol).await {
+        Ok(external) => {
+            port_map_trace(&format!(
+                "{protocol:?}: NAT-PMP mapped {lan_ip}:{internal_port} -> {external} (public)"
+            ));
+            Some(external)
+        }
+        Err(reason) => {
+            port_map_trace(&format!("{protocol:?}: NAT-PMP via {gateway}: {reason}"));
+            None
+        }
+    }
+}
+
+/// [`map_nat_pmp`] with the step that failed named.
+async fn try_map_nat_pmp(
+    lan_ip: Ipv4Addr,
+    gateway: Ipv4Addr,
+    internal_port: u16,
+    protocol: igd_next::PortMappingProtocol,
+) -> Result<SocketAddr, String> {
     let socket = tokio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(lan_ip), 0))
         .await
-        .ok()?;
+        .map_err(|e| format!("bind on {lan_ip} failed ({e})"))?;
     socket
         .connect(SocketAddr::new(IpAddr::V4(gateway), nat_pmp::PORT))
         .await
-        .ok()?;
+        .map_err(|e| format!("connect failed ({e})"))?;
     let mut buf = [0u8; 32];
 
-    // 1. Learn our public IP (a non-NAT-PMP gateway never answers → timeout → None).
-    socket.send(&nat_pmp::external_address_request()).await.ok()?;
+    // 1. Learn our public IP (a non-NAT-PMP gateway never answers → timeout).
+    socket
+        .send(&nat_pmp::external_address_request())
+        .await
+        .map_err(|e| format!("send failed ({e})"))?;
     let n = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf))
         .await
-        .ok()?
-        .ok()?;
-    let external_ip = nat_pmp::parse_external_address_response(&buf[..n])?;
-    if !is_public_ipv4(external_ip) {
-        return None; // CGNAT external — the mapping wouldn't be reachable from the internet
+        .map_err(|_| "no answer in 2 s (no NAT-PMP on this gateway)".to_string())?
+        .map_err(|e| format!("recv failed ({e})"))?;
+    let external_ip = nat_pmp::parse_external_address_response(&buf[..n])
+        .ok_or_else(|| "unreadable external-address answer".to_string())?;
+    if !omni_net_primitives::is_public_ip(IpAddr::V4(external_ip)) {
+        // CGNAT external — the mapping wouldn't be reachable from the internet.
+        return Err(format!("external {external_ip} is not internet-public (CGNAT) — withheld"));
     }
 
     // 2. Map the port for the requested protocol (suggest the same external port; lifetime = the
@@ -722,13 +887,17 @@ async fn map_nat_pmp(
             nat_pmp::OP_MAP_UDP,
         ),
     };
-    socket.send(&request).await.ok()?;
+    socket
+        .send(&request)
+        .await
+        .map_err(|e| format!("map send failed ({e})"))?;
     let n = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf))
         .await
-        .ok()?
-        .ok()?;
-    let external_port = nat_pmp::parse_map_response(&buf[..n], op, internal_port)?;
-    Some(SocketAddr::new(IpAddr::V4(external_ip), external_port))
+        .map_err(|_| "no answer to the map request in 2 s".to_string())?
+        .map_err(|e| format!("map recv failed ({e})"))?;
+    let external_port = nat_pmp::parse_map_response(&buf[..n], op, internal_port)
+        .ok_or_else(|| "mapping refused or unreadable answer".to_string())?;
+    Ok(SocketAddr::new(IpAddr::V4(external_ip), external_port))
 }
 
 /// This host's primary LAN IPv4 — the source address the OS would use to reach the internet RIGHT NOW.
@@ -796,6 +965,12 @@ fn build_advertised_addresses(
     quic_addr: SocketAddr,
     mapped_external: Option<SocketAddr>,
 ) -> Vec<SocketAddr> {
+    // A socket bound to loopback is reached at loopback only: the LAN address the route names is
+    // nobody's there, and the peer's dial to it fails («no reachable address» — two same-host
+    // instances, 2026-10-27).
+    if quic_addr.ip().is_loopback() {
+        return vec![quic_addr];
+    }
     let mut addrs = Vec::new();
     if let Some(v4) = advertise_ipv4 {
         addrs.push(SocketAddr::new(IpAddr::V4(v4), port));
@@ -832,22 +1007,46 @@ impl MeshRuntime {
         // which drives the timeout itself — no worker is ever blocked. A single serial executor
         // preserves frame order and matches the app's own session-lock serialization. See
         // docs/bugs/relay-less-mobile-transport-findings.md §RESOLVED.
+        //
+        // A durable frame carries its answer (`MeshDurableDone`), given once the app has actually
+        // handled it: marking it at the enqueue said "handled" for a frame still waiting in a queue,
+        // and a holder that drops what our high-water covers would lose it on a crash or a sign-out.
+        // The app's `on_durable_wire` may queue the frame further (its own receive dispatcher) and
+        // answer from there; without one, `on_wire` returning is the answer.
+        let mut durable_on_wire: Option<MeshDurableWireCallback> = None;
         if let Some(real_on_wire) = callbacks.on_wire.take() {
-            let (tx, rx) = std::sync::mpsc::channel::<(MeshNodeAddress, Vec<u8>)>();
+            let real_on_durable_wire = callbacks.on_durable_wire.take();
+            let (queue, rx) = OnWireQueue::new();
+            // Only the counts go to the thread, not a sender: holding one, its channel never closed
+            // and the thread — with the app's handler and its open database — outlived the runtime.
+            let taken = queue.counts();
             std::thread::Builder::new()
                 .name("omni-on-wire".to_string())
                 .spawn(move || {
-                    while let Ok((peer, bytes)) = rx.recv() {
-                        real_on_wire(peer, bytes);
+                    while let Ok((peer, bytes, done)) = rx.recv() {
+                        taken.taken(bytes.len());
+                        match (done, real_on_durable_wire.as_ref()) {
+                            (None, _) => real_on_wire(peer, bytes),
+                            (Some(done), Some(on_durable_wire)) => on_durable_wire(peer, bytes, done),
+                            (Some(done), None) => {
+                                real_on_wire(peer, bytes);
+                                done(MeshDurableOutcome::Handled);
+                            }
+                        }
                     }
                 })
                 .map_err(|e| MeshRuntimeError::Runtime(format!("on_wire executor: {e}")))?;
-            let tx = std::sync::Mutex::new(tx);
+            let durable_queue = queue.clone();
             callbacks.on_wire = Some(Arc::new(move |peer, bytes| {
-                // Fire-and-forget enqueue — never blocks the caller (safe on a tokio worker). A send
-                // error means the executor thread is gone (runtime shutting down); drop the frame.
-                if let Ok(tx) = tx.lock() {
-                    let _ = tx.send((peer, bytes));
+                // Fire-and-forget enqueue — never blocks the caller (safe on a tokio worker). Past
+                // the queue's budget the frame is dropped: its sender retries until it is answered.
+                let _ = queue.push((peer, bytes, None));
+            }));
+            durable_on_wire = Some(Arc::new(move |peer, bytes, done| {
+                // Past the budget a durable frame is answered «retry»: its holder keeps it and offers
+                // it again.
+                if let Err((_, _, Some(done))) = durable_queue.push((peer, bytes, Some(done))) {
+                    done(MeshDurableOutcome::Retry);
                 }
             }));
         }
@@ -1001,16 +1200,14 @@ impl MeshRuntime {
             .direct_tcp_bind_port
             .or(config.preferred_direct_tcp_port)
             .filter(|port| *port != 0);
+        // Bound for port reuse: the TCP hole punch sends from this same port (tcp-hole-punch.md).
+        let bind_door = omni_net_primitives::tcp_punch::bind_door_listener;
         let direct_tcp_listener = match wanted_door_port {
-            Some(port) => {
-                std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).or_else(|e| {
-                    eprintln!(
-                        "[omni-mesh] direct-tcp port {port} unavailable ({e}); using ephemeral"
-                    );
-                    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
-                })
-            }
-            None => std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+            Some(port) => bind_door(port).or_else(|e| {
+                tcp_door_trace(&format!("direct-tcp port {port} unavailable ({e}); using ephemeral"));
+                bind_door(0)
+            }),
+            None => bind_door(0),
         };
         let direct_tcp_internal: Option<u16> =
             match direct_tcp_listener {
@@ -1033,11 +1230,11 @@ impl MeshRuntime {
                                     )
                                     .await
                                     {
-                                        eprintln!("[omni-mesh] direct-tcp front door ended: {e}");
+                                        tcp_door_trace(&format!("direct-tcp front door ended: {e}"));
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("[omni-mesh] direct-tcp listener adopt failed: {e}")
+                                    tcp_door_trace(&format!("direct-tcp listener adopt failed: {e}"))
                                 }
                             }
                         }));
@@ -1045,10 +1242,21 @@ impl MeshRuntime {
                     port
                 }
                 Err(e) => {
-                    eprintln!("[omni-mesh] direct-tcp bind failed: {e}");
+                    tcp_door_trace(&format!("direct-tcp bind failed: {e}"));
                     None
                 }
             };
+        // The TCP hole punch learns the door's external address (STUN over TCP from the door's port).
+        // A relay server is reachable already and punches nobody.
+        let tcp_punch = Arc::new(tcp_punch::TcpPunchState::default());
+        if let (Some(door_port), false) = (direct_tcp_internal, is_relay_server) {
+            background.push(runtime.spawn(tcp_punch::keep_own_address(
+                Arc::clone(&network),
+                Arc::clone(&tcp_punch),
+                door_port,
+                announce_interval,
+            )));
+        }
         // Peers on our LAN learn the door from our announces: without UPnP it is in no beacon.
         network.set_door_port(direct_tcp_internal.unwrap_or(0));
 
@@ -1099,6 +1307,12 @@ impl MeshRuntime {
                     let lease_due = last_mapped.elapsed()
                         >= Duration::from_secs(MESH_UPNP_LEASE_SECS as u64 * 4 / 5);
                     if lan != last_lan || lease_due {
+                        if lan.is_none() {
+                            port_map_trace("no LAN IPv4 (no route, or a mobile/CGNAT link) — nothing to map");
+                        }
+                        if tcp_internal.is_none() {
+                            port_map_trace("TCP: the front door has no listening port — nothing to map");
+                        }
                         let external = match lan {
                             // Prefer UPnP-IGD; fall back to NAT-PMP so a router with EITHER is reached.
                             // The gateway is re-detected here too (it changes on roaming).
@@ -1107,8 +1321,11 @@ impl MeshRuntime {
                                     map_upnp(ip, internal_port, igd_next::PortMappingProtocol::UDP)
                                         .await;
                                 if e.is_none() {
-                                    if let Some(gw) = detect_default_gateway_ipv4() {
-                                        e = map_nat_pmp(ip, gw, internal_port, igd_next::PortMappingProtocol::UDP).await;
+                                    match detect_default_gateway_ipv4() {
+                                        Some(gw) => {
+                                            e = map_nat_pmp(ip, gw, internal_port, igd_next::PortMappingProtocol::UDP).await;
+                                        }
+                                        None => port_map_trace("UDP: no default IPv4 gateway — NAT-PMP not tried"),
                                     }
                                 }
                                 e
@@ -1125,14 +1342,17 @@ impl MeshRuntime {
                                 let mut e =
                                     map_upnp(ip, tport, igd_next::PortMappingProtocol::TCP).await;
                                 if e.is_none() {
-                                    if let Some(gw) = detect_default_gateway_ipv4() {
-                                        e = map_nat_pmp(
-                                            ip,
-                                            gw,
-                                            tport,
-                                            igd_next::PortMappingProtocol::TCP,
-                                        )
-                                        .await;
+                                    match detect_default_gateway_ipv4() {
+                                        Some(gw) => {
+                                            e = map_nat_pmp(
+                                                ip,
+                                                gw,
+                                                tport,
+                                                igd_next::PortMappingProtocol::TCP,
+                                            )
+                                            .await;
+                                        }
+                                        None => port_map_trace("TCP: no default IPv4 gateway — NAT-PMP not tried"),
                                     }
                                 }
                                 e
@@ -1266,7 +1486,7 @@ impl MeshRuntime {
             let callbacks = callbacks.clone();
             background.push(runtime.spawn(async move {
                 while let Some(link) = net.accept().await {
-                    register_link(link, &links, &callbacks);
+                    register_link(link, &links, &callbacks, false);
                 }
             }));
         }
@@ -1277,7 +1497,7 @@ impl MeshRuntime {
         // handled identically. P4 offline delivery. (A frame from a peer we have no
         // mesh session/ctx for is dropped by on_wire today — true never-linked
         // offline delivery needs the ctx-from-durable step, see
-        // docs/notes/durable-1to1-integration-plan.md variant (b).)
+        // docs/decisions/mesh-durable-delivery.md, variant (b).)
         let on_wire = callbacks.on_wire.clone();
         let on_peer_down = callbacks.on_peer_down.clone();
         // Bulk plane pump (attachment transfer): hand each inbound stream to the app on its OWN OS
@@ -1286,12 +1506,24 @@ impl MeshRuntime {
         // tokio workers because that read is synchronous and can run for gigabytes.
         if let Some(on_bulk_stream) = callbacks.on_bulk_stream.clone() {
             let net = Arc::clone(&network);
+            let workers = Arc::new(bulk_guard::BulkWorkers::default());
+            let timers = runtime.handle().clone();
             background.push(runtime.spawn(async move {
                 while let Ok((peer, stream)) = net.recv_bulk_stream().await {
+                    // Capped, and every read bounded: see `bulk_guard`. Over the cap the stream is
+                    // dropped (closed) — the sender retries.
+                    let Some(slot) = workers.take(peer) else {
+                        omni_network::diag_trace("bulk-pump/over-cap", &format!("peer={peer:?} stream dropped"));
+                        continue;
+                    };
+                    let stream = bulk_guard::bound_bulk_stream(stream, &timers);
                     let on_bulk_stream = Arc::clone(&on_bulk_stream);
                     if let Err(error) = std::thread::Builder::new()
                         .name("omni-bulk-in".to_string())
-                        .spawn(move || on_bulk_stream(peer, stream))
+                        .spawn(move || {
+                            let _slot = slot;
+                            on_bulk_stream(peer, stream)
+                        })
                     {
                         omni_network::diag_trace(
                             "bulk-pump/spawn-fail",
@@ -1311,28 +1543,72 @@ impl MeshRuntime {
         {
             let net = Arc::clone(&network);
             let links_for_down = Arc::clone(&links);
+            // Durable frames the app answered `Retry`: (offer again at, attempts so far, frame).
+            // A frame stays counted as on its way through the app (`DurableInFlight`) while it waits
+            // here to be offered again: the network takes no more in for the app past its limit, so
+            // what waits here is bounded too (blind audit 2026-11-11, L1).
+            type DurableRetry = (std::time::Instant, usize, omni_network::DurableDataFrame, omni_network::DurableInFlight);
+            let durable_retries: Arc<Mutex<Vec<DurableRetry>>> = Arc::new(Mutex::new(Vec::new()));
             background.push(runtime.spawn(async move {
                 loop {
-                    if let Some(on_wire) = on_wire.as_ref() {
-                        while let Some(frame) = net.try_recv_durable() {
+                    if let Some(on_wire) = durable_on_wire.as_ref() {
+                        let due: Vec<(usize, omni_network::DurableDataFrame, omni_network::DurableInFlight)> = {
+                            let mut retries = durable_retries.lock();
+                            let now = std::time::Instant::now();
+                            let (due, later) = retries.drain(..).partition(|(at, _, _, _)| *at <= now);
+                            *retries = later;
+                            due.into_iter().map(|(_, attempts, frame, in_flight)| (attempts, frame, in_flight)).collect()
+                        };
+                        let fresh = std::iter::from_fn(|| net.try_recv_durable_in_flight()).map(|(frame, in_flight)| (0, frame, in_flight));
+                        for (attempts, frame, in_flight) in due.into_iter().chain(fresh) {
                             // Same bracket as the wire pump's — tells the two on_wire lanes apart
                             // (a hang here stalls durable delivery; a hang there stalls live).
                             omni_network::diag_trace(
                                 "durable-pump/frame",
                                 &format!(
-                                    "from={:?} tid={:?}",
+                                    "from={:?} attempt={attempts} tid={:?}",
                                     frame.from,
                                     std::thread::current().id()
                                 ),
                             );
-                            let (feed, seq) = (frame.feed_id, frame.seq);
-                            on_wire(frame.from, frame.ciphertext);
-                            // Handled: from now on it is persisted, so our high-water survives a
-                            // restart and holders stop re-offering it.
-                            net.note_durable_handled(feed, seq);
+                            let (from, ciphertext) = (frame.from, frame.ciphertext.clone());
+                            // Handled once the app says so: from then on it is persisted, so our
+                            // high-water survives a restart and holders stop re-offering it (and
+                            // may drop their copy). A frame to try again waits in `durable_retries`.
+                            let handled_net = Arc::clone(&net);
+                            let retries = Arc::clone(&durable_retries);
+                            on_wire(
+                                from,
+                                ciphertext,
+                                Box::new(move |outcome| match outcome {
+                                    MeshDurableOutcome::Handled => {
+                                        handled_net.note_durable_handled(frame.feed_id, frame.seq);
+                                        // Its group moved on: what waited for that goes in again.
+                                        handled_net.redeliver_given_up_to(&frame.to);
+                                    }
+                                    outcome @ (MeshDurableOutcome::Retry | MeshDurableOutcome::RetryAWhile) => match durable_retry_delay(
+                                        attempts,
+                                        outcome == MeshDurableOutcome::Retry
+                                            && handled_net.holds_durable_frame(&frame.feed_id, frame.seq),
+                                    ) {
+                                        Some(delay) => {
+                                            retries.lock().push((std::time::Instant::now() + delay, attempts.saturating_add(1), frame, in_flight))
+                                        }
+                                        None => {
+                                            if outcome == MeshDurableOutcome::RetryAWhile {
+                                                handled_net.note_durable_given_up(frame.feed_id, frame.seq);
+                                            }
+                                            omni_network::diag_trace(
+                                                "durable-pump/frame-left-unhandled",
+                                                &format!("from={:?} seq={} attempts={attempts}", frame.from, frame.seq),
+                                            )
+                                        }
+                                    },
+                                }),
+                            );
                             omni_network::diag_trace(
-                                "durable-pump/frame-done",
-                                &format!("from={:?}", frame.from),
+                                "durable-pump/frame-queued",
+                                &format!("from={from:?}"),
                             );
                         }
                     }
@@ -1402,6 +1678,7 @@ impl MeshRuntime {
             mapped_tcp_external,
             configured_direct_tcp_port: config.direct_tcp_bind_port,
             direct_tcp_port: direct_tcp_internal,
+            tcp_punch,
             dual_carrier_relay_tcp,
             relay_tcp_endpoint: if is_relay_server { None } else { config.relay_tcp_endpoint },
             dht_proxy_advertised: std::sync::atomic::AtomicBool::new(dht_proxy_advertised),
@@ -1493,6 +1770,24 @@ impl MeshRuntime {
         self.runtime.spawn(async move { network.keep_direct_only_with(allowed).await });
     }
 
+    /// Hold no direct link with `refused` (blocked contacts' nodes), whatever else allows it: theirs
+    /// is closed now and their dial refused. Only a change is applied, so the app hands the whole set
+    /// every tick. See omni-network `Network::refuse_direct_with`.
+    pub fn refuse_direct_links_with(&self, refused: std::collections::HashSet<MeshNodeAddress>) {
+        if self.network.refuses_direct_with_exactly(&refused) {
+            return;
+        }
+        // Applied before this returns: spawned, a block reported done while the blocked contact's
+        // link was still up (blind audit 2026-11-11, G7). `run_blocking` is safe from any thread.
+        let network = Arc::clone(&self.network);
+        self.run_blocking(async move { network.refuse_direct_with(refused).await });
+    }
+
+    /// Whether the nodes we hold no direct link with are exactly `refused`.
+    pub fn refuses_direct_links_with_exactly(&self, refused: &std::collections::HashSet<MeshNodeAddress>) -> bool {
+        self.network.refuses_direct_with_exactly(refused)
+    }
+
     /// Whether the relay→direct upgrade is currently permitted. The rendezvous dial worker reads this
     /// live so a `RelayOnly` profile skips the direct-dial leg (UDP-direct + TCP-direct), keeping the
     /// "one setting gates both carriers" invariant of follow-up d. See tcp-direct-peer-fallback.md.
@@ -1544,6 +1839,64 @@ impl MeshRuntime {
 
     pub fn allows_direct_punch(&self) -> bool {
         self.network.allows_direct_punch()
+    }
+
+    /// Our door's external TCP address for the TCP hole punch — to publish in the beacon's
+    /// `tcp_punch` — when two STUN servers saw exactly the same public address from the door's port.
+    /// `None` without a door, on a QUIC-only carrier, or when direct links are off. Outside a punch
+    /// window a remapped port of the same IP is not given out (`TcpPunchState::address_to_publish`:
+    /// it would make every sweep a courier publication). See docs/decisions/tcp-hole-punch.md.
+    pub fn tcp_punch_endpoint(&self) -> Option<SocketAddr> {
+        if !self.network.allows_direct_punch() || self.network.carrier_preference() == CarrierPreference::Quic {
+            return None;
+        }
+        self.direct_tcp_port.and(self.tcp_punch.address_to_publish())
+    }
+
+    /// How many times our punch address has been asked so far — a caller that just started a window
+    /// waits for this to move to know the address it then reads is the NAT's current one.
+    pub fn tcp_punch_probes(&self) -> u64 {
+        self.tcp_punch.probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a punch window towards `peer` is running (it ends on its own, or when the peer links).
+    pub fn tcp_punch_window_open(&self, peer: &MeshNodeAddress) -> bool {
+        self.tcp_punch.window_open(peer)
+    }
+
+    /// Punch a TCP path to `peer`, whose beacon published `punch`: start a window in the background,
+    /// or extend the running one. Never waits — the window runs on the mesh runtime and links the peer
+    /// by itself (`on_link_up`). Both sides call this when they open each other's beacon; the roles
+    /// come out opposite without an exchange (`tcp_punch_role`). See docs/decisions/tcp-hole-punch.md.
+    pub fn start_tcp_punch(&self, peer: MeshNodeAddress, punch: SocketAddr) -> TcpPunchStart {
+        let Some(door_port) = self.direct_tcp_port else {
+            return TcpPunchStart::NoDoor;
+        };
+        if !self.network.allows_direct_punch() || self.network.carrier_preference() == CarrierPreference::Quic {
+            return TcpPunchStart::NotAllowed;
+        }
+        if self.tcp_punch.own_address.lock().is_none() {
+            return TcpPunchStart::NoOwnAddress;
+        }
+        if self.links.lock().contains_key(&peer)
+            && matches!(self.network.peer_link_quality(&peer), Some(MeshLinkQuality::Direct))
+        {
+            return TcpPunchStart::AlreadyLinked;
+        }
+        if !self.tcp_punch.open_window(peer, punch) {
+            return TcpPunchStart::Extended;
+        }
+        let window = tcp_punch::TcpPunchWindow {
+            network: Arc::clone(&self.network),
+            links: Arc::clone(&self.links),
+            callbacks: self.callbacks.clone(),
+            state: Arc::clone(&self.tcp_punch),
+            door_port,
+            local: self.local_address,
+            peer,
+        };
+        self.runtime.spawn(window.run());
+        TcpPunchStart::Started
     }
 
     /// Our advertised native-global-IPv6 endpoint (else None). Directly dialable with no NAT — carried
@@ -1686,6 +2039,12 @@ impl MeshRuntime {
         self.network.consent_to_relay_for(peer);
     }
 
+    /// Name every node we carry traffic for, the whole set each time. See omni-network
+    /// `Network::set_relay_consents`.
+    pub fn set_relay_consents(&self, peers: std::collections::HashSet<MeshNodeAddress>) {
+        self.network.set_relay_consents(peers);
+    }
+
     /// Withdraw a prior [`consent_to_relay_for`](Self::consent_to_relay_for) — effective immediately.
     pub fn revoke_relay_consent(&self, peer: &MeshNodeAddress) {
         self.network.revoke_relay_consent(peer);
@@ -1760,7 +2119,7 @@ impl MeshRuntime {
                 .dial(peer)
                 .await
                 .map_err(|e| MeshRuntimeError::Dial(e.to_string()))?;
-            register_link(link, &links, &callbacks);
+            register_link(link, &links, &callbacks, true);
             Ok(())
         })
     }
@@ -1805,13 +2164,13 @@ impl MeshRuntime {
         self.run_blocking(async move { net.route_peer_over_door(&peer, door).await })
     }
 
-    /// Our reflexive address from public STUN, asked from the mesh's own QUIC socket — the mapping a
+    /// What public STUN says about our address, asked from the mesh's own QUIC socket — the mapping a
     /// peer's dial reaches (a query from any other socket describes a port nobody listens on). All
     /// servers are asked at once; bounded by one `timeout`. See `omni_network::stun_socket`.
-    pub fn stun_reflexive(&self) -> Option<omni_network::stun_socket::Reflexive> {
+    pub fn stun_probe(&self) -> Option<omni_network::stun_socket::StunProbe> {
         let net = Arc::clone(&self.network);
         self.run_blocking(async move {
-            net.stun_reflexive(
+            net.stun_probe(
                 omni_network::stun_socket::DEFAULT_STUN_SERVERS,
                 std::time::Duration::from_secs(3),
             )
@@ -1975,7 +2334,7 @@ impl MeshRuntime {
                 .dial_over_door(peer, door)
                 .await
                 .map_err(|e| MeshRuntimeError::Dial(e.to_string()))?;
-            register_link(link, &links, &callbacks);
+            register_link(link, &links, &callbacks, true);
             Ok(true)
         })
     }
@@ -2038,7 +2397,7 @@ impl MeshRuntime {
                     .dial_over_carrier(relay, &tcp_endpoint.to_string(), MeshInterfaceKind::QuicOverTcp)
                     .await
                     .map_err(|e| MeshRuntimeError::Dial(e.to_string()))?;
-                register_link(link, &links, &callbacks);
+                register_link(link, &links, &callbacks, true);
                 Ok::<_, MeshRuntimeError>(())
             });
             // No TCP base → the relay over UDP, the single-carrier way. Returning the TCP error here
@@ -2145,10 +2504,18 @@ impl MeshRuntime {
             .get(&peer)
             .cloned()
             .ok_or(MeshRuntimeError::NoLink)?;
+        let timers = self.runtime.handle().clone();
+        // Bounded as an inbound one is: a holder that kept the connection and never answered held
+        // the fetch — and every other source behind it — for good (blind audit 2026-11-12, pass 15).
+        // The opening too: a peer that gave no stream credit (or never took the preface) held it
+        // before the bounds above applied (pass 16).
         self.run_blocking(async move {
-            link.open_bulk_stream()
-                .await
-                .map_err(|e| MeshRuntimeError::Send(e.to_string()))
+            match tokio::time::timeout(bulk_guard::BULK_READ_IDLE_LIMIT, link.open_bulk_stream()).await {
+                Ok(opened) => opened
+                    .map(|stream| bulk_guard::bound_bulk_stream(stream, &timers))
+                    .map_err(|e| MeshRuntimeError::Send(e.to_string())),
+                Err(_) => Err(MeshRuntimeError::Send(format!("the peer gave no bulk stream within {:?}", bulk_guard::BULK_READ_IDLE_LIMIT))),
+            }
         })
     }
 
@@ -2187,9 +2554,7 @@ impl MeshRuntime {
         seq: u64,
     ) -> Result<(), MeshRuntimeError> {
         let from = self.local_address;
-        let mut feed_id = [0u8; 16];
-        feed_id[..8].copy_from_slice(&from.as_bytes()[..8]);
-        feed_id[8..].copy_from_slice(&to.as_bytes()[..8]);
+        let feed_id = omni_network::direct_feed_id(&from, &to);
         let msg_id = u64::from_le_bytes(feed_id[8..16].try_into().expect("8 bytes")) ^ seq;
         let frame = DurableDataFrame {
             to,
@@ -2198,8 +2563,9 @@ impl MeshRuntime {
             seq,
             msg_id,
             ttl_secs: DURABLE_TTL_SECS,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: ciphertext.to_vec(),
-            signature: Vec::new(),
+            signature: Vec::new(), // signed by `Network::send_durable`
         };
         let network = Arc::clone(&self.network);
         self.run_blocking(async move {
@@ -2259,6 +2625,12 @@ impl MeshRuntime {
         self.network.peer_on_door(peer)
     }
 
+    /// Whether `peer`'s best path rides a TCP door either way — our tunnel into its door, or its
+    /// connection into ours. The honest carrier label for both ends (`Network::peer_through_a_door`).
+    pub fn peer_through_a_door(&self, peer: &MeshNodeAddress) -> bool {
+        self.network.peer_through_a_door(peer)
+    }
+
     /// This node's AutoNAT reachability verdict (Unknown / Reachable / Unreachable):
     /// whether a fresh peer can dial us directly. Feeds the node-state ("online &
     /// reachable" vs "online, behind NAT") of the honest connection-state surface.
@@ -2281,9 +2653,15 @@ impl MeshRuntime {
         self.network.snapshot_peer_book()
     }
 
-    /// Re-export of the per-(group, sender) feed-id derivation for the app.
-    pub fn group_feed_id_for(domain: &str, group_id: &str, sender_pub: &str) -> [u8; 16] {
-        omni_network::group_feed_id(domain, group_id, sender_pub)
+    /// The per-(group, sender node) feed id for the app (see `omni_network::FeedId`): our feed in
+    /// the group, under the node this profile runs as.
+    pub fn group_feed_id_for(
+        domain: &str,
+        group_id: &str,
+        sender_pub: &str,
+        sender_node: &MeshNodeAddress,
+    ) -> [u8; 16] {
+        omni_network::group_feed_id(domain, group_id, sender_pub, sender_node)
     }
 
     /// Subscribe to a group's synthetic mesh destination (G3): inbound durable
@@ -2291,6 +2669,12 @@ impl MeshRuntime {
     /// newly stored frame is gossip-pushed once to `members` with live paths.
     /// Call BEFORE `import_durable_rows` at start so persisted group frames
     /// re-deliver. Re-subscribing replaces the member push set.
+    /// The nodes trusted to carry our 1:1 frames: our own devices and our contacts'. See
+    /// omni-network `Network::set_durable_carriers`.
+    pub fn set_durable_carriers(&self, carriers: std::collections::HashSet<MeshNodeAddress>) {
+        self.network.set_durable_carriers(carriers);
+    }
+
     pub fn subscribe_group_destination(
         &self,
         group_id: &str,
@@ -2323,8 +2707,9 @@ impl MeshRuntime {
             seq,
             msg_id: omni_network::group_msg_id(&feed_id, seq),
             ttl_secs: DURABLE_TTL_SECS,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: ciphertext.to_vec(),
-            signature: Vec::new(),
+            signature: Vec::new(), // signed by `Network::send_durable`
         };
         let network = Arc::clone(&self.network);
         self.run_blocking(async move {
@@ -2338,35 +2723,44 @@ impl MeshRuntime {
     }
 
     /// Snapshot the store-and-forward durable frames we hold for others, as
-    /// `(feed_id, seq, wire)` rows for the app to persist (omni-storage) so they
-    /// survive a restart. The runtime owns the wire encode/decode so omni-app
+    /// `(feed_id, seq, wire, handled)` rows for the app to persist (omni-storage) so
+    /// they survive a restart. The runtime owns the wire encode/decode so omni-app
     /// deals only with opaque bytes. P4 durable persistence.
-    pub fn export_durable_rows(&self) -> Vec<(Vec<u8>, i64, Vec<u8>)> {
+    pub fn export_durable_rows(&self) -> Vec<(Vec<u8>, i64, Vec<u8>, bool)> {
         self.network
             .export_durable()
             .into_iter()
             .map(|frame| {
                 let feed_id = frame.feed_id.to_vec();
                 let seq = frame.seq as i64;
+                let handled = self.network.durable_frame_handled(&frame.feed_id, frame.seq);
                 let wire = omni_network::NetworkFrame::DurableData(frame).encode_to_wire();
-                (feed_id, seq, wire)
+                (feed_id, seq, wire, handled)
             })
             .collect()
     }
 
-    /// Restore persisted durable-frame wire blobs into the store at startup.
-    /// Best-effort: an undecodable blob is skipped. P4 durable persistence.
-    pub fn import_durable_rows(&self, wires: Vec<Vec<u8>>) {
-        let frames = wires
+    /// Changes when `export_durable_rows` would give something else; costs no copy of a frame.
+    pub fn durable_export_marks(&self) -> u64 {
+        self.network.durable_export_marks()
+    }
+
+    /// Restore persisted durable-frame wire blobs and their handled marks into the store at
+    /// startup. Best-effort: an undecodable blob is skipped. P4 durable persistence.
+    pub fn import_durable_rows(&self, rows: Vec<(Vec<u8>, bool)>) {
+        let frames: Vec<(omni_network::DurableDataFrame, bool)> = rows
             .into_iter()
             .filter_map(
-                |wire| match omni_network::NetworkFrame::decode_from_wire(&wire) {
-                    Ok(omni_network::NetworkFrame::DurableData(frame)) => Some(frame),
+                |(wire, handled)| match omni_network::NetworkFrame::decode_from_wire(&wire) {
+                    Ok(omni_network::NetworkFrame::DurableData(frame)) => Some((frame, handled)),
                     _ => None,
                 },
             )
             .collect();
-        self.network.import_durable(frames);
+        self.network.restore_durable_handled(
+            frames.iter().filter(|(_, handled)| *handled).map(|(f, _)| (f.feed_id, f.seq)),
+        );
+        self.network.import_durable(frames.into_iter().map(|(frame, _)| frame).collect());
     }
 
     /// Stop the dispatcher + background loops. Drop completes teardown.
@@ -2427,11 +2821,11 @@ fn register_dialed_link(
             "the endpoints did not answer; the peer stays on its route".to_string(),
         ));
     }
-    register_link(link, links, callbacks);
+    register_link(link, links, callbacks, true);
     Ok(())
 }
 
-fn register_link(link: Link, links: &LinkMap, callbacks: &MeshCallbacks) {
+fn register_link(link: Link, links: &LinkMap, callbacks: &MeshCallbacks, dialed_by_us: bool) {
     let link = Arc::new(link);
     let peer = link.destination();
     links.lock().insert(peer, Arc::clone(&link));
@@ -2440,11 +2834,13 @@ fn register_link(link: Link, links: &LinkMap, callbacks: &MeshCallbacks) {
     // reliable frame (the peer reads it as the first `on_wire` frame). Done in
     // the async context here — never blocks the caller.
     if let Some(make_hello) = &callbacks.make_hello {
-        let hello = make_hello(peer);
-        let hello_link = Arc::clone(&link);
-        tokio::spawn(async move {
-            let _ = hello_link.send(&hello).await;
-        });
+        let hello = make_hello(peer, dialed_by_us);
+        if !hello.is_empty() {
+            let hello_link = Arc::clone(&link);
+            tokio::spawn(async move {
+                let _ = hello_link.send(&hello).await;
+            });
+        }
     }
 
     // Reliable wire plane (chat / call-control) — only pumped when a handler
@@ -2486,6 +2882,39 @@ mod tests {
     use rand_core::OsRng;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    /// Blind audit 2026-11-10: the queue to the app's single wire thread had no bound, so a peer
+    /// sending faster than the app handles filled the memory. Past its budget a frame is handed back
+    /// (a durable one is then answered «retry»), and room comes back as the thread takes frames.
+    #[test]
+    fn the_queue_to_the_wire_thread_takes_no_more_than_its_budget() {
+        let (queue, rx) = OnWireQueue::new();
+        let peer = MeshNodeAddress::from_bytes([1; 20]);
+        let frame = vec![0u8; 1024 * 1024];
+        let fits = ON_WIRE_QUEUE_BYTES_MAX / frame.len();
+        for _ in 0..fits {
+            assert!(queue.push((peer, frame.clone(), None)).is_ok());
+        }
+        assert!(queue.push((peer, frame.clone(), None)).is_err(), "past the byte budget");
+        let (_, taken, _) = rx.recv().unwrap();
+        queue.counts().taken(taken.len());
+        assert!(queue.push((peer, frame.clone(), None)).is_ok(), "a frame taken frees its room");
+        while let Ok((_, taken, _)) = rx.try_recv() {
+            queue.counts().taken(taken.len());
+        }
+        for _ in 0..ON_WIRE_QUEUE_FRAMES_MAX {
+            assert!(queue.push((peer, Vec::new(), None)).is_ok());
+        }
+        assert!(queue.push((peer, Vec::new(), None)).is_err(), "past the frame budget");
+
+        // The wire thread holds only the counts: once the queue goes, its channel closes and the
+        // thread ends (holding a sender, it never did, nor let go of the app's open database).
+        let counts = queue.counts();
+        drop(queue);
+        while rx.try_recv().is_ok() {}
+        assert!(rx.recv().is_err(), "the channel closes");
+        drop(counts);
+    }
 
     fn fresh_key_bytes() -> [u8; 32] {
         SigningKey::generate(&mut OsRng).to_bytes()
@@ -2671,25 +3100,10 @@ mod tests {
     }
 
     #[test]
-    fn is_public_ipv4_rejects_private_cgnat_and_loopback() {
-        // Worth advertising — genuinely internet-routable external addresses.
-        assert!(is_public_ipv4("8.8.8.8".parse().unwrap()));
-        assert!(is_public_ipv4("1.1.1.1".parse().unwrap()));
-        // Not worth advertising — inbound still blocked upstream / not routable.
-        assert!(!is_public_ipv4("192.168.1.10".parse().unwrap()), "private");
-        assert!(!is_public_ipv4("10.0.0.5".parse().unwrap()), "private");
-        assert!(!is_public_ipv4("100.64.0.1".parse().unwrap()), "CGNAT 100.64/10");
-        assert!(!is_public_ipv4("127.0.0.1".parse().unwrap()), "loopback");
-        assert!(!is_public_ipv4("169.254.1.1".parse().unwrap()), "link-local");
-        assert!(!is_public_ipv4("0.0.0.0".parse().unwrap()), "unspecified");
-        assert!(!is_public_ipv4("203.0.113.7".parse().unwrap()), "documentation");
-    }
-
-    #[test]
     fn build_advertised_addresses_decouples_advertise_from_bind() {
         let lan: Ipv4Addr = "192.168.0.12".parse().unwrap();
         let v6: Ipv6Addr = "2606:4700::1111".parse().unwrap();
-        let bind: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let bind: SocketAddr = "0.0.0.0:5000".parse().unwrap();
         let upnp: SocketAddr = "203.0.113.7:6000".parse().unwrap();
 
         // IPv4-only (proven path): advertise the LAN v4 at the bound port — NOT the bind
@@ -2711,10 +3125,17 @@ mod tests {
                 upnp,
             ],
         );
-        // Same-host / loopback (nothing to advertise): fall back to the bound addr, unchanged.
+        // Nothing to advertise: fall back to the bound addr, unchanged.
         assert_eq!(
             build_advertised_addresses(None, None, 4444, bind, None),
             vec![bind],
+        );
+        // Same-host (bound to loopback): only loopback reaches it — never the LAN address the route
+        // names, nor a mapping.
+        let loopback: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        assert_eq!(
+            build_advertised_addresses(Some(lan), Some(v6), 4444, loopback, Some(upnp)),
+            vec![loopback],
         );
     }
 
@@ -2773,10 +3194,11 @@ mod tests {
             on_wire: Some(Arc::new(move |peer, bytes| {
                 let _ = wire_tx.send((peer, bytes));
             })),
+            on_durable_wire: None,
             on_media: Arc::new(move |peer, bytes| {
                 let _ = media_tx.send((peer, bytes));
             }),
-            make_hello: Some(Arc::new(move |_peer| hello.clone())),
+            make_hello: Some(Arc::new(move |_peer, _| hello.clone())),
             on_peer_down: None,
             on_dht_proxy_request: None,
             on_dht_bootstrap_request: None,
@@ -2873,8 +3295,18 @@ mod tests {
 
         let alice_hello = b"mesh-hello-alice".to_vec();
         let bob_hello = b"mesh-hello-bob".to_vec();
-        let (alice_cb, alice_wire_rx, _alice_media_rx) = recording_callbacks(alice_hello.clone());
-        let (bob_cb, bob_wire_rx, bob_media_rx) = recording_callbacks(bob_hello.clone());
+        let (mut alice_cb, alice_wire_rx, _alice_media_rx) = recording_callbacks(alice_hello.clone());
+        let (mut bob_cb, bob_wire_rx, bob_media_rx) = recording_callbacks(bob_hello.clone());
+        // Who brought the link up reaches the hello maker: the app sends its hello unasked only on a
+        // link of its own or to a peer it knows.
+        let (flag_tx, flag_rx) = mpsc::channel::<(&'static str, bool)>();
+        for (callbacks, who, hello) in [(&mut alice_cb, "alice", alice_hello.clone()), (&mut bob_cb, "bob", bob_hello.clone())] {
+            let flag_tx = flag_tx.clone();
+            callbacks.make_hello = Some(Arc::new(move |_peer, dialed_by_us| {
+                let _ = flag_tx.send((who, dialed_by_us));
+                hello.clone()
+            }));
+        }
 
         let alice = MeshRuntime::start(MeshConfig::same_host(alice_key), alice_cb)
             .expect("alice mesh starts");
@@ -2887,15 +3319,19 @@ mod tests {
         // skip if no multicast adapter, mirroring omni-network's own tests).
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut dialed = false;
+        let mut last_error = None;
         while Instant::now() < deadline {
-            if alice.dial(bob_address).is_ok() {
-                dialed = true;
-                break;
+            match alice.dial(bob_address) {
+                Ok(()) => {
+                    dialed = true;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
             }
             std::thread::sleep(Duration::from_millis(150));
         }
         if !dialed {
-            eprintln!("SKIP: multicast discovery unavailable on this host");
+            eprintln!("SKIP: multicast discovery unavailable on this host (last dial: {last_error:?})");
             return;
         }
 
@@ -2933,6 +3369,9 @@ mod tests {
             .expect("alice receives bob's hello within 5s");
         assert_eq!(alice_hello_from, bob_address);
         assert_eq!(alice_hello_got, bob_hello);
+        let mut flags: Vec<(&str, bool)> = flag_rx.try_iter().collect();
+        flags.sort();
+        assert_eq!(flags, vec![("alice", true), ("bob", false)], "alice dialed, bob accepted");
 
         // Wire plane: a subsequent reliable frame is delivered in order after
         // the hello (no retry — reliable, ordered, same Link).
@@ -2945,6 +3384,76 @@ mod tests {
             .expect("bob receives the chat frame within 5s");
         assert_eq!(wire_from, alice.node_address());
         assert_eq!(wire_got, chat);
+
+        alice.shutdown();
+        bob.shutdown();
+    }
+
+    /// Blind audit 2026-11-11, M4: past the last pause a frame still held is offered at that pause;
+    /// one the network let go is given up.
+    #[test]
+    fn a_durable_frame_answered_retry_is_offered_for_as_long_as_it_is_held() {
+        let last = DURABLE_RETRY_DELAYS.len();
+        assert_eq!(durable_retry_delay(0, false), Some(DURABLE_RETRY_DELAYS[0]));
+        assert_eq!(durable_retry_delay(last - 1, false), DURABLE_RETRY_DELAYS.last().copied());
+        assert_eq!(durable_retry_delay(last, true), DURABLE_RETRY_DELAYS.last().copied(), "held: offered again");
+        assert_eq!(durable_retry_delay(last + 100, true), DURABLE_RETRY_DELAYS.last().copied());
+        assert_eq!(durable_retry_delay(last, false), None, "let go: given up");
+    }
+
+    /// V-05: a durable frame counts as handled only when the app says so. One the app could not take
+    /// yet (`Retry`) stays unhandled — out of the export that restores our high-water, so no holder
+    /// drops it — and is offered again after the pause; answered `Handled`, it is marked.
+    #[test]
+    fn a_durable_frame_the_app_answers_retry_is_offered_again_and_marked_only_when_handled() {
+        let (alice_cb, _alice_wire, _alice_media) = recording_callbacks(b"hello-a".to_vec());
+        let (mut bob_cb, _bob_wire, _bob_media) = recording_callbacks(b"hello-b".to_vec());
+        let (offer_tx, offer_rx) = mpsc::channel::<Vec<u8>>();
+        let offers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        bob_cb.on_durable_wire = Some(Arc::new(move |_peer, bytes, done| {
+            let first = offers.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let _ = offer_tx.send(bytes);
+            done(if first { MeshDurableOutcome::Retry } else { MeshDurableOutcome::Handled });
+        }));
+        let alice = MeshRuntime::start(MeshConfig::same_host(fresh_key_bytes()), alice_cb).expect("alice mesh starts");
+        let bob = MeshRuntime::start(MeshConfig::same_host(fresh_key_bytes()), bob_cb).expect("bob mesh starts");
+        let bob_address = bob.node_address();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alice.dial(bob_address).is_err() {
+            if Instant::now() > deadline {
+                eprintln!("SKIP: multicast discovery unavailable on this host");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        // The link is verified on both sides once the hellos have crossed; until then bob does not
+        // admit a durable frame, so send until the first offer arrives.
+        let first = (0..50)
+            .find_map(|_| {
+                let _ = alice.send_durable(bob_address, b"offline-message", 1);
+                offer_rx.recv_timeout(Duration::from_millis(200)).ok()
+            })
+            .expect("bob's app is offered the durable frame");
+        assert_eq!(first, b"offline-message");
+        assert!(bob.export_durable_rows().is_empty(), "answered Retry: not handled, not exported");
+        assert_eq!(bob.network.durable_in_flight(), 1, "and still on its way through the app, counted (L1)");
+
+        let again = offer_rx
+            .recv_timeout(DURABLE_RETRY_DELAYS[0] + Duration::from_secs(3))
+            .expect("offered again after the first pause");
+        assert_eq!(again, b"offline-message");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bob.export_durable_rows().is_empty() {
+            assert!(Instant::now() < deadline, "answered Handled: marked and exported");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The frame is marked first and let go of right after: under load the count is seen a moment
+        // before it drops.
+        while bob.network.durable_in_flight() != 0 {
+            assert!(Instant::now() < deadline, "settled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         alice.shutdown();
         bob.shutdown();

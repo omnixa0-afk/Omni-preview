@@ -94,21 +94,42 @@ public sealed partial class MainWindow
         return $"Не удалось подключиться к компьютеру «{name}»: {text}";
     }
 
+    private readonly Dictionary<Button, int> remoteControlAffordanceRenders = [];
+
     /// The header / card button: shown only when this contact lets us control its computer, greyed
     /// with the reason while it is offline.
-    private void RenderRemoteControlAffordance(Button button, ContactSnapshot? contact)
+    private async void RenderRemoteControlAffordance(Button button, ContactSnapshot? contact)
     {
+        // Off the UI thread: the chat header draws this on every refresh tick. The newest render of a
+        // button wins, whichever read comes back first.
+        int render = remoteControlAffordanceRenders.GetValueOrDefault(button) + 1;
+        remoteControlAffordanceRenders[button] = render;
+
         string? received = null;
         if (contact is not null)
         {
             try
             {
-                received = rustBridge.GetContactRemoteAccess(contact.ContactId).ReceivedMode;
+                received = await Task.Run(() =>
+                {
+                    string? mode = rustBridge.GetContactRemoteAccess(contact.ContactId).ReceivedMode;
+                    if (mode is not null)
+                    {
+                        MeshStateForScreen();
+                    }
+
+                    return mode;
+                });
             }
             catch (Exception)
             {
                 received = null; // profile not ready: hide; the next render retries
             }
+        }
+
+        if (remoteControlAffordanceRenders[button] != render)
+        {
+            return;
         }
 
         if (contact is null || received is null)

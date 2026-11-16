@@ -22,5 +22,20 @@ if ($testsExitCode -ne 0) {
     exit $testsExitCode
 }
 
+# Dev-only checks kept outside the published tree, when this checkout has them (repository hygiene).
+$devChecks = Join-Path $repoRoot 'public\check-hygiene.ps1'
+if (Test-Path $devChecks) {
+    Write-Host 'Running repository hygiene check...'
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $devChecks
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ''
+        Write-Host "HYGIENE CHECK FAILED (exit code $LASTEXITCODE)" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+}
+
+# Dependencies (docs/decisions/dependency-gate.md): reported here, they fail only a release.
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'check-dependencies.ps1')
+
 Write-Host 'CORE TESTS PASSED' -ForegroundColor Green
 exit 0

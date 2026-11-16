@@ -2,6 +2,7 @@
 name = "omni-mesh-runtime"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Sync facade over the async omni-network mesh. Owns a tokio runtime + a
 # Network, exposes blocking start/dial/send with inbound callbacks — so the
@@ -14,6 +15,7 @@ ed25519-dalek = { workspace = true }
 # UPnP-capable router becomes directly dialable even on a symmetric NAT (no relay).
 # Same crate the legacy transport already uses; cross-platform (no Windows crate).
 igd-next = { version = "0.16.2", features = ["aio_tokio"] }
+omni-net-primitives = { path = "../omni-net-primitives" }
 omni-network = { path = "../omni-network" }
 # CarrierPolicy (R1a connection-quality ladder): the app's persisted carrier choice that
 # drives which carrier(s) start() binds. omni-types is a pure leaf crate (no dep cycle).
@@ -26,6 +28,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 
 [dev-dependencies]
 rand_core = { workspace = true }
+tokio = { version = "1", features = ["rt", "time", "macros", "io-util", "test-util"] }
 
 [lints]
 workspace = true

@@ -16,6 +16,9 @@
     <LangVersion>14.0</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Omni.Windows.App</RootNamespace>
+    <!-- The exe users download is Omni.exe, so the assembly (and with it the exe and its .pri) is named
+         Omni: launched under its canonical name, Program.cs has nothing to re-launch. -->
+    <AssemblyName>Omni</AssemblyName>
     <!-- Provide our own entry point (Program.cs) instead of the XAML-generated Main, so we can
          self-heal a renamed exe. WinUI 3 unpackaged resolves Window/Page XAML via MRT keyed to the
          executable's base name — a renamed exe (e.g. a browser "Foo (1).exe" copy) can't find
@@ -45,11 +48,23 @@
     <OmniCoreDll>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni_ffi.dll</OmniCoreDll>
     <OmniRendezvousHelperExe>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni-rendezvous-helper.exe</OmniRendezvousHelperExe>
     <OmniDhtHelperExe>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni-dht-helper.exe</OmniDhtHelperExe>
+    <OmniGitHelperExe>$(OmniCoreTargetDir)\$(OmniRustTarget)\$(OmniCoreConfiguration)\omni-git-helper.exe</OmniGitHelperExe>
     <OmniWebRtcMediaDll>$(OmniRepoRoot)native\omni-webrtc-media\build\Release-libwebrtc\omni_webrtc_media.dll</OmniWebRtcMediaDll>
     <OmniWebRtcMediaDll Condition="!Exists('$(OmniWebRtcMediaDll)')">$(OmniRepoRoot)native\omni-webrtc-media\build\Release\Release\omni_webrtc_media.dll</OmniWebRtcMediaDll>
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- Dependency gate (docs/decisions/dependency-gate.md): packages, transitive ones too, are checked
+         against the known vulnerabilities on restore. A warning in daily builds; scripts/release.ps1
+         sets OmniReleaseGate, and there high and critical ones fail the build, and so does a check
+         that could not run (no advisory data: NU1900). -->
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>low</NuGetAuditLevel>
+    <WarningsAsErrors Condition="'$(OmniReleaseGate)' == 'true'">$(WarningsAsErrors);NU1900;NU1903;NU1904</WarningsAsErrors>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Satellite assemblies of referenced packages: only the UI's two languages (WinUI's own .mui files
+         are filtered separately, see OmniDropUnusedWinUiLanguages). -->
+    <SatelliteResourceLanguages>en;ru</SatelliteResourceLanguages>
     <!-- Dev tooling (forced trace file, embedded command pipe, UI test channel, core fault injection) exists
          only outside Release. A test stand that needs it in a release build passes -p:OmniDevTools=true. -->
     <OmniDevTools Condition="'$(OmniDevTools)' == '' and '$(Configuration)' != 'Release'">true</OmniDevTools>
@@ -67,6 +82,11 @@
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <!-- The notification-area icon (Core/TrayIcon.cs): inside the assembly, so the single-file exe
          needs nothing next to it. -->
+    <!-- Only as resources: left to the default items, each font also went into the bundle as a file. -->
+    <None Remove="Assets\Emoji\**" />
+    <Content Remove="Assets\Emoji\**" />
+    <EmbeddedResource Include="Assets\Emoji\noto.ttf.gz" LogicalName="Omni.Windows.App.Emoji.noto.ttf.gz" />
+    <EmbeddedResource Include="Assets\Emoji\twemoji.ttf.gz" LogicalName="Omni.Windows.App.Emoji.twemoji.ttf.gz" />
     <EmbeddedResource Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png"
                       LogicalName="Omni.Windows.App.TrayIcon.png" />
   </ItemGroup>
@@ -98,6 +118,11 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </ContentWithTargetPath>
+    <ContentWithTargetPath Include="$(OmniGitHelperExe)" Condition="Exists('$(OmniGitHelperExe)')">
+      <TargetPath>omni-git-helper.exe</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </ContentWithTargetPath>
   </ItemGroup>
 
   <ItemGroup Condition="'$(DisableMsixProjectCapabilityAddedByProject)' != 'true' and '$(EnableMsixTooling)' == 'true'">
@@ -108,17 +133,54 @@
     <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
   </PropertyGroup>
 
-  <!-- The self-contained Windows App SDK runtime carries the Windows ML runtime (onnxruntime + DirectML,
-       ~38 MB unpacked on every install). Omni calls none of the Windows ML APIs, so those two never ship. -->
-  <Target Name="OmniDropUnusedMlRuntime" AfterTargets="ComputeResolvedFilesToPublishList">
+  <!-- The self-contained Windows App SDK runtime carries every component of the SDK. Three of its
+       component packages back APIs Omni never calls, and nothing else loads their files:
+         Microsoft.WindowsAppSDK.ML      - Windows ML: onnxruntime + DirectML (~38 MB unpacked);
+         Microsoft.WindowsAppSDK.AI      - Windows AI APIs (Text, Imaging, ContentSafety), the AI
+                                           workload session manager and NpuDetect\;
+         Microsoft.WindowsAppSDK.Widgets - the Windows widgets-board provider.
+       Each package's files go together - native DLLs, .winmd, projection assemblies, workload JSON.
+       They are matched by NAME, listed from the packages themselves: the runtime reaches publish as
+       copies in obj\...\MsixContent\, so the source path no longer says which package a file is from. -->
+  <Target Name="OmniDropUnusedWinAppSdkComponents" AfterTargets="ComputeResolvedFilesToPublishList">
     <ItemGroup>
-      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
-                             Condition="'%(Filename)%(Extension)' == 'onnxruntime.dll' or '%(Filename)%(Extension)' == 'DirectML.dll'" />
+      <OmniUnusedWinAppSdkPackageFile Include="$(NuGetPackageRoot)$([System.String]::Copy('%(OmniUnusedWinAppSdkPackage.Identity)').ToLowerInvariant())\*\runtimes-framework\$(RuntimeIdentifier)\native\**\*;
+                                               $(NuGetPackageRoot)$([System.String]::Copy('%(OmniUnusedWinAppSdkPackage.Identity)').ToLowerInvariant())\*\metadata\*.winmd;
+                                               $(NuGetPackageRoot)$([System.String]::Copy('%(OmniUnusedWinAppSdkPackage.Identity)').ToLowerInvariant())\*\lib\**\*.dll" />
+    </ItemGroup>
+    <PropertyGroup>
+      <OmniUnusedWinAppSdkNames>;@(OmniUnusedWinAppSdkPackageFile->'%(Filename)%(Extension)'->ToLowerInvariant());</OmniUnusedWinAppSdkNames>
+    </PropertyGroup>
+    <Error Condition="'@(OmniUnusedWinAppSdkPackageFile)' == ''"
+           Text="No files of the unused Windows App SDK component packages found under $(NuGetPackageRoot): the package layout changed, and they would ship again." />
+    <ItemGroup>
+      <OmniUnusedWinAppSdkFile Include="@(ResolvedFileToPublish)"
+                               Condition="$(OmniUnusedWinAppSdkNames.Contains(';$([System.String]::Copy('%(Filename)%(Extension)').ToLowerInvariant());'))" />
+      <ResolvedFileToPublish Remove="@(OmniUnusedWinAppSdkFile)" />
+    </ItemGroup>
+    <Message Importance="high" Text="Not shipping unused Windows App SDK components (@(OmniUnusedWinAppSdkFile->Count()) files): @(OmniUnusedWinAppSdkFile->'%(RelativePath)', ', ')" />
+  </Target>
+  <ItemGroup>
+    <OmniUnusedWinAppSdkPackage Include="Microsoft.WindowsAppSDK.ML;Microsoft.WindowsAppSDK.AI;Microsoft.WindowsAppSDK.Widgets" />
+  </ItemGroup>
+
+  <!-- WinUI ships its own strings (Microsoft.ui.xaml.dll.mui, Microsoft.UI.Xaml.Phone.dll.mui) in 86
+       languages, 172 files; Omni's UI is Russian with English, so only those two stay. A Windows in any
+       other language falls back to English: both DLLs name en-US as their MUI ultimate fallback.
+       SatelliteResourceLanguages does not reach these (WinUI adds them as plain copy-local files), so
+       they are filtered here by their culture folder. -->
+  <Target Name="OmniDropUnusedWinUiLanguages" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <OmniUnusedWinUiLanguageFile Include="@(ResolvedFileToPublish)"
+                                   Condition="'%(Extension)' == '.mui'
+                                              and !$([System.String]::Copy('%(RelativePath)').ToLowerInvariant().StartsWith('en-'))
+                                              and !$([System.String]::Copy('%(RelativePath)').ToLowerInvariant().StartsWith('ru-'))" />
+      <ResolvedFileToPublish Remove="@(OmniUnusedWinUiLanguageFile)" />
     </ItemGroup>
   </Target>
 
   <Target Name="BuildOmniRustCore" BeforeTargets="PrepareForBuild">
-    <Message Importance="high" Text="Building omni-ffi + omni-rendezvous-helper + omni-dht-helper for $(OmniRustTarget) ($(Configuration))..." />
+    <Message Importance="high" Text="Building omni-ffi + omni-rendezvous-helper + omni-dht-helper + omni-git-helper for $(OmniRustTarget) ($(Configuration))..." />
     <!-- Reproducible Release binaries: panic locations and debug info name sources by neutral prefixes
          (~ for the cargo home, omni for the repo, target), not by where the tree happens to live. Debug
          builds keep real paths so the debugger finds sources. The array is merged with
@@ -129,7 +191,9 @@
       <OmniRemapRepo>$([System.IO.Path]::GetFullPath('$(OmniRepoRoot)').TrimEnd('\'))</OmniRemapRepo>
       <OmniCoreRemapSwitch Condition="'$(Configuration)' == 'Release'">--config &quot;target.$(OmniRustTarget).rustflags=['--remap-path-prefix=$(USERPROFILE)=~', '--remap-path-prefix=$(OmniRemapRepo)=omni', '--remap-path-prefix=$(OmniCoreTargetDir)=target']&quot;</OmniCoreRemapSwitch>
     </PropertyGroup>
-    <Exec Command="cargo build --manifest-path &quot;$(OmniCoreManifest)&quot; -p omni-ffi -p omni-rendezvous-helper -p omni-dht-helper --target $(OmniRustTarget) --target-dir &quot;$(OmniCoreTargetDir)&quot; $(OmniCoreReleaseSwitch) $(OmniCoreCargoFeatures) $(OmniCoreRemapSwitch)" WorkingDirectory="$(OmniRepoRoot)core-rust" EnvironmentVariables="$(OmniCoreBuildEnvironment)" />
+    <!-- Locked: the core is built from the versions in Cargo.lock, the ones the dependency gate
+         checked; a Cargo.toml that needs other versions fails here instead of updating them quietly. -->
+    <Exec Command="cargo build --locked --manifest-path &quot;$(OmniCoreManifest)&quot; -p omni-ffi -p omni-rendezvous-helper -p omni-dht-helper -p omni-git-helper --target $(OmniRustTarget) --target-dir &quot;$(OmniCoreTargetDir)&quot; $(OmniCoreReleaseSwitch) $(OmniCoreCargoFeatures) $(OmniCoreRemapSwitch)" WorkingDirectory="$(OmniRepoRoot)core-rust" EnvironmentVariables="$(OmniCoreBuildEnvironment)" />
   </Target>
 
   <!-- Single-file publish: keep the helper EXEs OUT of the bundle. They are the same courier code
@@ -144,7 +208,7 @@
     <ItemGroup>
       <ResolvedFileToPublish
         Remove="@(ResolvedFileToPublish)"
-        Condition="'%(ResolvedFileToPublish.Filename)' == 'omni-rendezvous-helper' or '%(ResolvedFileToPublish.Filename)' == 'omni-dht-helper'" />
+        Condition="'%(ResolvedFileToPublish.Filename)' == 'omni-rendezvous-helper' or '%(ResolvedFileToPublish.Filename)' == 'omni-dht-helper' or '%(ResolvedFileToPublish.Filename)' == 'omni-git-helper'" />
     </ItemGroup>
   </Target>
 
@@ -181,6 +245,65 @@
     <Error Text="Rust DLL not found at $(OmniCoreDll) after cargo build." />
   </Target>
 
+  <!-- The native media module is NOT built here: the csproj only copies whatever
+       native\omni-webrtc-media\build\... holds. A copy older than its sources still loads its file but
+       not the exports the shell now calls, and calls ring with no sound or picture (stand 2026-11-08: a
+       July build in a November exe, «EntryPointNotFoundException: omni_webrtc_media_session_set_max_bitrate»
+       on both machines). A missing one ships an exe with no media engine at all. Build: warning. Publish:
+       error - an exe made to be run elsewhere must not carry a stale engine; -p:OmniAllowStaleNativeMedia=true
+       to publish anyway. Rebuild: scripts\build-omni-webrtc-media.ps1 -Configuration Release -UseLibWebRtc. -->
+  <UsingTask TaskName="OmniNativeMediaAge" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Dll ParameterType="System.String" Required="true" />
+      <SourceRoot ParameterType="System.String" Required="true" />
+      <Problem ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        Problem = "";
+        if (!System.IO.File.Exists(Dll))
+        {
+            Problem = "native media module not found at " + Dll + ": calls will have no sound or picture";
+        }
+        else
+        {
+            var built = System.IO.File.GetLastWriteTimeUtc(Dll);
+            string newest = null;
+            var newestTime = System.DateTime.MinValue;
+            foreach (var dir in new[] { "src", "include" })
+            {
+                var path = System.IO.Path.Combine(SourceRoot, dir);
+                if (!System.IO.Directory.Exists(path)) continue;
+                foreach (var file in System.IO.Directory.EnumerateFiles(path, "*", System.IO.SearchOption.AllDirectories))
+                {
+                    var time = System.IO.File.GetLastWriteTimeUtc(file);
+                    if (time > newestTime) { newestTime = time; newest = file; }
+                }
+            }
+            if (newest != null && newestTime > built)
+            {
+                Problem = "native media module " + Dll + " (built " + built.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                    + ") is older than its sources (" + System.IO.Path.GetFileName(newest) + ", "
+                    + newestTime.ToLocalTime().ToString("yyyy-MM-dd HH:mm") + "): calls may ring with no sound or picture";
+            }
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="OmniCheckNativeMediaAge" BeforeTargets="Build;Publish">
+    <OmniNativeMediaAge Dll="$(OmniWebRtcMediaDll)" SourceRoot="$(OmniRepoRoot)native\omni-webrtc-media">
+      <Output TaskParameter="Problem" PropertyName="OmniNativeMediaProblem" />
+    </OmniNativeMediaAge>
+    <PropertyGroup>
+      <OmniNativeMediaFix>rebuild it: scripts\build-omni-webrtc-media.ps1 -Configuration Release -UseLibWebRtc</OmniNativeMediaFix>
+    </PropertyGroup>
+    <Warning Condition="'$(OmniNativeMediaProblem)' != '' and ('$(_IsPublishing)' != 'true' or '$(OmniAllowStaleNativeMedia)' == 'true')"
+             Text="$(OmniNativeMediaProblem); $(OmniNativeMediaFix)" />
+    <Error Condition="'$(OmniNativeMediaProblem)' != '' and '$(_IsPublishing)' == 'true' and '$(OmniAllowStaleNativeMedia)' != 'true'"
+           Text="$(OmniNativeMediaProblem); $(OmniNativeMediaFix) (or -p:OmniAllowStaleNativeMedia=true to publish anyway)" />
+  </Target>
+
   <Target Name="CopyOmniCoreDll" AfterTargets="Build" Condition="Exists('$(OmniCoreDll)')">
     <Copy SourceFiles="$(OmniCoreDll)" DestinationFiles="$(OutDir)omni_ffi.dll" SkipUnchangedFiles="true" />
   </Target>
@@ -191,5 +314,9 @@
 
   <Target Name="CopyOmniDhtHelper" AfterTargets="Build" Condition="Exists('$(OmniDhtHelperExe)')">
     <Copy SourceFiles="$(OmniDhtHelperExe)" DestinationFiles="$(OutDir)omni-dht-helper.exe" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyOmniGitHelper" AfterTargets="Build" Condition="Exists('$(OmniGitHelperExe)')">
+    <Copy SourceFiles="$(OmniGitHelperExe)" DestinationFiles="$(OutDir)omni-git-helper.exe" SkipUnchangedFiles="true" />
   </Target>
 </Project>

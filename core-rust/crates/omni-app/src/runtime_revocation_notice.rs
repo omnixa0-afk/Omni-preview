@@ -44,8 +44,10 @@ struct RevocationNoticeState {
     inbox: Vec<([u8; 32], omni_crypto::DeviceRevocationV1)>,
     /// Pair secrets whose beacons were read at the couriers since the start.
     beacons_read: std::collections::HashSet<[u8; 32]>,
-    /// When sending first asked whether a contact's revocations are settled (0 = not yet).
-    first_asked_at_unix_ms: i64,
+    /// Account → when sending first asked whether its revocations are settled. One time for the
+    /// profile let the grace that ran out for one account count for every account asked after it
+    /// (blind audit 2026-11-11, J2).
+    first_asked_at_unix_ms: HashMap<String, i64>,
     /// Catch-ups of a contact's device held until its account's revocations are settled:
     /// (device dialog, device).
     held_catch_ups: Vec<(String, DeviceId)>,
@@ -88,15 +90,13 @@ pub(crate) fn contact_revocations_settled(storage: &Storage, account_id: &Accoun
         .into_iter()
         .map(|peer| peer.secret)
         .collect();
-    with_revocation_notices(&db_path, |state| revocations_settled_in(state, &secrets, now_unix_ms))
+    with_revocation_notices(&db_path, |state| revocations_settled_in(state, &account_id.0, &secrets, now_unix_ms))
 }
 
 /// The rule of [`contact_revocations_settled`] over one profile's state and the account's pairs.
-fn revocations_settled_in(state: &mut RevocationNoticeState, secrets: &[[u8; 32]], now_unix_ms: i64) -> bool {
-    if state.first_asked_at_unix_ms == 0 {
-        state.first_asked_at_unix_ms = now_unix_ms;
-    }
-    now_unix_ms - state.first_asked_at_unix_ms >= REVOCATION_CHECK_GRACE_MS
+fn revocations_settled_in(state: &mut RevocationNoticeState, account: &str, secrets: &[[u8; 32]], now_unix_ms: i64) -> bool {
+    let first_asked = *state.first_asked_at_unix_ms.entry(account.to_string()).or_insert(now_unix_ms);
+    now_unix_ms - first_asked >= REVOCATION_CHECK_GRACE_MS
         || (secrets.iter().all(|secret| state.beacons_read.contains(secret))
             && !state.inbox.iter().any(|(secret, _)| secrets.contains(secret)))
 }

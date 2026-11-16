@@ -62,23 +62,46 @@ public sealed partial class ChatsSectionControl : UserControl
 
     public event RoutedEventHandler? AttachmentCardClicked;
 
+    /// «Ответить» in a message's menu.
+    public event EventHandler<Shared.MessageRow>? MessageReplyRequested;
+
+    /// A tap on a message's quote.
+    public event EventHandler<Shared.MessageRow>? MessageQuoteOpened;
+
+    private void OnMessageReplyRequested(object? sender, Shared.MessageRow row) => MessageReplyRequested?.Invoke(sender, row);
+
+    /// An emoji chosen for a message (empty: ours taken away): the bubble is the sender.
+    public event EventHandler<string>? MessageReactionChosen;
+
+    private void OnMessageReactionChosen(object? sender, string emoji) => MessageReactionChosen?.Invoke(sender, emoji);
+
+    private void OnMessageQuoteOpened(object? sender, Shared.MessageRow row) => MessageQuoteOpened?.Invoke(sender, row);
+
+    public event EventHandler<Shared.MessageRow>? MessagePinRequested;
+
+    public event EventHandler<Shared.MessageRow>? MessageForwardRequested;
+
+    public event EventHandler<Shared.MessageRow>? MessageSelectRequested;
+
+    public event EventHandler<Shared.MessageRow>? MessageSelectionToggled;
+
+    public event EventHandler<Shared.MessageRow>? MessageDeleteRequested;
+
+    private void OnMessagePinRequested(object? sender, Shared.MessageRow row) => MessagePinRequested?.Invoke(sender, row);
+
+    private void OnMessageForwardRequested(object? sender, Shared.MessageRow row) => MessageForwardRequested?.Invoke(sender, row);
+
+    private void OnMessageSelectRequested(object? sender, Shared.MessageRow row) => MessageSelectRequested?.Invoke(sender, row);
+
+    private void OnMessageSelectionToggled(object? sender, Shared.MessageRow row) => MessageSelectionToggled?.Invoke(sender, row);
+
+    private void OnMessageDeleteRequested(object? sender, Shared.MessageRow row) => MessageDeleteRequested?.Invoke(sender, row);
+
     /// A tap on a photo in a bubble (Tag = the message id): the host opens it on the whole window.
     public event RoutedEventHandler? AttachmentPhotoClicked;
 
     private void OnAttachmentPhotoClicked(object sender, RoutedEventArgs e)
         => AttachmentPhotoClicked?.Invoke(sender, e);
-
-    // A flyout is outside the bubble's tree: its items get the message id from the photo they opened on.
-    private void OnPhotoMenuOpening(object? sender, object e)
-    {
-        if (sender is MenuFlyout { Target: FrameworkElement { Tag: string messageId } } menu)
-        {
-            foreach (MenuFlyoutItemBase item in menu.Items)
-            {
-                item.Tag = messageId;
-            }
-        }
-    }
 
     /// «Сохранить как…» on a photo's menu (Tag = the message id).
     public event RoutedEventHandler? AttachmentPhotoSaveClicked;
@@ -109,9 +132,9 @@ public sealed partial class ChatsSectionControl : UserControl
         => ApplyResponsiveLayout(lastLayoutWidth > 0 ? lastLayoutWidth : ActualWidth);
 
     // Drive the rail/conversation layout off THIS control's width, not the window
-    // width. The section is hosted inside NavigationView.Content, whose pane eats
-    // up to 228px; an AdaptiveTrigger on MinWindowWidth over-reports the space the
-    // section actually has and keeps the rail column too wide at half-screen widths
+    // width. The section sits beside the sections' rail (Shared.ShellRail); an
+    // AdaptiveTrigger on MinWindowWidth over-reports the space the section actually
+    // has and keeps the rail column too wide at half-screen widths
     // (см. docs/architecture/ui-audit.md §D).
     //
     // Below the narrow threshold the section becomes a master-detail: the chat list

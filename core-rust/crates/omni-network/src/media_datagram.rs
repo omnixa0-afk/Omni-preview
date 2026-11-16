@@ -9,7 +9,7 @@
 //! identity (`from`). The `payload` is the opaque, E2E-encrypted media (RTP from the shell) — a relay
 //! reads only the routing header, never the payload (content-blind). Wrapped/unwrapped INSIDE
 //! omni-network so the media layer above is unchanged. See docs/decisions/omni-network-model.md (G2)
-//! and docs/notes/nat-relay-CONTINUE.md (R2 design).
+//! and docs/decisions/omni-network-model.md (G2).
 
 use crate::address::NodeAddress;
 
@@ -34,7 +34,8 @@ pub struct MediaDatagram {
     pub to: NodeAddress,
     /// TTL, decremented at each relay hop (loop-bound, mirrors `DataFrame::hop_limit`).
     pub hop_limit: u8,
-    /// Opaque, E2E-encrypted media payload (RTP). A relay never reads this.
+    /// Opaque media payload, sealed end to end above this layer (`omni-app`: a 1:1 call's keys, or
+    /// a group sender's). A relay forwards it and can neither read nor alter it.
     pub payload: Vec<u8>,
 }
 

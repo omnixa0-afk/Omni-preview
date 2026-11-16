@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use omni_storage::Storage;
-use omni_types::{AttachmentTransferState, OmniResult};
+use omni_types::{AttachmentTransferState, OmniError, OmniResult};
 
 use crate::{current_unix_ms, omni_app_trace_log};
 
@@ -110,7 +110,7 @@ fn prepare(db_path: &str, message_id: &str, stop: &AtomicBool) -> OmniResult<Vec
     let storage = Storage::open(Path::new(db_path))?;
     let mut reported: u64 = 0;
     let mut still_preparing = true;
-    let prepared = storage.finish_outgoing_attachment_preparation(
+    let prepared = storage.read_outgoing_attachment_preparation(
         message_id,
         &mut |read| {
             if stop.load(Ordering::Relaxed) {
@@ -125,10 +125,12 @@ fn prepare(db_path: &str, message_id: &str, stop: &AtomicBool) -> OmniResult<Vec
             }
             still_preparing
         },
-        current_unix_ms(),
     );
-    let ready = match prepared {
+    let ready = match prepared.and_then(|read| complete_and_offer(&storage, &read)) {
         Ok(ready) => ready,
+        // Not now (the database busy, the group's offer): the rows stay `Preparing`, and the queue's
+        // tick picks them up again (`resume_attachment_preparations`) — the reading is kept.
+        Err(error @ OmniError::StorageLocked(_)) => return Err(error),
         Err(error) => {
             // Stopped on purpose: whoever stopped it has already said why. Otherwise the file could
             // not be read (moved, changed, gone): the message fails, nothing was offered.
@@ -138,19 +140,41 @@ fn prepare(db_path: &str, message_id: &str, stop: &AtomicBool) -> OmniResult<Vec
             return Err(error);
         }
     };
-    // A 1:1 message goes on the queue's next tick; a group offer is sent from here.
-    for ready_id in &ready {
-        let Some(runtime) = storage.get_attachment_runtime_info(ready_id)? else {
-            continue;
-        };
-        if storage.get_group_by_dialog_key(&runtime.dialog_key)?.is_some() {
-            if let Err(error) = crate::app_groups::send_prepared_group_attachment_offer(&storage, ready_id) {
-                omni_app_trace_log("attachment/prepare", &format!("message={ready_id} group offer not sent: {error}"));
-            }
-        }
-    }
     Ok(ready)
 }
+
+/// The file made ready and, for a group, its offer queued — one transaction. They were two: the
+/// offer failed (or the process ended) after the file was ready, and no pass looked at it again,
+/// since only `Preparing` files are resumed — the members never heard of the file (blind audit
+/// 2026-11-13, pass 21). A 1:1 message goes on the queue's next tick.
+fn complete_and_offer(storage: &Storage, read: &omni_storage::PreparedAttachmentSource) -> OmniResult<Vec<String>> {
+    crate::app_groups::in_mls_transaction(storage, "prepared attachment", |storage| {
+        let ready = storage.complete_outgoing_attachment_preparation(read, current_unix_ms())?;
+        for ready_id in &ready {
+            let Some(runtime) = storage.get_attachment_runtime_info(ready_id)? else {
+                continue;
+            };
+            if storage.get_group_by_dialog_key(&runtime.dialog_key)?.is_none() {
+                continue;
+            }
+            match crate::app_groups::send_prepared_group_attachment_offer(storage, ready_id) {
+                Ok(()) => {}
+                // Not now: none of it is done, the file is ready and offered on a later pass.
+                Err(error @ (OmniError::Storage(_) | OmniError::StorageLocked(_) | OmniError::Internal(_))) => {
+                    return Err(OmniError::StorageLocked(format!("message={ready_id} group offer not now: {error}")));
+                }
+                // For good (we left the group): the file is ready, there is nobody to offer it to.
+                Err(error) => omni_app_trace_log("attachment/prepare", &format!("message={ready_id} group offer not sent: {error}")),
+            }
+        }
+        Ok(ready)
+    })
+}
+
+/// Test hook: the databases whose next group offer of a prepared file fails as a busy database would
+/// (the preparation runs on a thread of its own).
+#[cfg(test)]
+pub(crate) static FAIL_PREPARED_OFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Whether the message's file is still being prepared — the queue, the copies to our devices and
 /// the history hand-over leave such a message be: there is nothing to offer yet.

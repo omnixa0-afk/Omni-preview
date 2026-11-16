@@ -25,9 +25,9 @@ fn hkdf_expand_multi(
     input_key_material: &[u8],
     info: &[u8],
     len: usize,
-) -> OmniResult<Vec<u8>> {
+) -> OmniResult<Zeroizing<Vec<u8>>> {
     let hkdf = Hkdf::<Sha256>::new(salt.map(|value| value.as_slice()), input_key_material);
-    let mut output = vec![0u8; len];
+    let mut output = Zeroizing::new(vec![0u8; len]);
     hkdf.expand(info, &mut output)
         .map_err(|_| OmniError::Internal("hkdf expand failed".to_string()))?;
     Ok(output)
@@ -74,9 +74,9 @@ fn unprotect_ed25519_signing_key(secret: &ProtectedSecret) -> OmniResult<Ed25519
     Ok(Ed25519SigningKey::from_bytes(&raw))
 }
 
-fn unprotect_chain_key(secret: &ProtectedSecret) -> OmniResult<[u8; 32]> {
+fn unprotect_chain_key(secret: &ProtectedSecret) -> OmniResult<Zeroizing<[u8; 32]>> {
     let bytes = unprotect_bytes(secret)?;
-    slice_to_array::<32>(&bytes)
+    slice_to_array::<32>(&bytes).map(Zeroizing::new)
 }
 
 fn slice_to_array<const N: usize>(bytes: &[u8]) -> OmniResult<[u8; N]> {

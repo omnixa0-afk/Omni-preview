@@ -256,6 +256,10 @@ fn account_mailbox_round(storage: &Storage, spawn_helper: bool) {
             if let Some(content) = publish {
                 let posted = publish_account_mailbox_with(courier, &secret, &content, now);
                 omni_app_trace_log("own_devices/mailbox", &format!("note posted to {posted} courier(s)"));
+                // No courier took it: not published, the next round tries again. Counted as posted, it
+                // waited out the republish interval — hours a device of ours went without a
+                // revocation or a block (blind audit 2026-11-11, F7). A newer note set since stays.
+                note_account_mailbox_posted(&db_path, &content, posted);
             }
             if read {
                 let notes = read_account_mailbox_with(courier, &secret, now);
@@ -265,6 +269,20 @@ fn account_mailbox_round(storage: &Storage, spawn_helper: bool) {
                 }
             }
         });
+}
+
+/// A note no courier took is not published: the next round posts it again (blind audit 2026-11-11,
+/// F7). Only while it is still the note marked published — a newer one set since stays.
+fn note_account_mailbox_posted(db_path: &str, content: &[u8], posted: usize) {
+    if posted > 0 {
+        return;
+    }
+    let fingerprint = account_mailbox_fingerprint(content);
+    with_account_mailbox(db_path, |state| {
+        if state.published_fingerprint == fingerprint {
+            state.published_fingerprint = 0;
+        }
+    });
 }
 
 /// Apply the notes read since the last tick. A note counts only when signed by a device of ours that
@@ -319,6 +337,7 @@ fn apply_account_mailbox_inbox(storage: &Storage, transport: &TransportManager) 
             }
         }
         forget_runtime_state_of_removed_contacts(storage, &removed);
+        end_calls_with_contacts_no_longer_approved(storage, Some(transport), &note.entries);
         omni_app_trace_log(
             "own_devices/mailbox",
             &format!(

@@ -83,22 +83,9 @@
           <Color x:Key="OmniCallScrimColor">#CC000000</Color>
           <Color x:Key="OmniCallScrimClearColor">#00000000</Color>
 
-          <!-- Drop-downs (ComboBox lists, menus) in the app's colours, not Fluent's grey acrylic
-               (owner, 2026-10-11: «выпадающие меню не состыковываются с темой»). -->
-          <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#172232" />
-          <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#324761" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="#1E2F45" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundPressed" Color="#223349" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="#223349" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="#2A3F5A" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="#2A3F5A" />
-          <SolidColorBrush x:Key="ComboBoxItemPillFillBrush" Color="#9AAED7" />
-          <SolidColorBrush x:Key="MenuFlyoutPresenterBackground" Color="#172232" />
-          <SolidColorBrush x:Key="MenuFlyoutPresenterBorderBrush" Color="#324761" />
-          <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPointerOver" Color="#1E2F45" />
-          <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPressed" Color="#223349" />
-          <SolidColorBrush x:Key="FlyoutPresenterBackground" Color="#172232" />
-          <SolidColorBrush x:Key="FlyoutBorderThemeBrush" Color="#324761" />
+          <!-- Popups: the surface a menu, a drop-down or a dialog stands on. -->
+          <SolidColorBrush x:Key="OmniPopupBrush" Color="#172232" />
+          <SolidColorBrush x:Key="OmniPopupStrokeBrush" Color="#324761" />
         </ResourceDictionary>
         <ResourceDictionary x:Key="Light">
           <Color x:Key="SystemAccentColor">#4C6091</Color>
@@ -151,20 +138,8 @@
           <Color x:Key="OmniCallScrimColor">#E6EEF2F8</Color>
           <Color x:Key="OmniCallScrimClearColor">#00EEF2F8</Color>
 
-          <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#FFFFFF" />
-          <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#C2CEDE" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="#E7EDF6" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundPressed" Color="#DCE6F6" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="#DCE6F6" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="#CDDBF1" />
-          <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="#CDDBF1" />
-          <SolidColorBrush x:Key="ComboBoxItemPillFillBrush" Color="#4C6091" />
-          <SolidColorBrush x:Key="MenuFlyoutPresenterBackground" Color="#FFFFFF" />
-          <SolidColorBrush x:Key="MenuFlyoutPresenterBorderBrush" Color="#C2CEDE" />
-          <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPointerOver" Color="#E7EDF6" />
-          <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPressed" Color="#DCE6F6" />
-          <SolidColorBrush x:Key="FlyoutPresenterBackground" Color="#FFFFFF" />
-          <SolidColorBrush x:Key="FlyoutBorderThemeBrush" Color="#C2CEDE" />
+          <SolidColorBrush x:Key="OmniPopupBrush" Color="#FFFFFF" />
+          <SolidColorBrush x:Key="OmniPopupStrokeBrush" Color="#C2CEDE" />
         </ResourceDictionary>
       </ResourceDictionary.ThemeDictionaries>
 
@@ -173,7 +148,232 @@
       <CornerRadius x:Key="ControlCornerRadius">8</CornerRadius>
       <CornerRadius x:Key="OverlayCornerRadius">8</CornerRadius>
 
+      <!-- Menus, flyouts and dialogs in the app's colours (owner, 2026-10-11 and again 2026-10-30:
+           «выпадающие меню не состыковываются с темой»). Overriding Fluent's own keys here does not
+           take — the Fluent templates find those keys in XamlControlsResources first — so the styles
+           set the surfaces to Omni's keys; and a menu is painted by a system acrylic backdrop with a
+           transparent background on top, so the backdrop goes. The drop-down list of a ComboBox
+           takes its keys on the window's root (MainWindow.xaml). -->
+      <Style TargetType="MenuFlyoutPresenter" BasedOn="{StaticResource DefaultMenuFlyoutPresenterStyle}">
+        <Setter Property="SystemBackdrop" Value="{x:Null}" />
+        <Setter Property="Background" Value="{ThemeResource OmniPopupBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource OmniPopupStrokeBrush}" />
+      </Style>
+      <Style TargetType="FlyoutPresenter" BasedOn="{StaticResource DefaultFlyoutPresenterStyle}">
+        <Setter Property="Background" Value="{ThemeResource OmniPopupBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource OmniPopupStrokeBrush}" />
+      </Style>
+      <!-- The buttons' strip at the bottom is the dialog's background; Fluent lays a faint layer over
+           the top part, so the content reads a shade lighter than the buttons, as before. -->
+      <Style TargetType="ContentDialog" BasedOn="{StaticResource DefaultContentDialogStyle}">
+        <Setter Property="Background" Value="{ThemeResource OmniBgPanelBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource OmniPopupStrokeBrush}" />
+      </Style>
+      <!-- CheckBox with a font check mark (docs/bugs/checkbox-glyph-windows10.md). Fluent draws the
+           mark with an AnimatedIcon whose fallback font glyph stays on and is hidden only by its
+           colour; on Windows 10 the box showed a circle with a dash, in the dark theme also when
+           unchecked (our TextOnAccentFillColorPrimaryBrush is light there). Here the mark is a
+           FontIcon of the system symbol font (Segoe Fluent Icons on 11, Segoe MDL2 Assets on 10 —
+           E73E and E738 are in both) shown by opacity. Colours and states are Fluent's own. -->
+      <Style TargetType="CheckBox" BasedOn="{StaticResource DefaultCheckBoxStyle}">
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="CheckBox">
+              <Grid
+                x:Name="RootGrid"
+                Background="{TemplateBinding Background}"
+                BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="{TemplateBinding BorderThickness}"
+                CornerRadius="{TemplateBinding CornerRadius}">
+                <VisualStateManager.VisualStateGroups>
+                  <VisualStateGroup x:Name="CombinedStates">
+                    <VisualState x:Name="UncheckedNormal" />
+                    <VisualState x:Name="UncheckedPointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundUncheckedPointerOver}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundUncheckedPointerOver}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushUncheckedPointerOver}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUncheckedPointerOver}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillUncheckedPointerOver}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedPointerOver}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="UncheckedPressed">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundUncheckedPressed}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundUncheckedPressed}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushUncheckedPressed}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUncheckedPressed}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillUncheckedPressed}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedPressed}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="UncheckedDisabled">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundUncheckedDisabled}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundUncheckedDisabled}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushUncheckedDisabled}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeUncheckedDisabled}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillUncheckedDisabled}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundUncheckedDisabled}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="CheckedNormal">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundChecked}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundChecked}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushChecked}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeChecked}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillChecked}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundChecked}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="CheckedPointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundCheckedPointerOver}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundCheckedPointerOver}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushCheckedPointerOver}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeCheckedPointerOver}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillCheckedPointerOver}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedPointerOver}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="CheckedPressed">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundCheckedPressed}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundCheckedPressed}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushCheckedPressed}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeCheckedPressed}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillCheckedPressed}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedPressed}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="CheckedDisabled">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundCheckedDisabled}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundCheckedDisabled}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushCheckedDisabled}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeCheckedDisabled}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillCheckedDisabled}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundCheckedDisabled}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="IndeterminateNormal">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundIndeterminate}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundIndeterminate}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushIndeterminate}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminate}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminate}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminate}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                        <Setter Target="CheckGlyph.Glyph" Value="&#xE738;" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="IndeterminatePointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundIndeterminatePointerOver}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundIndeterminatePointerOver}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushIndeterminatePointerOver}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminatePointerOver}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminatePointerOver}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminatePointerOver}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                        <Setter Target="CheckGlyph.Glyph" Value="&#xE738;" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="IndeterminatePressed">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundIndeterminatePressed}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundIndeterminatePressed}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushIndeterminatePressed}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminatePressed}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminatePressed}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminatePressed}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                        <Setter Target="CheckGlyph.Glyph" Value="&#xE738;" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="IndeterminateDisabled">
+                      <VisualState.Setters>
+                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource CheckBoxForegroundIndeterminateDisabled}" />
+                        <Setter Target="RootGrid.Background" Value="{ThemeResource CheckBoxBackgroundIndeterminateDisabled}" />
+                        <Setter Target="RootGrid.BorderBrush" Value="{ThemeResource CheckBoxBorderBrushIndeterminateDisabled}" />
+                        <Setter Target="NormalRectangle.Stroke" Value="{ThemeResource CheckBoxCheckBackgroundStrokeIndeterminateDisabled}" />
+                        <Setter Target="NormalRectangle.Fill" Value="{ThemeResource CheckBoxCheckBackgroundFillIndeterminateDisabled}" />
+                        <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource CheckBoxCheckGlyphForegroundIndeterminateDisabled}" />
+                        <Setter Target="CheckGlyph.Opacity" Value="1" />
+                        <Setter Target="CheckGlyph.Glyph" Value="&#xE738;" />
+                      </VisualState.Setters>
+                    </VisualState>
+                  </VisualStateGroup>
+                </VisualStateManager.VisualStateGroups>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid Grid.Column="0" Width="{StaticResource CheckBoxSize}" Height="{StaticResource CheckBoxSize}" VerticalAlignment="Center">
+                  <Rectangle
+                    x:Name="NormalRectangle"
+                    Width="{StaticResource CheckBoxSize}"
+                    Height="{StaticResource CheckBoxSize}"
+                    Fill="{ThemeResource CheckBoxCheckBackgroundFillUnchecked}"
+                    RadiusX="{Binding CornerRadius, RelativeSource={RelativeSource TemplatedParent}, Converter={StaticResource TopLeftCornerRadiusDoubleValueConverter}}"
+                    RadiusY="{Binding CornerRadius, RelativeSource={RelativeSource TemplatedParent}, Converter={StaticResource BottomRightCornerRadiusDoubleValueConverter}}"
+                    Stroke="{ThemeResource CheckBoxCheckBackgroundStrokeUnchecked}"
+                    StrokeThickness="{StaticResource CheckBoxBorderThickness}"
+                    UseLayoutRounding="False" />
+                  <FontIcon
+                    x:Name="CheckGlyph"
+                    FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                    FontSize="{StaticResource CheckBoxGlyphSize}"
+                    Foreground="{ThemeResource CheckBoxCheckGlyphForegroundUnchecked}"
+                    Glyph="&#xE73E;"
+                    Opacity="0" />
+                </Grid>
+                <ContentPresenter
+                  x:Name="ContentPresenter"
+                  Grid.Column="1"
+                  Margin="{TemplateBinding Padding}"
+                  HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                  VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                  AutomationProperties.AccessibilityView="Raw"
+                  Content="{TemplateBinding Content}"
+                  ContentTemplate="{TemplateBinding ContentTemplate}"
+                  ContentTransitions="{TemplateBinding ContentTransitions}"
+                  Foreground="{TemplateBinding Foreground}"
+                  TextWrapping="Wrap" />
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+
       <Style TargetType="Button">
+        <Setter Property="MinWidth" Value="108" />
+        <Setter Property="MinHeight" Value="40" />
+        <Setter Property="Padding" Value="14,8" />
+        <Setter Property="HorizontalAlignment" Value="Left" />
+        <Setter Property="CornerRadius" Value="8" />
+      </Style>
+
+      <!-- The one button beside a list's title («+ Группа», «+ Добавить», «+ Workspace»): one width,
+           so its left edge does not jump between the sections (owner, 2026-10-30). -->
+      <Style x:Key="PaneHeaderButtonStyle" TargetType="Button">
+        <Setter Property="MinWidth" Value="120" />
+        <Setter Property="MinHeight" Value="40" />
+        <Setter Property="Padding" Value="14,8" />
+        <Setter Property="HorizontalAlignment" Value="Right" />
+        <Setter Property="CornerRadius" Value="8" />
+      </Style>
+
+      <!-- The accent button of a sentence or a card («Сохранить версию», «Беру в работу»): the plain
+           button's geometry with the accent fill, so the two stand the same height side by side. -->
+      <Style x:Key="AccentActionButtonStyle" TargetType="Button" BasedOn="{StaticResource AccentButtonStyle}">
         <Setter Property="MinWidth" Value="108" />
         <Setter Property="MinHeight" Value="40" />
         <Setter Property="Padding" Value="14,8" />
@@ -211,12 +411,67 @@
              as much, so the plate lines up with the search box and the header button above. -->
         <Setter Property="Margin" Value="-4,0,-4,0" />
       </Style>
+      <!-- The hover/selection plate is the row's own rounded border (owner, 2026-11-01: the
+           presenter's plate stayed square whatever CornerRadius said), 4 px inside the row's
+           edges, in the list colours of the theme. -->
       <Style x:Key="PersonListItemStyle" TargetType="ListViewItem">
         <Setter Property="Padding" Value="0" />
         <Setter Property="Margin" Value="0,0,0,2" />
         <Setter Property="MinHeight" Value="0" />
         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-        <Setter Property="CornerRadius" Value="8" />
+        <Setter Property="UseSystemFocusVisuals" Value="True" />
+        <Setter Property="FocusVisualMargin" Value="4,0" />
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ListViewItem">
+              <!-- The row's content keeps the whole width, as under the presenter before. -->
+              <Grid>
+                <VisualStateManager.VisualStateGroups>
+                  <VisualStateGroup x:Name="CommonStates">
+                    <VisualState x:Name="Normal" />
+                    <VisualState x:Name="PointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="Plate.Background" Value="{ThemeResource ListViewItemBackgroundPointerOver}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Pressed">
+                      <VisualState.Setters>
+                        <Setter Target="Plate.Background" Value="{ThemeResource ListViewItemBackgroundPointerOver}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Selected">
+                      <VisualState.Setters>
+                        <Setter Target="Plate.Background" Value="{ThemeResource ListViewItemBackgroundSelected}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="PointerOverSelected">
+                      <VisualState.Setters>
+                        <Setter Target="Plate.Background" Value="{ThemeResource ListViewItemBackgroundSelectedPointerOver}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="PressedSelected">
+                      <VisualState.Setters>
+                        <Setter Target="Plate.Background" Value="{ThemeResource ListViewItemBackgroundSelectedPressed}" />
+                      </VisualState.Setters>
+                    </VisualState>
+                  </VisualStateGroup>
+                </VisualStateManager.VisualStateGroups>
+                <Border
+                  x:Name="Plate"
+                  Margin="4,0"
+                  Background="Transparent"
+                  CornerRadius="8" />
+                <ContentPresenter
+                  Padding="{TemplateBinding Padding}"
+                  HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                  VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                  Content="{TemplateBinding Content}"
+                  ContentTemplate="{TemplateBinding ContentTemplate}"
+                  ContentTransitions="{TemplateBinding ContentTransitions}" />
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
       </Style>
       <DataTemplate x:Key="PersonRowTemplate">
         <Border
@@ -251,7 +506,7 @@
                 VerticalAlignment="Bottom"
                 Background="{ThemeResource OmniBgPanelBrush}"
                 Visibility="{Binding GroupMarkVisibility}">
-                <FontIcon FontSize="11" Glyph="&#xE716;" />
+                <FontIcon FontSize="11" Glyph="{Binding GroupMarkGlyph}" />
               </Border>
               <Border
                 Width="14"

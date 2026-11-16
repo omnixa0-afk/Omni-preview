@@ -2,6 +2,7 @@
 name = "omni-net-primitives"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 # Shared, identity-agnostic networking primitives. Extracted из
 # omni-transport/quic_carrier.rs (2026-05-28) чтобы omni-transport И
@@ -23,10 +24,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # `#[cfg(unix)]` in multicast.rs) — required to build on Linux (the relay VPS). Harmless on Windows.
 socket2 = { version = "0.5", features = ["all"] }
 thiserror = { workspace = true }
-tokio = { version = "1", features = ["net", "rt", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "time"] }
 rcgen = "0.14"
 
 [lints]

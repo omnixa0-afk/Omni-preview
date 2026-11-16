@@ -8,7 +8,7 @@
 //! shaped TLS connection, the same as any other. The outer TLS verifier is
 //! AcceptAny by design: it gives channel opacity, while the relay's IDENTITY stays enforced by
 //! the in-tunnel QUIC challenge (see [`crate::cert`]), exactly as on the native-UDP path. (SPKI
-//! pinning is later hardening.)
+//! pinning is later hardening, see docs/decisions/availability-axis.md §A.1.)
 //!
 //! Two halves:
 //! - [`TcpQuicSocket`] — client side: a `quinn::AsyncUdpSocket` backed by one TCP connection
@@ -153,7 +153,7 @@ pub(crate) fn outer_tls_acceptor() -> io::Result<TlsAcceptor> {
 /// (live 2026-10-16: 48% loss on a door, 1.6 MB/s through it with no queue and RTT at its floor).
 fn place_datagrams(
     first: Vec<u8>,
-    rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
     bufs: &mut [std::io::IoSliceMut<'_>],
     meta: &mut [RecvMeta],
     peer: SocketAddr,
@@ -325,7 +325,7 @@ pub struct TcpQuicSocket {
     peer: StdMutex<SocketAddr>,
     local: SocketAddr,
     out_tx: mpsc::UnboundedSender<Vec<u8>>,
-    in_rx: StdMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    in_rx: StdMutex<mpsc::Receiver<Vec<u8>>>,
     /// Жив ли супервизор. Снимается, когда он сдался по `GiveUpAfter`. Нужно ВЛАДЕЛЬЦУ карты
     /// туннелей: без этого запись о сдавшемся туннеле выглядит как исправная, и проверка «уже на
     /// этой двери» возвращает no-op на трупе.
@@ -345,7 +345,7 @@ impl TcpQuicSocket {
         std_stream.set_nonblocking(true)?;
         let stream = TcpStream::from_std(std_stream)?;
         size_door_socket(&stream);
-        Self::start(relay, stream, sni, TcpReconnectPolicy::Forever)
+        Self::start(relay, stream, sni, TcpReconnectPolicy::Forever, None)
     }
 
     /// Async connect with an explicit retry policy — see [`TcpReconnectPolicy`]. For a peer's door,
@@ -362,15 +362,34 @@ impl TcpQuicSocket {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("tcp connect {relay} timed out")))??;
         stream.set_nodelay(true).ok();
         size_door_socket(&stream);
-        Self::start(relay, stream, sni, policy)
+        Self::start(relay, stream, sni, policy, None)
+    }
+
+    /// Over a TCP connection already made from our door's `door_port` to a peer's punch address `peer`
+    /// (the dialing side of the TCP hole punch). A broken pipe is redialed from the same port: only a
+    /// connection from the door's external address gets through the peer's NAT, and only while the
+    /// peer still holds its pinhole — so the policy should give up soon and leave the next try to a
+    /// new punch. See docs/decisions/tcp-hole-punch.md.
+    pub fn over_punched_stream(
+        peer: SocketAddr,
+        stream: TcpStream,
+        sni: &str,
+        policy: TcpReconnectPolicy,
+        door_port: u16,
+    ) -> io::Result<Arc<Self>> {
+        stream.set_nodelay(true).ok();
+        size_door_socket(&stream);
+        Self::start(peer, stream, sni, policy, Some(door_port))
     }
 
     /// Start the supervisor over a connected stream. Must run inside a tokio runtime context.
+    /// `from_port` — the local port every redial must leave from (`None` — any).
     fn start(
         relay: SocketAddr,
         stream: TcpStream,
         sni: &str,
         policy: TcpReconnectPolicy,
+        from_port: Option<u16>,
     ) -> io::Result<Arc<Self>> {
         let local = stream.local_addr()?;
 
@@ -383,7 +402,12 @@ impl TcpQuicSocket {
             .to_owned();
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Inbound is bounded: when quinn is behind, the pump stops reading the pipe and TCP's own
+        // flow control holds the peer — nothing is lost. It had no bound, and a peer writing
+        // faster than quinn took grew it without end (blind audit 2026-11-11, pass 13). Outbound
+        // stays as it is (see `AlwaysWritable`): what quinn hands over is bounded by its
+        // congestion window.
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(INBOUND_QUEUE_DATAGRAMS);
 
         // One supervisor owns the byte-pipe for the socket's whole life: it TLS-handshakes the
         // initial TCP conn, pumps frames over it, and when the conn breaks dials + TLS-handshakes a
@@ -397,6 +421,7 @@ impl TcpQuicSocket {
             in_tx,
             Some(stream),
             policy,
+            from_port,
             std::sync::Arc::clone(&alive),
         ));
 
@@ -484,9 +509,10 @@ async fn supervise(
     connector: TlsConnector,
     server_name: ServerName<'static>,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    in_tx: mpsc::UnboundedSender<Vec<u8>>,
+    in_tx: mpsc::Sender<Vec<u8>>,
     mut initial_tcp: Option<TcpStream>,
     policy: TcpReconnectPolicy,
+    from_port: Option<u16>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut backoff = INITIAL_RECONNECT_BACKOFF;
@@ -523,7 +549,7 @@ async fn supervise(
                     continue;
                 }
             },
-            None => match reconnect(relay, &connector, &server_name).await {
+            None => match reconnect(relay, &connector, &server_name, from_port).await {
                 Some(t) => {
                     tcp_trace("tcp/reconnect", &format!("relay={relay} byte-pipe re-established"));
                     backoff = INITIAL_RECONNECT_BACKOFF;
@@ -567,7 +593,7 @@ async fn supervise(
 /// a read-EOF would never come. Either way → `TcpBroken` → the supervisor recycles the conn.
 async fn pump<R, W>(
     out_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-    in_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    in_tx: &mpsc::Sender<Vec<u8>>,
     read_half: &mut R,
     write_half: &mut W,
     mut stats: PipeStats,
@@ -580,8 +606,11 @@ where
         let mut buf = Vec::with_capacity(PIPE_WRITE_BATCH_BYTES + MAX_FRAME_LEN);
         while let Some(datagram) = out_rx.recv().await {
             let started = std::time::Instant::now();
-            let Ok((frames, bytes)) = write_frames(write_half, datagram, out_rx, &mut buf).await else {
-                return PumpEnd::TcpBroken; // TCP write failed
+            // A write the relay takes nothing of is a dead pipe too: a peer that stopped reading and
+            // kept sending held it for good, and quinn's datagrams piled up behind it (blind audit
+            // 2026-11-12, pass 17).
+            let Ok(Ok((frames, bytes))) = timeout(READ_IDLE_TIMEOUT, write_frames(write_half, datagram, out_rx, &mut buf)).await else {
+                return PumpEnd::TcpBroken; // TCP write failed or stalled
             };
             stats.add(frames, bytes, started.elapsed(), out_rx.len());
         }
@@ -596,7 +625,7 @@ where
             match timeout(window, read_frame(read_half)).await {
                 Ok(Ok(datagram)) => {
                     window = READ_IDLE_TIMEOUT;
-                    if in_tx.send(datagram).is_err() {
+                    if in_tx.send(datagram).await.is_err() {
                         return PumpEnd::SocketDropped; // in_rx dropped → socket gone
                     }
                 }
@@ -618,10 +647,18 @@ async fn reconnect(
     relay: SocketAddr,
     connector: &TlsConnector,
     server_name: &ServerName<'static>,
+    from_port: Option<u16>,
 ) -> Option<ClientTlsStream<TcpStream>> {
-    let tcp = match timeout(Duration::from_secs(10), TcpStream::connect(relay)).await {
-        Ok(Ok(stream)) => stream,
-        _ => return None,
+    let limit = Duration::from_secs(10);
+    let connected = match from_port {
+        Some(port) => omni_net_primitives::tcp_punch::connect_from_door_port(port, relay, limit).await,
+        None => match timeout(limit, TcpStream::connect(relay)).await {
+            Ok(result) => result,
+            Err(_) => return None,
+        },
+    };
+    let Ok(tcp) = connected else {
+        return None;
     };
     tcp.set_nodelay(true).ok();
     size_door_socket(&tcp);
@@ -647,6 +684,10 @@ pub fn tcp_trace(category: &str, message: &str) {
 pub(crate) fn trace_enabled() -> bool {
     omni_net_primitives::trace_enabled()
 }
+
+/// How many datagrams read off the pipe wait for quinn; past it the pipe is not read (TCP holds
+/// the peer back).
+const INBOUND_QUEUE_DATAGRAMS: usize = 4096;
 
 /// `UdpPoller` that is always writable — the outbound queue is unbounded, so `try_send`
 /// never needs to back-pressure. Not `WouldBlock` ever: the door rides `MuxRouter`, whose
@@ -732,6 +773,21 @@ const MAX_BRIDGE_CONNS: usize = 1024;
 /// the absolute bound is `MAX_BRIDGE_CONNS`.
 const MAX_BRIDGE_CONNS_PER_IP: usize = 64;
 
+/// How long an inbound conn may take to finish the outer TLS handshake before it is dropped and its
+/// permit and IP share go back. A real client does it in one round trip; a slow mobile link in a few.
+const INBOUND_TLS_HANDSHAKE_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long a bridged conn may carry no frame from its client before it is dropped. A live QUIC
+/// client sends at least a keep-alive every `QUIC_KEEP_ALIVE_INTERVAL` and its connection dies after
+/// `QUIC_MAX_IDLE_TIMEOUT` of silence, so a conn quiet for twice that carries nothing any more. One
+/// that finished TLS and sent nothing held its permit and its IP's share for good (blind audit
+/// 2026-11-12, pass 15).
+/// How many of our quinn's datagrams wait for a bridged client's pipe at most (some 24 MB of full
+/// datagrams): past it they are dropped, as on a full link.
+const BRIDGE_QUEUE_MAX_DATAGRAMS: usize = 16 * 1024;
+
+const BRIDGE_FRAME_IDLE_LIMIT: Duration = Duration::from_secs(2 * omni_net_primitives::QUIC_MAX_IDLE_TIMEOUT.as_secs());
+
 /// Relay side: accept TCP connections on `listen` and bridge each one to the relay's local
 /// QUIC UDP socket at `quic_udp`. Each connection gets its own ephemeral loopback UDP socket,
 /// so the relay's (unmodified) quinn endpoint sees every TCP peer as a distinct UDP peer. The
@@ -740,7 +796,7 @@ const MAX_BRIDGE_CONNS_PER_IP: usize = 64;
 pub async fn run_tcp_bridge(listen: SocketAddr, quic_udp: SocketAddr) -> io::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let acceptor = outer_tls_acceptor()?;
-    serve_tcp_bridge(listener, quic_udp, acceptor, MAX_BRIDGE_CONNS, MAX_BRIDGE_CONNS_PER_IP).await
+    serve_tcp_bridge(listener, quic_udp, acceptor, MAX_BRIDGE_CONNS, MAX_BRIDGE_CONNS_PER_IP, BridgeLimits::PRODUCTION).await
 }
 
 /// Like [`run_tcp_bridge`] but serves on an ALREADY-bound listener — so the caller can learn the
@@ -749,15 +805,29 @@ pub async fn run_tcp_bridge(listen: SocketAddr, quic_udp: SocketAddr) -> io::Res
 /// See docs/decisions/tcp-direct-peer-fallback.md.
 pub async fn run_tcp_bridge_on(listener: TcpListener, quic_udp: SocketAddr) -> io::Result<()> {
     let acceptor = outer_tls_acceptor()?;
-    serve_tcp_bridge(listener, quic_udp, acceptor, MAX_BRIDGE_CONNS, MAX_BRIDGE_CONNS_PER_IP).await
+    serve_tcp_bridge(listener, quic_udp, acceptor, MAX_BRIDGE_CONNS, MAX_BRIDGE_CONNS_PER_IP, BridgeLimits::PRODUCTION).await
 }
 
+/// How long a bridged conn may wait: for its TLS handshake, and for the next frame of its client.
+#[derive(Clone, Copy)]
+pub(crate) struct BridgeLimits {
+    pub(crate) handshake: Duration,
+    pub(crate) frame_idle: Duration,
+}
+
+impl BridgeLimits {
+    pub(crate) const PRODUCTION: Self = Self { handshake: INBOUND_TLS_HANDSHAKE_LIMIT, frame_idle: BRIDGE_FRAME_IDLE_LIMIT };
+}
+
+/// `limits`: [`BridgeLimits::PRODUCTION`] in production; a test passes short ones and runs on real
+/// time (a paused clock jumps past real socket events: see the test).
 pub(crate) async fn serve_tcp_bridge(
     listener: TcpListener,
     quic_udp: SocketAddr,
     acceptor: TlsAcceptor,
     max_total: usize,
     max_per_ip: usize,
+    limits: BridgeLimits,
 ) -> io::Result<()> {
     let total = Arc::new(Semaphore::new(max_total));
     let per_ip: Arc<StdMutex<HashMap<IpAddr, usize>>> = Arc::new(StdMutex::new(HashMap::new()));
@@ -790,7 +860,7 @@ pub(crate) async fn serve_tcp_bridge(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the conn's life → released when this task ends
-            let _ = bridge_one_conn(tcp, quic_udp, acceptor).await;
+            let _ = bridge_one_conn(tcp, quic_udp, acceptor, limits).await;
             let mut map = per_ip_dec.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(n) = map.get_mut(&ip) {
                 *n -= 1;
@@ -806,7 +876,9 @@ async fn bridge_one_conn(
     tcp: TcpStream,
     quic_udp: SocketAddr,
     acceptor: TlsAcceptor,
+    limits: BridgeLimits,
 ) -> io::Result<()> {
+    let handshake_limit = limits.handshake;
     tcp.set_nodelay(true).ok();
     size_door_socket(&tcp);
     // Diagnostic: distinguish a REAL carrier conn (completes the outer TLS, then carries framed QUIC)
@@ -815,14 +887,21 @@ async fn bridge_one_conn(
     // per accepted door conn + one summary when it ends. See relay-less-mobile-transport-findings.md.
     let peer = tcp.peer_addr().ok();
     // Terminate the outer TLS; below this point it is the same QUIC bytes as the native-UDP path.
-    let tls = match acceptor.accept(tcp).await {
-        Ok(tls) => {
+    // Bounded: the conn holds a bridge permit and its IP's share from accept on, and a client that
+    // opens TCP and never sends its ClientHello used to hold them for good (64 such conns lock out
+    // everyone behind that IP, 1024 the whole bridge).
+    let tls = match timeout(handshake_limit, acceptor.accept(tcp)).await {
+        Ok(Ok(tls)) => {
             tcp_trace("tcp/bridge-tls-ok", &format!("peer={peer:?}"));
             tls
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tcp_trace("tcp/bridge-tls-fail", &format!("peer={peer:?} err={e}"));
             return Err(e);
+        }
+        Err(_) => {
+            tcp_trace("tcp/bridge-tls-fail", &format!("peer={peer:?} no handshake within {handshake_limit:?}"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "inbound TLS handshake took too long"));
         }
     };
     let mut out_stats = PipeStats::writing("door/bridge-out", format!("to={peer:?}"), tls.get_ref().0);
@@ -848,10 +927,11 @@ async fn bridge_one_conn(
     let t2u = tokio::spawn(async move {
         let mut count = 0u64;
         let mut stats = PipeStats::new("door/bridge-in", format!("from={peer:?}"));
-        // `read_frame` erroring = TCP closed → stop forwarding.
+        // `read_frame` erroring = TCP closed → stop forwarding; so does a client silent past
+        // `BRIDGE_FRAME_IDLE_LIMIT`.
         loop {
             let started = std::time::Instant::now();
-            let Ok(dg) = read_frame(&mut tcp_r).await else {
+            let Ok(Ok(dg)) = timeout(limits.frame_idle, read_frame(&mut tcp_r)).await else {
                 break;
             };
             let waited = started.elapsed();
@@ -870,11 +950,20 @@ async fn bridge_one_conn(
     // whenever the TCP write waited, its buffer overflowed and the datagrams were lost — 58% of what
     // our quinn sent back over the door (live 2026-10-16: 0.8 MB/s from the door's owner, 10 MB/s to
     // it). A UDP socket never pushes back, so a full buffer is a silent drop; the queue never is.
+    // The queue has a bound all the same, and so has a write: a client that stopped reading the pipe
+    // grew the queue for as long as it kept the conn up, and held the write for good (blind audit
+    // 2026-11-12, pass 16). Over the bound a datagram is dropped, as the network would.
     let (u2q_tx, mut u2q_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let udp_recv = Arc::clone(&udp);
+    let queued_in = Arc::clone(&queued);
     let u2q = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_FRAME_LEN];
         while let Ok(n) = udp_recv.recv(&mut buf).await {
+            if queued_in.load(std::sync::atomic::Ordering::Relaxed) >= BRIDGE_QUEUE_MAX_DATAGRAMS {
+                continue;
+            }
+            queued_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if u2q_tx.send(buf[..n].to_vec()).is_err() {
                 break;
             }
@@ -885,7 +974,11 @@ async fn bridge_one_conn(
         let mut buf = Vec::with_capacity(PIPE_WRITE_BATCH_BYTES + MAX_FRAME_LEN);
         while let Some(datagram) = u2q_rx.recv().await {
             let started = std::time::Instant::now();
-            let (frames, bytes) = write_frames(&mut tcp_w, datagram, &mut u2q_rx, &mut buf).await?;
+            let written = timeout(limits.frame_idle, write_frames(&mut tcp_w, datagram, &mut u2q_rx, &mut buf))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the client took nothing of the pipe"))?;
+            let (frames, bytes) = written?;
+            queued.fetch_sub(usize::try_from(frames).unwrap_or(usize::MAX).min(queued.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
             stats.add(frames, bytes, started.elapsed(), u2q_rx.len());
         }
         Ok::<(), io::Error>(())
@@ -930,6 +1023,39 @@ mod tests {
         }
     }
 
+    /// Blind audit 2026-11-11, pass 13: what came over the pipe was queued for quinn without a bound.
+    /// The pump now stops reading while quinn is behind, and nothing is lost when it catches up.
+    #[tokio::test]
+    async fn the_pipe_is_not_read_while_quinn_is_behind_and_nothing_is_lost() {
+        let total = INBOUND_QUEUE_DATAGRAMS + 30_000; // more than the pipe itself buffers
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let (mut far_read, mut far_write) = tokio::io::split(far);
+        let writer = tokio::spawn(async move {
+            for i in 0..total {
+                write_frame(&mut far_write, &(i as u32).to_be_bytes()).await.unwrap();
+            }
+            far_write
+        });
+        tokio::spawn(async move {
+            let mut sink = [0u8; 1024];
+            while far_read.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+        });
+        let (_out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(INBOUND_QUEUE_DATAGRAMS);
+        let (mut read_half, mut write_half) = tokio::io::split(near);
+        let pumping = tokio::spawn(async move {
+            pump(&mut out_rx, &in_tx, &mut read_half, &mut write_half, PipeStats::new("test", String::new())).await;
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(in_rx.len(), INBOUND_QUEUE_DATAGRAMS, "up to the bound, and no further");
+        assert!(!writer.is_finished(), "the peer is held back by the pipe");
+        for i in 0..total {
+            let datagram = timeout(Duration::from_secs(10), in_rx.recv()).await.unwrap().unwrap();
+            assert_eq!(datagram, (i as u32).to_be_bytes(), "in order, none lost");
+        }
+        pumping.abort();
+    }
+
     /// Every datagram that came over the pipe reaches quinn, however few buffers it hands per call:
     /// with one buffer (quinn on Windows) a datagram is left in the queue for the next call, not
     /// taken out and dropped.
@@ -937,9 +1063,9 @@ mod tests {
     fn no_datagram_is_lost_when_quinn_hands_fewer_buffers_than_wait() {
         let peer: SocketAddr = "203.0.113.9:443".parse().unwrap();
         for buffers in [1usize, 2, 3] {
-            let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(INBOUND_QUEUE_DATAGRAMS);
             for i in 1..10u8 {
-                tx.send(vec![i; 100]).unwrap();
+                tx.try_send(vec![i; 100]).unwrap();
             }
             let mut got = Vec::new();
             let mut first = Some(vec![0u8; 100]);
@@ -1160,7 +1286,7 @@ mod tests {
             let bridge_addr = listener.local_addr().unwrap();
             let acceptor = outer_tls_acceptor().unwrap();
             tokio::spawn(async move {
-                let _ = serve_tcp_bridge(listener, quic_addr, acceptor, max_total, max_per_ip).await;
+                let _ = serve_tcp_bridge(listener, quic_addr, acceptor, max_total, max_per_ip, BridgeLimits::PRODUCTION).await;
             });
 
             // Two connections fill the cap; the bridge holds them open (it blocks reading frames).
@@ -1183,6 +1309,72 @@ mod tests {
                 "under-cap conn stays open (caps {max_total}/{max_per_ip})"
             );
         }
+    }
+
+    /// A conn that never starts its TLS handshake gives back its permit and its IP's share after
+    /// [`INBOUND_TLS_HANDSHAKE_LIMIT`]: with a per-IP cap of one, a silent conn used to lock that IP
+    /// out for good (security review 2026-11-09, F6).
+    ///
+    /// Real time, a short limit: on a paused clock (as it ran first) the runtime, idle while the
+    /// accept was still on its way from the OS, jumped the clock past the client's own timeout before
+    /// the bridge had even started the handshake — it failed only in the full gate, under load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conn_that_never_handshakes_gives_its_slot_back() {
+        let limit = Duration::from_secs(1);
+        let quic_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let quic_addr = quic_udp.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_addr = listener.local_addr().unwrap();
+        let acceptor = outer_tls_acceptor().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_tcp_bridge(listener, quic_addr, acceptor, 100, 1, BridgeLimits { handshake: limit, frame_idle: BRIDGE_FRAME_IDLE_LIMIT }).await;
+        });
+        let mut silent = TcpStream::connect(bridge_addr).await.unwrap();
+        let mut b = [0u8; 1];
+        let n = timeout(limit + Duration::from_secs(10), silent.read(&mut b))
+            .await
+            .expect("the silent conn is closed once the handshake limit passes")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        // The IP's one slot is free again: the next conn is held open, not shed.
+        let mut next = TcpStream::connect(bridge_addr).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(400), next.read(&mut b)).await.is_err(),
+            "the next conn of the same IP is taken"
+        );
+    }
+
+    /// Blind audit 2026-11-12, pass 15: a client that finished TLS and then sent no frame held its
+    /// permit and its IP's share for good. Past the frame-idle limit the conn is closed and the slot
+    /// is free again. Real time, short limits, as above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conn_that_sends_no_frame_after_tls_gives_its_slot_back() {
+        let limits = BridgeLimits { handshake: Duration::from_secs(5), frame_idle: Duration::from_secs(1) };
+        let quic_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let quic_addr = quic_udp.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_addr = listener.local_addr().unwrap();
+        let acceptor = outer_tls_acceptor().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_tcp_bridge(listener, quic_addr, acceptor, 100, 1, limits).await;
+        });
+        let tcp = TcpStream::connect(bridge_addr).await.unwrap();
+        let mut silent = outer_tls_connector()
+            .unwrap()
+            .connect(ServerName::try_from(OUTER_TLS_SNI).unwrap(), tcp)
+            .await
+            .expect("the outer TLS handshake completes");
+        let mut b = [0u8; 1];
+        let n = timeout(limits.frame_idle + Duration::from_secs(10), silent.read(&mut b))
+            .await
+            .expect("the silent conn is closed once the frame-idle limit passes")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        let mut next = TcpStream::connect(bridge_addr).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(400), next.read(&mut b)).await.is_err(),
+            "the next conn of the same IP is taken"
+        );
     }
 
     /// End-to-end: a real QUIC handshake + uni-stream over the FULL production path —
@@ -1220,7 +1412,7 @@ mod tests {
                 let Ok((tcp, _)) = listener.accept().await else { break };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    let _ = bridge_one_conn(tcp, server_udp_addr, acceptor).await;
+                    let _ = bridge_one_conn(tcp, server_udp_addr, acceptor, BridgeLimits::PRODUCTION).await;
                 });
             }
         });

@@ -1,0 +1,93 @@
+name: libwebrtc
+
+# Builds the pinned libwebrtc once and publishes the part the native media module needs as a
+# libwebrtc kit: a .tar.gz on the release "libwebrtc-<key>", with a signed build provenance
+# attestation. The release workflow then takes the kit instead of building libwebrtc for an hour,
+# after checking that this workflow built it (gh attestation verify) and that its key matches the
+# scripts of the commit being released. Anyone can check the kit the same way:
+#
+#   gh attestation verify libwebrtc-kit.tar.gz -R <owner>/<repo> --signer-workflow <owner>/<repo>/.github/workflows/libwebrtc.yml
+#
+# The key is a hash of the scripts that decide the build (scripts/pack-libwebrtc-kit.ps1), so a new
+# revision or different GN arguments make a new key and a new kit; an existing kit is never rebuilt.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/bootstrap-libwebrtc.ps1
+      - scripts/build-libwebrtc.ps1
+      - scripts/pack-libwebrtc-kit.ps1
+      - .github/workflows/libwebrtc.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: libwebrtc
+  cancel-in-progress: false
+
+jobs:
+  libwebrtc:
+    runs-on: windows-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kit key
+        id: kit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $key = .\scripts\pack-libwebrtc-kit.ps1 -KeyOnly
+          "key=$key" | Add-Content -Path $env:GITHUB_OUTPUT
+          gh release view "libwebrtc-$key" --repo $env:GITHUB_REPOSITORY *> $null
+          $exists = $LASTEXITCODE -eq 0
+          "exists=$($exists.ToString().ToLower())" | Add-Content -Path $env:GITHUB_OUTPUT
+          Write-Host "kit libwebrtc-$key $(if ($exists) { 'already published - nothing to do' } else { 'not published yet - building' })"
+          exit 0
+
+      # libwebrtc takes tens of GB: build on whichever drive has the most room.
+      - name: Pick the build drive
+        if: steps.kit.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -match '^[A-Z]$' -and $_.Free -gt 0 }
+          $best = $drives | Sort-Object Free -Descending | Select-Object -First 1
+          "OMNI_BUILD_ROOT=$($best.Name):\omni-build" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host "building on $($best.Name): ($([int]($best.Free/1GB)) GB free)"
+
+      - name: libwebrtc sources (pinned revision)
+        if: steps.kit.outputs.exists != 'true'
+        shell: pwsh
+        run: .\scripts\bootstrap-libwebrtc.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps" -Sync -RunHooks
+
+      - name: libwebrtc build
+        if: steps.kit.outputs.exists != 'true'
+        shell: pwsh
+        run: .\scripts\build-libwebrtc.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps"
+
+      - name: Pack the kit
+        if: steps.kit.outputs.exists != 'true'
+        shell: pwsh
+        run: .\scripts\pack-libwebrtc-kit.ps1 -DependencyRoot "$env:OMNI_BUILD_ROOT\deps" -Output kit\libwebrtc-kit.tar.gz
+
+      - uses: actions/attest-build-provenance@v2
+        if: steps.kit.outputs.exists != 'true'
+        with:
+          subject-path: kit/libwebrtc-kit.tar.gz
+
+      - name: Publish the kit
+        if: steps.kit.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $key = '${{ steps.kit.outputs.key }}'
+          $notes = "libwebrtc build used by the release workflow (not an Omni release). Built by this repository's libwebrtc workflow from $env:GITHUB_SHA.`n`nVerify:`n`n    gh attestation verify libwebrtc-kit.tar.gz -R $env:GITHUB_REPOSITORY --signer-workflow $env:GITHUB_REPOSITORY/.github/workflows/libwebrtc.yml"
+          gh release create "libwebrtc-$key" kit\libwebrtc-kit.tar.gz --prerelease --latest=false --target $env:GITHUB_SHA --title "libwebrtc kit $key" --notes $notes

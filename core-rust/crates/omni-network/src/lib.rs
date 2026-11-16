@@ -42,12 +42,13 @@ pub use announce::{
     ANNOUNCE_CAP_FRIEND_RELAY, ANNOUNCE_WIRE_VERSION, MAX_HOP_COUNT,
 };
 pub use durable::{
-    group_destination_address, group_feed_id, group_msg_id, FeedId, ReconcileEngine,
+    direct_feed_id, feed_is_bound_to, group_destination_address, group_feed_id, group_msg_id, FeedId,
+    ReconcileEngine,
     ReconcileState,
 };
 pub use cert::{
     derive_cert_from_signing_key, fresh_challenge_nonce, respond_to_challenge,
-    verify_challenge_response, CertError, ChallengeResponse, CHALLENGE_NONCE_BYTES,
+    verify_challenge_response, CertError, ChallengeResponse, CHALLENGE_NONCE_BYTES, CHANNEL_BINDING_BYTES,
     IDENTITY_CHALLENGE_DOMAIN,
 };
 pub use interface::{
@@ -58,7 +59,7 @@ pub use multicast_interface::{
     MulticastConfig, MulticastInterface, OMNI_MULTICAST_GROUP, OMNI_MULTICAST_PORT,
 };
 pub use network::{
-    CarrierPreference, Link, LinkQuality, Network, NetworkError, PeerLinkFacts, ReachabilityState,
+    CarrierPreference, DurableInFlight, Link, LinkQuality, Network, NetworkError, PeerLinkFacts, ReachabilityState,
     DEFAULT_ANNOUNCE_TTL_SECONDS,
 };
 pub use path_table::{PathEntry, PathTable};

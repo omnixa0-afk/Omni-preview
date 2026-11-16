@@ -166,9 +166,25 @@ impl Storage {
         self.with_immediate_transaction("record_delivery_receipt", |storage| {
             let profile_id = storage.resolve_transition_profile_id()?;
             let normalized_dialog_key = normalize_dialog_key(dialog_key);
+            // A receipt speaks only for a message of the chat it came over: a contact that knew the id
+            // of our message to someone else used to mark it delivered and stop its resending
+            // (security review 2026-11-09, F4).
+            let elsewhere = storage
+                .connection
+                .query_row(
+                    "SELECT 1 FROM messages WHERE id = ?1 AND profile_id = ?2 AND dialog_key != ?3",
+                    params![message_id, profile_id.0, normalized_dialog_key],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .is_some();
+            if elsewhere {
+                return Ok(None);
+            }
             // Kept even for a message not here yet: the contact tells every device of ours, and the
             // copy of a message sent from another of them may still be on its way
-            // (`insert_sent_copy` applies the receipt when it lands).
+            // (`insert_sent_copy` applies the receipt when it lands — of the same chat only).
             storage
                 .connection
                 .execute(
@@ -181,7 +197,7 @@ impl Storage {
                         profile_id
                     )
                     VALUES (?1, ?2, ?3, ?4, ?5)
-                    ON CONFLICT(message_id) DO UPDATE SET
+                    ON CONFLICT(profile_id, message_id) DO UPDATE SET
                         dialog_key = excluded.dialog_key,
                         delivered_at_unix_ms = excluded.delivered_at_unix_ms,
                         recorded_at_unix_ms = excluded.recorded_at_unix_ms,
@@ -208,8 +224,9 @@ impl Storage {
                     WHERE id = ?1
                       AND direction = 'outgoing'
                       AND profile_id = ?4
+                      AND dialog_key = ?5
                     ",
-                    params![message_id, delivered_at_unix_ms, recorded_at_unix_ms, profile_id.0],
+                    params![message_id, delivered_at_unix_ms, recorded_at_unix_ms, profile_id.0, normalized_dialog_key],
                 )
                 .map_err(map_sqlite_error)?;
 
@@ -457,43 +474,7 @@ impl Storage {
                 )
                 .map_err(map_sqlite_error)?;
 
-            let (signature_r, signature_s) =
-                signature_to_wire(hierarchy.signed_prekey.signature.clone());
-            storage
-                .connection
-                .execute(
-                    "
-                    INSERT INTO signed_prekeys (
-                        prekey_id,
-                        device_id,
-                        public_key,
-                        private_key_protection_scheme,
-                        private_key_blob,
-                        signature_r,
-                        signature_s,
-                        suite_version,
-                        state,
-                        created_at_unix_ms,
-                        expires_at_unix_ms,
-                        updated_at_unix_ms
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11)
-                    ",
-                    params![
-                        hierarchy.signed_prekey.prekey_id as i64,
-                        hierarchy.signed_prekey.device_id.0,
-                        prekey_public_key_to_wire(hierarchy.signed_prekey.public_key),
-                        hierarchy.signed_prekey.protected_private_key.scheme.as_db_value(),
-                        hierarchy.signed_prekey.protected_private_key.blob_hex,
-                        signature_r,
-                        signature_s,
-                        hierarchy.signed_prekey.suite_version as i64,
-                        hierarchy.signed_prekey.created_at_unix_ms,
-                        hierarchy.signed_prekey.expires_at_unix_ms,
-                        hierarchy.signed_prekey.updated_at_unix_ms,
-                    ],
-                )
-                .map_err(map_sqlite_error)?;
+            storage.insert_signed_prekey_row(&hierarchy.signed_prekey)?;
 
             for prekey in &hierarchy.one_time_prekeys {
                 storage
@@ -530,6 +511,46 @@ impl Storage {
 
             Ok(())
         })
+    }
+
+    /// One `active` signed prekey row (a new foundation, or a rotation inside its transaction).
+    pub(crate) fn insert_signed_prekey_row(&self, prekey: &omni_crypto::SignedPrekey) -> OmniResult<()> {
+        let (signature_r, signature_s) = signature_to_wire(prekey.signature.clone());
+        self.connection
+            .execute(
+                "
+                INSERT INTO signed_prekeys (
+                    prekey_id,
+                    device_id,
+                    public_key,
+                    private_key_protection_scheme,
+                    private_key_blob,
+                    signature_r,
+                    signature_s,
+                    suite_version,
+                    state,
+                    created_at_unix_ms,
+                    expires_at_unix_ms,
+                    updated_at_unix_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11)
+                ",
+                params![
+                    prekey.prekey_id as i64,
+                    prekey.device_id.0,
+                    prekey_public_key_to_wire(prekey.public_key),
+                    prekey.protected_private_key.scheme.as_db_value(),
+                    prekey.protected_private_key.blob_hex,
+                    signature_r,
+                    signature_s,
+                    prekey.suite_version as i64,
+                    prekey.created_at_unix_ms,
+                    prekey.expires_at_unix_ms,
+                    prekey.updated_at_unix_ms,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
     }
 
     /// Долить одноразовые предключи, не трогая идентичность и подписанный предключ.
@@ -961,7 +982,7 @@ impl Storage {
                     profile_id
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(message_id) DO UPDATE SET
+                ON CONFLICT(profile_id, message_id) DO UPDATE SET
                     dialog_key = excluded.dialog_key,
                     status = excluded.status,
                     attempt_count = excluded.attempt_count,

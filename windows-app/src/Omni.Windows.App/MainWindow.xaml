@@ -10,10 +10,57 @@
   xmlns:contacts="using:Omni.Windows.App.Features.Contacts"
   xmlns:settings="using:Omni.Windows.App.Features.Settings"
   xmlns:diagnostics="using:Omni.Windows.App.Features.Diagnostics"
+  xmlns:workspaces="using:Omni.Windows.App.Features.Workspaces"
   xmlns:calls="using:Omni.Windows.App.Features.Calls"
   xmlns:shared="using:Omni.Windows.App.Features.Shared"
   mc:Ignorable="d">
   <Grid Background="{ThemeResource OmniBgAppBrush}">
+    <!-- A ComboBox's list and the InfoBars in the app's colours: their templates read these Fluent keys
+         themselves, and an override takes on an element above them, not in App.xaml (see the popup
+         styles there). An InfoBar is a soft tint of its state's colour, not Fluent's olive and wine
+         (owner, 2026-10-30: «не очень приятно выглядит»). -->
+    <Grid.Resources>
+      <ResourceDictionary>
+        <ResourceDictionary.ThemeDictionaries>
+          <ResourceDictionary x:Key="Dark">
+            <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#172232" />
+            <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#324761" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="#1E2F45" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundPressed" Color="#223349" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="#223349" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="#2A3F5A" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="#2A3F5A" />
+            <SolidColorBrush x:Key="InfoBarSuccessSeverityBackgroundBrush" Color="#14261F" />
+            <SolidColorBrush x:Key="InfoBarErrorSeverityBackgroundBrush" Color="#2C181C" />
+            <SolidColorBrush x:Key="InfoBarWarningSeverityBackgroundBrush" Color="#2A2416" />
+            <SolidColorBrush x:Key="InfoBarInformationalSeverityBackgroundBrush" Color="#1D2A3D" />
+            <SolidColorBrush x:Key="InfoBarSuccessSeverityIconBackground" Color="#3DB57A" />
+            <SolidColorBrush x:Key="InfoBarErrorSeverityIconBackground" Color="#E5484D" />
+            <SolidColorBrush x:Key="InfoBarWarningSeverityIconBackground" Color="#E0A33A" />
+            <SolidColorBrush x:Key="InfoBarInformationalSeverityIconBackground" Color="#9AAED7" />
+            <SolidColorBrush x:Key="InfoBarBorderBrush" Color="#26334A" />
+          </ResourceDictionary>
+          <ResourceDictionary x:Key="Light">
+            <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#FFFFFF" />
+            <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#C2CEDE" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="#E7EDF6" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundPressed" Color="#DCE6F6" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="#DCE6F6" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="#CDDBF1" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPressed" Color="#CDDBF1" />
+            <SolidColorBrush x:Key="InfoBarSuccessSeverityBackgroundBrush" Color="#E6F4EC" />
+            <SolidColorBrush x:Key="InfoBarErrorSeverityBackgroundBrush" Color="#FBEBEC" />
+            <SolidColorBrush x:Key="InfoBarWarningSeverityBackgroundBrush" Color="#FBF2DF" />
+            <SolidColorBrush x:Key="InfoBarInformationalSeverityBackgroundBrush" Color="#E4EAF4" />
+            <SolidColorBrush x:Key="InfoBarSuccessSeverityIconBackground" Color="#2B9A66" />
+            <SolidColorBrush x:Key="InfoBarErrorSeverityIconBackground" Color="#DC3E42" />
+            <SolidColorBrush x:Key="InfoBarWarningSeverityIconBackground" Color="#C27F12" />
+            <SolidColorBrush x:Key="InfoBarInformationalSeverityIconBackground" Color="#3D5A8C" />
+            <SolidColorBrush x:Key="InfoBarBorderBrush" Color="#D3DCE9" />
+          </ResourceDictionary>
+        </ResourceDictionary.ThemeDictionaries>
+      </ResourceDictionary>
+    </Grid.Resources>
     <Grid
       x:Name="BootRoot"
       Padding="40">
@@ -23,6 +70,7 @@
         VerticalAlignment="Center"
         Spacing="18">
         <ProgressRing
+          x:Name="BootRing"
           Width="56"
           Height="56"
           HorizontalAlignment="Center"
@@ -217,78 +265,95 @@
           </VisualStateGroup>
         </VisualStateManager.VisualStateGroups>
 
-        <NavigationView
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- The sections' rail: each icon with its name under it, always (docs/decisions/omni-app-ux.md §2;
+             a bare icon told a newcomer nothing). Its own control, not a NavigationView: that one names
+             its items only in the open drawer. -->
+        <shared:ShellRail
           x:Name="AuthenticatedNavigationView"
-          CompactPaneLength="56"
-          IsBackButtonVisible="Collapsed"
-          IsSettingsVisible="False"
-          OpenPaneLength="228"
-          PaneDisplayMode="LeftCompact"
-          SelectionChanged="OnAuthenticatedNavigationSelectionChanged">
-          <!-- One pane surface whether the drawer is folded or open. Fluent paints the open
-               (overlay) drawer with its own lighter in-app acrylic and the folded rail with
-               another brush, so opening and folding it flipped the colour in one frame (owner,
-               2026-10-10: "светлый моментально сменяется тёмным"). Set here, on the control:
-               app-level overrides of Fluent's own keys don't take. -->
-          <NavigationView.Resources>
+          Grid.Column="0"
+          Width="72">
+          <shared:ShellRail.Resources>
             <ResourceDictionary>
               <ResourceDictionary.ThemeDictionaries>
                 <ResourceDictionary x:Key="Dark">
-                  <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="#0F1924" />
-                  <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="#0F1924" />
+                  <SolidColorBrush x:Key="OmniRailBackgroundBrush" Color="#0F1924" />
                 </ResourceDictionary>
                 <ResourceDictionary x:Key="Light">
-                  <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="#FFFFFF" />
-                  <SolidColorBrush x:Key="NavigationViewExpandedPaneBackground" Color="#FFFFFF" />
+                  <SolidColorBrush x:Key="OmniRailBackgroundBrush" Color="#FFFFFF" />
                 </ResourceDictionary>
               </ResourceDictionary.ThemeDictionaries>
             </ResourceDictionary>
-          </NavigationView.Resources>
-          <NavigationView.MenuItems>
-            <NavigationViewItem
-              x:Name="ChatsNavigationItem"
-              AutomationProperties.AutomationId="ChatsNavigationItem"
-              Content="Чаты"
-              Tag="Chats">
-              <NavigationViewItem.Icon>
-                <SymbolIcon Symbol="Message" />
-              </NavigationViewItem.Icon>
-            </NavigationViewItem>
-            <NavigationViewItem
-              x:Name="ContactsNavigationItem"
-              AutomationProperties.AutomationId="ContactsNavigationItem"
-              Content="Контакты"
-              Tag="Contacts">
-              <NavigationViewItem.Icon>
-                <SymbolIcon Symbol="People" />
-              </NavigationViewItem.Icon>
-            </NavigationViewItem>
-            <NavigationViewItem
-              x:Name="SettingsNavigationItem"
-              Content="Настройки"
-              Tag="Settings">
-              <NavigationViewItem.Icon>
-                <SymbolIcon Symbol="Setting" />
-              </NavigationViewItem.Icon>
-            </NavigationViewItem>
-            <NavigationViewItem
-              x:Name="DiagnosticsNavigationItem"
-              Content="Диагностика"
-              Tag="Diagnostics">
-              <NavigationViewItem.Icon>
-                <FontIcon Glyph="&#xE9D9;" />
-              </NavigationViewItem.Icon>
-            </NavigationViewItem>
-          </NavigationView.MenuItems>
-
-          <NavigationView.PaneFooter>
+          </shared:ShellRail.Resources>
+          <Border
+            Background="{ThemeResource OmniRailBackgroundBrush}"
+            BorderBrush="{ThemeResource OmniStrokeBrush}"
+            BorderThickness="0,0,1,0">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+              </Grid.RowDefinitions>
+              <StackPanel Padding="0,6,0,0">
+                <shared:ShellRailItem
+                  x:Name="ChatsNavigationItem"
+                  AutomationProperties.AutomationId="ChatsNavigationItem"
+                  Label="Чаты"
+                  Tag="Chats">
+                  <shared:ShellRailItem.Icon>
+                    <SymbolIcon Symbol="Message" />
+                  </shared:ShellRailItem.Icon>
+                </shared:ShellRailItem>
+                <!-- Groups with projects (docs/decisions/omni-workspace-ux.md): right under the chats
+                     (owner, 2026-10-30). A briefcase, not `{}`: the work is CAD and documents too. -->
+                <shared:ShellRailItem
+                  x:Name="WorkspacesNavigationItem"
+                  AutomationProperties.AutomationId="WorkspacesNavigationItem"
+                  Label="Workspaces"
+                  Tag="Workspaces">
+                  <shared:ShellRailItem.Icon>
+                    <FontIcon Glyph="&#xE821;" />
+                  </shared:ShellRailItem.Icon>
+                </shared:ShellRailItem>
+                <shared:ShellRailItem
+                  x:Name="ContactsNavigationItem"
+                  AutomationProperties.AutomationId="ContactsNavigationItem"
+                  Label="Контакты"
+                  Tag="Contacts">
+                  <shared:ShellRailItem.Icon>
+                    <SymbolIcon Symbol="People" />
+                  </shared:ShellRailItem.Icon>
+                </shared:ShellRailItem>
+              </StackPanel>
+              <!-- The rare ones at the bottom, then who is signed in. -->
+              <StackPanel Grid.Row="1" Padding="0,0,0,8" Spacing="4">
+                <shared:ShellRailItem
+                  x:Name="SettingsNavigationItem"
+                  Label="Настройки"
+                  Tag="Settings">
+                  <shared:ShellRailItem.Icon>
+                    <SymbolIcon Symbol="Setting" />
+                  </shared:ShellRailItem.Icon>
+                </shared:ShellRailItem>
+                <shared:ShellRailItem
+                  x:Name="DiagnosticsNavigationItem"
+                  Label="Помощь"
+                  Tag="Diagnostics">
+                  <shared:ShellRailItem.Icon>
+                    <FontIcon Glyph="&#xE897;" />
+                  </shared:ShellRailItem.Icon>
+                </shared:ShellRailItem>
             <Grid
               x:Name="IdentityFooter"
-              Margin="4,2,4,6"
-              Padding="8,6"
+              Margin="0,6,0,0"
+              Padding="6"
               Background="{ThemeResource OmniBgElevatedBrush}"
               CornerRadius="10"
-              ColumnSpacing="10"
+              HorizontalAlignment="Center"
               Tapped="OnIdentityFooterTapped"
               AutomationProperties.Name="Профиль">
               <Grid.ColumnDefinitions>
@@ -302,15 +367,21 @@
                 VerticalAlignment="Center"
                 FontWeight="SemiBold"
                 Text="Профиль не загружен"
+                Visibility="Collapsed"
                 TextTrimming="CharacterEllipsis" />
             </Grid>
-          </NavigationView.PaneFooter>
+              </StackPanel>
+            </Grid>
+          </Border>
+        </shared:ShellRail>
 
-          <Grid
+        <Grid
             x:Name="AuthenticatedContentHost"
+            Grid.Column="1"
             Padding="0">
             <chats:ChatsSectionControl x:Name="ChatsSectionHost" />
             <contacts:ContactsSectionControl x:Name="ContactsSectionHost" />
+            <workspaces:WorkspacesSectionControl x:Name="WorkspacesSectionHost" />
             <settings:SettingsSectionControl x:Name="SettingsSectionHost" />
             <diagnostics:DiagnosticsSectionControl x:Name="DiagnosticsSectionHost" />
             <!-- A group call rings over whatever section is open (MainWindow.Groups.cs). -->
@@ -335,7 +406,6 @@
               </InfoBar.Content>
             </InfoBar>
           </Grid>
-        </NavigationView>
         </Grid>
       </Grid>
     </Grid>

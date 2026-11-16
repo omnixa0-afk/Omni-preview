@@ -160,12 +160,6 @@ public sealed partial class MainWindow
         return await StageFilePathToTempAsync(sourcePath, stagedFileName);
     }
 
-    private async Task<string> StagePublicAvatarSourceAsync(StorageFile file)
-    {
-        string stagedFileName = BuildStagedPublicAvatarFileName(file.Name);
-        return await StageStorageFileToTempAsync(file, stagedFileName);
-    }
-
     private void DeletePendingPublicAvatarSourceFile()
     {
         string? sourcePath = pendingPublicAvatarSourcePath;
@@ -310,13 +304,7 @@ public sealed partial class MainWindow
                 throw new InvalidOperationException("Выберите существующий файл изображения, а не папку.");
             }
 
-            DeletePendingPublicAvatarSourceFile();
-            pendingPublicAvatarSourcePath = await StagePublicAvatarSourceAsync(file.FullName);
-            pendingPublicAvatarDisplayName = file.Name;
-            pendingPublicAvatarClearRequested = false;
-            RenderLocalPublicProfileEditor();
-            SettingsStatusTextBlock.Text = $"Выбран новый аватар: {file.Name}.";
-            UpdateControlStates();
+            await CropPublicAvatarAsync(file.FullName);
         }
         catch (Exception ex)
         {
@@ -324,6 +312,27 @@ public sealed partial class MainWindow
             SettingsProfileEditorStatusTextBlock.Text = $"Не удалось выбрать аватар: {errorText}";
             SettingsStatusTextBlock.Text = SettingsProfileEditorStatusTextBlock.Text;
         }
+    }
+
+    /// The picked picture through the crop frame; what the frame shows becomes the pending avatar.
+    private async Task CropPublicAvatarAsync(string sourcePath)
+    {
+        string croppedPath = GetUiTempFilePath(BuildStagedPublicAvatarFileName("avatar.png"));
+        if (!await Features.Shared.PhotoCropDialog.ShowAsync(
+                Content.XamlRoot, MainWindowPresentation.ActiveTheme, "Фото профиля", sourcePath, croppedPath))
+        {
+            SettingsProfileEditorStatusTextBlock.Text = "Выбор аватара отменён.";
+            return;
+        }
+
+        string name = Path.GetFileName(sourcePath);
+        DeletePendingPublicAvatarSourceFile();
+        pendingPublicAvatarSourcePath = croppedPath;
+        pendingPublicAvatarDisplayName = name;
+        pendingPublicAvatarClearRequested = false;
+        // The editor's own line says it under the photo; the page's status line would repeat it.
+        RenderLocalPublicProfileEditor();
+        UpdateControlStates();
     }
 
     private void OnSettingsClearAvatarClicked(object sender, RoutedEventArgs e)

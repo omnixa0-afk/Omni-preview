@@ -22,7 +22,7 @@ The guiding rule is simple:
 
 - `windows-app/`
   - WinUI 3 shell
-  - renders chats, contacts, settings, devices, files, diagnostics, saved profiles, LAN peers, and call surfaces
+  - renders chats, contacts, groups, settings, devices, files, diagnostics, saved profiles and call surfaces
   - talks to Rust through FFI only
 - `core-rust/crates/omni-ffi`
   - stable C ABI
@@ -31,7 +31,7 @@ The guiding rule is simple:
   - shared product types, screen snapshots, call DTOs, and foundational errors
 - `core-rust/crates/omni-app`
   - orchestration layer
-  - composes storage, transport, identity, messaging, routing, and projections
+  - composes storage, transport, identity, messaging, mesh, calls, groups and projections
 - `core-rust/crates/omni-transport`
   - session seam for the mesh: verified connections registered by mesh links, inbound envelope dispatch, send through the mesh carrier or durable store-and-forward (the pre-mesh QUIC listener/dialer is gone, `docs/decisions/no-friend-tier.md` part 2)
 - `core-rust/crates/omni-storage`
@@ -44,8 +44,28 @@ The guiding rule is simple:
   - encrypted 1:1 envelope flow
 - `core-rust/crates/omni-protocol`
   - versioned DTOs and control-plane payload contracts
-- `core-rust/crates/omni-sync`
-  - device and sync domain helpers
+- `core-rust/crates/omni-group-mls`
+  - group membership and messaging crypto (MLS)
+- `core-rust/crates/omni-network`
+  - the mesh overlay: links, announce routing, relays, durable store-and-forward, media datagrams
+- `core-rust/crates/omni-mesh-runtime`
+  - the `MeshRuntime` facade over `omni-network` (links, carriers, lifecycle)
+- `core-rust/crates/omni-net-primitives`
+  - identity-agnostic network primitives (QUIC config, multicast, STUN)
+- `core-rust/crates/omni-rendezvous`
+  - serverless rendezvous: the channel trait, topics, sealed beacons
+- `core-rust/crates/omni-rendezvous-providers`
+  - rendezvous couriers: ntfy, Nostr, BitTorrent DHT
+- `core-rust/crates/omni-rendezvous-helper`, `core-rust/crates/omni-dht-helper`
+  - the courier and Mainline DHT helper processes (key-free, untrusted)
+- `core-rust/crates/omni-daemon`
+  - the reusable daemon/CLI command dispatcher
+- `core-rust/crates/omni-node`
+  - a headless node over `omni-app`, for development and validation
+
+## Workspaces and agent integrations
+
+A workspace brings group discussions, tasks, code repositories and versioned file projects into the shell. Rust owns task state, permissions and file-version recovery. The MCP server exposes workspace tools to local agent clients. Its wait and acknowledgement calls use profile storage. See [workspace tasks](core-rust/crates/omni-app/src/app_workspace_tasks.rs), [file versions](core-rust/crates/omni-app/src/app_workspace_versions.rs) and [MCP tools](core-rust/crates/omni-mcp/src/tools.rs).
 
 ## Active Session Boundary
 
@@ -134,6 +154,10 @@ The product keeps these state families independent:
 
 These do not collapse into one mega-status.
 
+## Local profile lifecycle
+
+Creating or restoring a profile makes it available in the profile chooser on that device. Signing out returns to the chooser or welcome screen. The saved profile can be unlocked again. Deleting a profile from the device removes its local copy.
+
 ## Contact And Presence Rules
 
 Important rules:
@@ -143,19 +167,23 @@ Important rules:
 - offline add by `account_id` creates local `Approved` immediately
 - `Never met` clears only after a verified secure session
 - `Friend` is a local flag on top of `Approved`
+- quiet reconnect is reserved for approved friends. A discovered peer can appear in the LAN list before any probe or introduction
 - presence comes from secure-session activity and lightweight secure service traffic, not from discovery alone
 - forgetting a contact removes relationship state and local dialog history
 - if forgetting happens while a verified secure session is still live, Rust may let that live session disconnect naturally before the transport context fully disappears so later re-request flows remain honest
 
 ## Call And Media Rules
 
-Important rules:
+Omni supports direct and group calls. A group member can start a call and others can explicitly join or leave it. The group feed carries call control. When a peer forwards media, it forwards sealed frames that recipients open with the sender's media key.
 
-- the shipped call surface is 1:1 only, even though call contracts already use participant rosters
-- v1 enforces exactly two participants at the app/runtime layer
+Direct calls have two participants and follow these lifecycle rules:
+
 - only one ringing or active call is allowed per local profile
 - unanswered calls time out after `30 s`
 - active calls get a `10 s` reconnect grace before ending as `ConnectionLost`
+
+Media and application boundaries:
+
 - Rust owns call eligibility, call state, media admission, history projection, and network-quality truth
 - production realtime media must use the V2 native/QUIC media path
 - JSON/base64 call media, local Opus bridge loops, and request-response media payloads are not supported

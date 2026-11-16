@@ -69,6 +69,9 @@ pub enum SecurityPayloadKind {
     CallReconnect,
     CallScreenControl,
     RemoteAccessGrant,
+    Reaction,
+    MessageDelete,
+    MessagePin,
     SentTranscript,
     DeviceRevocation,
     AccountKeyMove,
@@ -117,6 +120,9 @@ impl SecurityPayloadKind {
             Self::CallReconnect => "call_reconnect",
             Self::CallScreenControl => "call_screen_control",
             Self::RemoteAccessGrant => "remote_access_grant",
+            Self::Reaction => "reaction",
+            Self::MessageDelete => "message_delete",
+            Self::MessagePin => "message_pin",
             Self::SentTranscript => "sent_transcript",
             Self::DeviceRevocation => "device_revocation",
             Self::AccountKeyMove => "account_key_move",
@@ -165,6 +171,9 @@ impl SecurityPayloadKind {
             "call_reconnect" => Ok(Self::CallReconnect),
             "call_screen_control" => Ok(Self::CallScreenControl),
             "remote_access_grant" => Ok(Self::RemoteAccessGrant),
+            "reaction" => Ok(Self::Reaction),
+            "message_delete" => Ok(Self::MessageDelete),
+            "message_pin" => Ok(Self::MessagePin),
             "sent_transcript" => Ok(Self::SentTranscript),
             "device_revocation" => Ok(Self::DeviceRevocation),
             "account_key_move" => Ok(Self::AccountKeyMove),
@@ -303,6 +312,7 @@ fn encrypted_payload_to_wire(payload: EncryptedPayload) -> EncryptedPayloadV1 {
         nonce_hex: payload.nonce_hex,
         ciphertext_hex: payload.ciphertext_hex,
         mac_hex: payload.mac_hex,
+        header_mac_hex: payload.header_mac_hex,
     }
 }
 
@@ -314,6 +324,7 @@ fn encrypted_payload_from_wire(payload: &EncryptedPayloadV1) -> EncryptedPayload
         nonce_hex: payload.nonce_hex.clone(),
         ciphertext_hex: payload.ciphertext_hex.clone(),
         mac_hex: payload.mac_hex.clone(),
+        header_mac_hex: payload.header_mac_hex.clone(),
     }
 }
 
@@ -472,6 +483,7 @@ pub fn build_encrypted_text_envelope(
     session: &SessionRecord,
     message_id: &str,
     body: &str,
+    reply_to: Option<&str>,
     created_at_unix_ms: i64,
     now_unix_ms: i64,
 ) -> OmniResult<OutgoingWireEnvelope> {
@@ -481,6 +493,7 @@ pub fn build_encrypted_text_envelope(
             message_id: message_id.to_string(),
             body: body.to_string(),
             created_at_unix_ms,
+            reply_to: reply_to.map(str::to_string),
         }),
         SecurityPayloadKind::Text,
         now_unix_ms,
@@ -584,6 +597,7 @@ mod tests {
             created_at_unix_ms: bootstrap.created_at_unix_ms,
             initiator_instance_id: String::new(),
             initiator_device_certificate_chain_json: None,
+            invite_claim_hex: None,
         }
     }
 

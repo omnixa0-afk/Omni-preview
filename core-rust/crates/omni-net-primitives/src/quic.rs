@@ -54,8 +54,8 @@ pub const QUIC_CONNECTION_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 ///
 /// This forces nothing on anyone. quinn runs DPLPMTUD, so each path probes upward and settles on what
 /// gets through, with QUIC 1200-byte floor and black-hole detection behind it. Not a risk for the
-/// restricted-mobile case either: that path drops QUIC by HEADER SIGNATURE, not by size -- raw UDP of
-/// any size measured 8/8 through . quic/stats reports the
+/// UDP-hostile mobile case either: that path drops QUIC by HEADER SIGNATURE, not by size -- raw UDP of
+/// any size measured 8/8 through (docs/decisions/tls-server-name.md). quic/stats reports the
 /// negotiated mtu and blackholes per connection, so a misbehaving path stays visible.
 pub const QUIC_MAX_UDP_PAYLOAD_BYTES: u16 = 9000;
 /// Kernel UDP socket buffer, per direction. Windows defaults to roughly 64 KB, under a millisecond at

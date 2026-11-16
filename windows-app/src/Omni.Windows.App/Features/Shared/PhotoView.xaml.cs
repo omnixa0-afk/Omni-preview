@@ -27,6 +27,14 @@ public sealed partial class PhotoView : UserControl
     public PhotoView()
     {
         InitializeComponent();
+        // A row out of the tree lets its picture go, or the surface waits for a garbage collection the
+        // small managed heap has no reason to run; back in the tree it decodes again.
+        Unloaded += (_, _) =>
+        {
+            shownKey = null;
+            ImagePart.Source = null;
+        };
+        Loaded += (_, _) => Reload();
     }
 
     public string? LocalPath

@@ -5,7 +5,7 @@ use crate::{
     AttachmentDownloadedV1, AttachmentOfferV1,
     AttachmentTransferFailedV1, CallAcceptV1, CallBusyV1, CallCancelV1, CallDeclineReason,
     CallDeclineV1, CallHangupV1, CallInviteV1, CallParticipantDescriptorV1, CallReconnectV1,
-    CallRingingV1, CallScreenControlV1, CallTimeoutV1, RemoteAccessGrantV1, RemoteAccessMode, SentTranscriptV1, DeviceRevocationSyncV1, AccountKeyMoveSyncV1, ContactSyncV1, ContactSyncAckV1, CourierSetV1, AccountPassportMessageV1, HistorySyncMessageV1, ChatTextV1, DeliveryReceiptV1, RealtimeMediaCapabilitiesV1, RealtimeMediaControlV1,
+    CallRingingV1, CallScreenControlV1, CallTimeoutV1, RemoteAccessGrantV1, RemoteAccessMode, MessageDeleteV1, MessagePinV1, ReactionV1, SentTranscriptV1, DeviceRevocationSyncV1, AccountKeyMoveSyncV1, ContactSyncV1, ContactSyncAckV1, CourierSetV1, AccountPassportMessageV1, HistorySyncMessageV1, ChatTextV1, DeliveryReceiptV1, RealtimeMediaCapabilitiesV1, RealtimeMediaControlV1,
     RealtimeMediaSelectionV1, SignalingRouteCandidateV1, TransportMode,
     OMNI_LOGICAL_EVENT_VERSION_V1, OMNI_PROTOCOL_VERSION_V1,
 };
@@ -169,6 +169,12 @@ pub struct SessionBootstrapMessageV1 {
     /// it vouches for exactly the initiator keys above.
     #[serde(default)]
     pub initiator_device_certificate_chain_json: Option<String>,
+    /// Set when this request answers an invite of the receiver's: `omni_crypto::invite_claim` of the
+    /// invite's nonce over the initiator's identity signing key and ephemeral key (hex). The receiver
+    /// takes the first valid claim of an invite of its own as the person it invited and approves the
+    /// request. Not under the bootstrap signature: the claim binds itself to the keys above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_claim_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +198,9 @@ pub struct EncryptedPayloadV1 {
     pub nonce_hex: String,
     pub ciphertext_hex: String,
     pub mac_hex: String,
+    /// See `omni_crypto::EncryptedPayload::header_mac_hex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_mac_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +237,9 @@ pub enum LogicalEventPayloadV1 {
     RelaySetUpdate(RelaySetUpdateV1),
     GroupControl(GroupControlV1),
     SentTranscript(SentTranscriptV1),
+    Reaction(ReactionV1),
+    MessageDelete(MessageDeleteV1),
+    MessagePin(MessagePinV1),
     DeviceRevocation(DeviceRevocationSyncV1),
     AccountKeyMove(AccountKeyMoveSyncV1),
     ContactSync(ContactSyncV1),
@@ -271,6 +283,7 @@ impl LogicalEventEnvelopeV1 {
                 message_id: message_id.into(),
                 body: body.into(),
                 created_at_unix_ms,
+                reply_to: None,
             }),
         }
     }
@@ -334,6 +347,7 @@ impl LogicalEventEnvelopeV1 {
         participants: Vec<CallParticipantDescriptorV1>,
         created_at_unix_ms: i64,
         expires_at_unix_ms: i64,
+        media_key_share: impl Into<String>,
     ) -> Self {
         Self {
             logical_version: OMNI_LOGICAL_EVENT_VERSION_V1,
@@ -344,6 +358,7 @@ impl LogicalEventEnvelopeV1 {
                 created_at_unix_ms,
                 expires_at_unix_ms,
                 remote_control: false,
+                media_key_share: media_key_share.into(),
             }),
         }
     }
@@ -355,8 +370,16 @@ impl LogicalEventEnvelopeV1 {
         participants: Vec<CallParticipantDescriptorV1>,
         created_at_unix_ms: i64,
         expires_at_unix_ms: i64,
+        media_key_share: impl Into<String>,
     ) -> Self {
-        let mut event = Self::call_invite(call_id, dialog_key, participants, created_at_unix_ms, expires_at_unix_ms);
+        let mut event = Self::call_invite(
+            call_id,
+            dialog_key,
+            participants,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            media_key_share,
+        );
         if let LogicalEventPayloadV1::CallInvite(invite) = &mut event.payload {
             invite.remote_control = true;
         }
@@ -373,12 +396,17 @@ impl LogicalEventEnvelopeV1 {
         }
     }
 
-    pub fn call_accept(call_id: impl Into<String>, accepted_at_unix_ms: i64) -> Self {
+    pub fn call_accept(
+        call_id: impl Into<String>,
+        accepted_at_unix_ms: i64,
+        media_key_share: impl Into<String>,
+    ) -> Self {
         Self {
             logical_version: OMNI_LOGICAL_EVENT_VERSION_V1,
             payload: LogicalEventPayloadV1::CallAccept(CallAcceptV1 {
                 call_id: call_id.into(),
                 accepted_at_unix_ms,
+                media_key_share: media_key_share.into(),
             }),
         }
     }
@@ -497,6 +525,27 @@ impl LogicalEventEnvelopeV1 {
         Self {
             logical_version: OMNI_LOGICAL_EVENT_VERSION_V1,
             payload: LogicalEventPayloadV1::DeviceRevocation(DeviceRevocationSyncV1 { revocation_json }),
+        }
+    }
+
+    pub fn message_delete(event: MessageDeleteV1) -> Self {
+        Self {
+            logical_version: 1,
+            payload: LogicalEventPayloadV1::MessageDelete(event),
+        }
+    }
+
+    pub fn message_pin(event: MessagePinV1) -> Self {
+        Self {
+            logical_version: 1,
+            payload: LogicalEventPayloadV1::MessagePin(event),
+        }
+    }
+
+    pub fn reaction(reaction: ReactionV1) -> Self {
+        Self {
+            logical_version: 1,
+            payload: LogicalEventPayloadV1::Reaction(reaction),
         }
     }
 
@@ -770,6 +819,7 @@ impl WireEnvelopeV1 {
                 message_id: message_id.into(),
                 body: body.into(),
                 created_at_unix_ms,
+                reply_to: None,
             }),
         }
     }

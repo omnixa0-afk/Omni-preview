@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using Omni.Windows.App.Core;
 
 namespace Omni.Windows.App;
 
@@ -160,6 +161,14 @@ public sealed partial class MainWindow
         builder.AppendLine(callVideoService.SharedMonitor is { } monitor
             ? $"shared_monitor={monitor.Left},{monitor.Top},{monitor.Width}x{monitor.Height}"
             : "shared_monitor=none");
+        // What the "allow control" button is drawn from (RefreshCallScreenControlState): visible only
+        // while the displayed call is active, the media runs for its dialog and a monitor is shared.
+        CallSummary? call = currentChatCallSummary;
+        builder.AppendLine($"grant_button={(ToggleCurrentCallScreenControlButton.Visibility == Visibility.Visible ? "visible" : "hidden")}");
+        builder.AppendLine($"displayed_call={(call is null ? "none" : $"{call.State} dialog={call.DialogKey}")}");
+        builder.AppendLine($"open_dialog={GetResolvedCurrentDialogKey() ?? "none"}");
+        builder.AppendLine($"media_for_call_dialog={(call is not null && callVideoService.IsActiveForDialog(call.DialogKey)).ToString().ToLowerInvariant()}");
+        builder.AppendLine($"screen_sharing={callVideoService.IsScreenSharing.ToString().ToLowerInvariant()}");
         builder.AppendLine($"injector={screenControlInjector?.Diagnostics ?? "none"}");
         builder.AppendLine($"viewer={screenControlViewer?.Diagnostics ?? "none"}");
         builder.AppendLine(callVideoService.RemotePresentedSize is { } picture

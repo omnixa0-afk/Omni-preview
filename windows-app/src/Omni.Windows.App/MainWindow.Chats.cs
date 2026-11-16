@@ -36,6 +36,7 @@ public sealed partial class MainWindow
             return;
         }
 
+        RefreshMessageActions(force);
         if (force)
         {
             StartTailRebaseTranscriptLoad(peerKey);
@@ -88,10 +89,10 @@ public sealed partial class MainWindow
         MessagesListView.Visibility = Visibility.Collapsed;
         MessagesEmptyStateBorder.Visibility = Visibility.Visible;
         MessagesEmptyStateTitleTextBlock.Text = string.IsNullOrWhiteSpace(peerKey)
-            ? ChatPresentationText.BuildTranscriptSelectionHeading(chatThreadItems.Count > 0)
+            ? ChatPresentationText.BuildTranscriptSelectionHeading(chatThreadItems.Count > 0, chatPartnerCount > 0)
             : ChatPresentationText.BuildTranscriptEmptyHeading();
         MessagesEmptyStateTextBlock.Text = string.IsNullOrWhiteSpace(peerKey)
-            ? ChatPresentationText.BuildTranscriptChatSelectionPrompt(chatThreadItems.Count > 0)
+            ? ChatPresentationText.BuildTranscriptChatSelectionPrompt(chatThreadItems.Count > 0, chatPartnerCount > 0)
             : IsCurrentChatAwaitingFirstConnection()
                 ? ChatPresentationText.BuildTranscriptAwaitingFirstConnectionHistoryText()
                 : ChatPresentationText.BuildTranscriptUnavailableText();
@@ -123,6 +124,7 @@ public sealed partial class MainWindow
         UpdateTranscriptEmptyState();
         TryTrimTranscriptWindow();
         TranscriptLayout.Apply(messageItems, DateTime.Today, transcriptPeer);
+        chatSelection?.Apply();
 
         if (shouldAutoScroll)
         {
@@ -362,6 +364,12 @@ public sealed partial class MainWindow
         activeChatTranscriptState.IsLoadingOlderMessages = false;
         activeChatTranscriptState.IsRestoringAnchor = false;
 
+        if (!sameDialog)
+        {
+            SetChatReply(null);
+            ChatComposerBorder.CancelVoice();
+        }
+
         if (!sameDialog || clearVisibleTranscript)
         {
             chatRefreshService.ClearDialog(dialogKey);
@@ -532,8 +540,9 @@ public sealed partial class MainWindow
             // The middle says «choose one» or «add the first one» by whether there is anything to choose.
             if (MessagesListView.Visibility != Visibility.Visible && string.IsNullOrWhiteSpace(GetResolvedCurrentDialogKey()) && currentGroupRowKey is null)
             {
-                MessagesEmptyStateTitleTextBlock.Text = ChatPresentationText.BuildTranscriptSelectionHeading(chatThreadItems.Count > 0);
-                MessagesEmptyStateTextBlock.Text = ChatPresentationText.BuildTranscriptChatSelectionPrompt(chatThreadItems.Count > 0);
+                MessagesEmptyStateTitleTextBlock.Text = ChatPresentationText.BuildTranscriptSelectionHeading(chatThreadItems.Count > 0, chatPartnerCount > 0);
+                MessagesEmptyStateTextBlock.Text = ChatPresentationText.BuildTranscriptChatSelectionPrompt(chatThreadItems.Count > 0, chatPartnerCount > 0);
+                OpenContactsFromChatsButton.Content = chatThreadItems.Count == 0 && chatPartnerCount > 0 ? "Открыть контакты" : "Добавить контакт";
             }
 
             // An open group keeps its row selected across refreshes (it is not the 1:1 "current peer").
@@ -661,7 +670,9 @@ public sealed partial class MainWindow
 
         // Every path into a 1:1 dialog (list tap, "write" from contacts, incoming call) leaves a group.
         CloseGroupConversation();
-        if (!string.Equals(dialogKey, windowState.CurrentPeerKey, StringComparison.Ordinal))
+        // The panel of details is the person's choice: open, it stays open on the next chat too.
+        bool reopenDetails = contactPageInChat && !string.Equals(dialogKey, windowState.CurrentPeerKey, StringComparison.Ordinal);
+        if (reopenDetails)
         {
             CloseChatContactInfo();
         }
@@ -679,6 +690,7 @@ public sealed partial class MainWindow
             windowState.SelectedContactRevision = null;
         }
 
+        long openStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             currentChatSessionSummary = rustBridge.OpenChatSessionLease(dialogKey);
@@ -690,16 +702,25 @@ public sealed partial class MainWindow
         WatchCallVideoDialog(dialogKey);
         pendingChatAutoScrollToLatest = true;
 
+        double openLease = System.Diagnostics.Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
         UpdateCurrentPeerText();
         RefreshChatHeaderSummary();
+        double openHeader = System.Diagnostics.Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
         // User intent to reach this contact: if there's no mesh link yet, nudge the core to
         // reach it over serverless rendezvous now instead of waiting for the periodic sweep
         // (idempotent + gated in the core; covers the selected-contact-call path too, which
         // opens the chat). See docs/decisions/serverless-bootstrap-rendezvous.md §Integration.
         TryReachContactOverRendezvous(currentChatHeaderSummary?.ContactCard?.Contact?.RemoteAccountId);
+        double openReach = System.Diagnostics.Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
         RefreshMessages(force: true);
+        double openMessages = System.Diagnostics.Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
         RefreshQueueDiagnostics();
         WakeChatRefresh();
+        if (reopenDetails)
+        {
+            OpenCurrentChatContactProfile();
+        }
+
         if (!string.IsNullOrWhiteSpace(windowState.SelectedContactId))
         {
             WakeSelectedContactRefresh();
@@ -707,6 +728,12 @@ public sealed partial class MainWindow
         ReadChatOnScreen();
         UpdateControlStates();
         SaveUiState();
+        TraceOpened(DispatcherQueue, $"chat lines={messageItems.Count}", openStarted);
+        double openTotal = System.Diagnostics.Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
+        if (openTotal >= SlowUiStepMs)
+        {
+            AppTrace.Write("ui/open", $"{openTotal:F0}ms lease={openLease:F0} header={openHeader - openLease:F0} reach={openReach - openHeader:F0} messages={openMessages - openReach:F0} rest={openTotal - openMessages:F0}");
+        }
     }
 
     /// Best-effort connectivity nudge: ask the core to reach an approved contact over serverless
@@ -749,7 +776,7 @@ public sealed partial class MainWindow
         }
 
         ReconnectContactButton.IsEnabled = false;
-        ChatConnectionStatusTextBlock.Text = "⏳ Подключаюсь по вашему запросу…";
+        ChatIdentitySubtitleTextBlock.Text = "Подключаюсь…";
         TryReachContactOverRendezvous(accountId);
         WakeChatRefresh();
         await Task.Delay(TimeSpan.FromSeconds(6));
@@ -764,6 +791,7 @@ public sealed partial class MainWindow
         ContactsSectionRoot.Visibility = Visibility.Collapsed;
         SettingsSectionRoot.Visibility = Visibility.Collapsed;
         DiagnosticsSectionRoot.Visibility = Visibility.Collapsed;
+        WorkspacesSectionHost.Deactivate();
     }
 
     private static string BuildDialogKeyFromInstanceId(string instanceId)
@@ -807,12 +835,16 @@ public sealed partial class MainWindow
     private void PatchChatThreadCollection(IReadOnlyList<ChatThreadListItem> threads)
         => ChatThreadCollectionPatcher.Patch(chatThreadItems, threads);
 
+    // Approved contacts one can write to: an empty Chats then says «start a conversation», not «add someone».
+    private int chatPartnerCount;
+
     private List<ChatThreadListItem> BuildChatThreadItems(
         IReadOnlyList<RustBridge.ChatThreadProjection> projections,
         ChatGroupRows? groupRows = null)
     {
         Dictionary<string, ChatThreadListItem> items = new(StringComparer.Ordinal);
         HashSet<string> linkedAccountIds = CurrentlyLinkedAccountIds();
+        int partners = 0;
         NoteContactPhotos(projections.Select(projection => projection.Contact));
 
         foreach (RustBridge.ChatThreadProjection projection in projections)
@@ -830,6 +862,15 @@ public sealed partial class MainWindow
 
             string? dialogKey = ResolveChatDialogKey(contact);
             if (string.IsNullOrWhiteSpace(dialogKey))
+            {
+                continue;
+            }
+
+            partners++;
+            // Chats are conversations: a contact nothing was said with yet is in Контакты, not here
+            // (docs/decisions/omni-app-ux.md R1 — a row «Сообщений пока нет» with a date read as
+            // activity). The one being opened right now stays, so «Написать» has its row.
+            if (projection.LastMessage is null && !string.Equals(dialogKey, GetResolvedCurrentDialogKey(), StringComparison.Ordinal))
             {
                 continue;
             }
@@ -861,6 +902,7 @@ public sealed partial class MainWindow
             }
         }
 
+        chatPartnerCount = partners;
         if (groupRows is not null)
         {
             foreach (ChatThreadListItem item in BuildGroupThreadItems(groupRows))

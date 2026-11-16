@@ -172,12 +172,13 @@ internal static partial class MainWindowPresentation
     public static string BuildContactStatus(
         ContactSnapshot contact,
         long nowUnixMs,
-        IReadOnlySet<string> linkedAccountIds)
+        IReadOnlySet<string> linkedAccountIds,
+        ContactConnectionDto? connection = null)
     {
         string relationship = MapRelationshipState(contact.RelationshipState);
         if (contact.RelationshipState.Equals("pending", StringComparison.OrdinalIgnoreCase))
         {
-            return BuildPendingContactStatus(contact);
+            return BuildPendingContactStatus(contact, connection);
         }
 
         if (!contact.RelationshipState.Equals("approved", StringComparison.OrdinalIgnoreCase))
@@ -238,10 +239,17 @@ internal static partial class MainWindowPresentation
         return hex.Length <= 4 ? hex : $"{hex[..4]}…";
     }
 
-    public static ContactListItem ToContactItem(ContactSnapshot contact, long nowUnixMs, IReadOnlySet<string> linkedAccountIds)
+    public static ContactListItem ToContactItem(
+        ContactSnapshot contact,
+        long nowUnixMs,
+        IReadOnlySet<string> linkedAccountIds,
+        IReadOnlyDictionary<string, ContactConnectionDto>? connections = null)
     {
         string title = ContactTitle(contact);
-        string status = BuildCompactContactStatus(contact, nowUnixMs, linkedAccountIds);
+        ContactConnectionDto? connection = contact.RemoteAccountId is { } accountId
+            ? connections?.GetValueOrDefault(accountId)
+            : null;
+        string status = BuildCompactContactStatus(contact, nowUnixMs, linkedAccountIds, connection);
         string badge = BuildContactBadgeText(contact);
         string avatarText = BuildAvatarText(title);
         BitmapImage? avatarImage = BuildAvatarImage(
@@ -390,7 +398,7 @@ internal static partial class MainWindowPresentation
             ? $"Не удалось узнать, задан ли пароль: {passwordProtectionErrorText}"
             : passwordProtectionSummary?.Enabled == true
                 ? string.Empty
-                : "Кнопки откроются, когда вы зададите пароль выше: без него фразу мог бы прочитать любой, кто сядет за компьютер.";
+                : "Чтобы открыть фразу, задайте пароль.";
     }
 
     public static string BuildPasswordProtectionSummaryText(
@@ -404,7 +412,7 @@ internal static partial class MainWindowPresentation
 
         if (passwordProtectionSummary is null || !passwordProtectionSummary.Enabled)
         {
-            return "Не задан — Omni открывается без пароля. Пароль защищает от того, кто сядет за компьютер, но не от вредоносной программы.";
+            return "Не задан. Пароль защищает от того, кто сядет за компьютер, но не от вредоносной программы.";
         }
 
         // Not the key-derivation parameters (Argon2 memory, iterations): they told the person nothing.
@@ -416,12 +424,13 @@ internal static partial class MainWindowPresentation
     private static string BuildCompactContactStatus(
         ContactSnapshot contact,
         long nowUnixMs,
-        IReadOnlySet<string> linkedAccountIds)
+        IReadOnlySet<string> linkedAccountIds,
+        ContactConnectionDto? connection)
     {
         string relationshipState = contact.RelationshipState?.Trim().ToLowerInvariant() ?? string.Empty;
         if (relationshipState == "pending")
         {
-            return BuildPendingContactStatus(contact);
+            return BuildPendingContactStatus(contact, connection);
         }
 
         if (relationshipState == "declined")
@@ -514,7 +523,8 @@ internal static partial class MainWindowPresentation
     /// The window's effective theme (Light/Dark), kept by MainWindow.ThemeSettings. A plain
     /// `Application.Current.Resources` lookup answers for the APPLICATION theme, fixed at start
     /// from Windows — so with "Светлая" picked in Settings, code-resolved brushes (chat bubbles,
-    /// presence dots) stayed dark on a light window (seen live 2026-10-10).
+    /// presence dots) stayed dark on a light window (seen live 2026-10-10). A dialog is not under the
+    /// window's root, so every ContentDialog takes it as its RequestedTheme (2026-10-30).
     internal static ElementTheme ActiveTheme { get; set; } = ElementTheme.Default;
 
     internal static Brush ResolveThemeBrush(string themeResourceKey, Brush fallback)
@@ -565,7 +575,7 @@ internal static partial class MainWindowPresentation
         {
             ContactPresenceDotKind.Live => "В сети",
             ContactPresenceDotKind.Recent => "Недавно в сети",
-            _ => "Офлайн",
+            _ => "Не в сети",
         };
     }
 
@@ -587,13 +597,30 @@ internal static partial class MainWindowPresentation
             _ => relationshipState,
         };
 
-    private static string BuildPendingContactStatus(ContactSnapshot contact)
+    // An outgoing request travels only over a live link, so "sent" was a promise: the core tells
+    // whether it has reached the contact (`request`) and, when no dial can join the pair, why.
+    // Without the mesh state (not started yet) only "created" is known.
+    private static string BuildPendingContactStatus(ContactSnapshot contact, ContactConnectionDto? connection = null)
         => contact.PendingRequestDirection?.Trim().ToLowerInvariant() switch
         {
             "incoming" => "Входящий запрос",
-            "outgoing" => "Запрос отправлен",
+            "outgoing" => connection switch
+            {
+                { CannotReachReason: "no_common_address_family" } =>
+                    $"Запрос не доставлен: {FormatAddressFamilyGap(connection.AddressFamilyGap)}",
+                { Request: "delivered" } => "Запрос доставлен, ждём ответа",
+                { Request: "waiting_for_link" } => "Запрос ждёт связи с контактом",
+                _ => "Запрос создан",
+            },
             _ => "Ожидает подтверждения",
         };
+
+    // Our published addresses and the contact's share no family: IPv6 and IPv4 never meet without a
+    // relay in between (the case behind docs/bugs/contact-request-said-sent-without-a-link.md).
+    public static string FormatAddressFamilyGap(AddressFamilyGapDto? gap)
+        => gap is null
+            ? "нет общего типа адресов (IPv4 / IPv6) — нужен релей"
+            : $"у вас только {gap.Ours}, у контакта только {gap.Theirs} — нужен релей";
 
     private static bool IsAccountDialogAwaitingFirstConnection(
         ChatSecuritySummary? summary,

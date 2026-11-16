@@ -296,6 +296,11 @@ impl Interface for SimInterface {
         Ok(())
     }
 
+    /// The fabric has no TLS, and no man in the middle: every pair of ends shares one binding.
+    fn channel_binding(&self, _neighbor: &NeighborId) -> Option<[u8; crate::cert::CHANNEL_BINDING_BYTES]> {
+        Some([0x51u8; crate::cert::CHANNEL_BINDING_BYTES])
+    }
+
     fn remote_addr(&self, neighbor: &NeighborId) -> Option<SocketAddr> {
         neighbor.0.parse().ok()
     }

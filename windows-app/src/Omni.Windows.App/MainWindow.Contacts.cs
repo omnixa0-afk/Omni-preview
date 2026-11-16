@@ -438,10 +438,11 @@ public sealed partial class MainWindow
         List<ContactListItem> approvedContacts = [];
         List<ContactListItem> declinedContacts = [];
 
-        HashSet<string> linkedAccountIds = CurrentlyLinkedAccountIds();
+        Dictionary<string, ContactConnectionDto> connections = CurrentMeshContacts();
+        HashSet<string> linkedAccountIds = LinkedAccountIdsOf(connections);
         foreach (ContactSnapshot contact in contacts)
         {
-            ContactListItem item = MainWindowPresentation.ToContactItem(contact, nowUnixMs, linkedAccountIds);
+            ContactListItem item = MainWindowPresentation.ToContactItem(contact, nowUnixMs, linkedAccountIds, connections);
             renderedContacts.Add(item);
 
             if (IsPendingContactItem(item))
@@ -450,7 +451,8 @@ public sealed partial class MainWindow
                 continue;
             }
 
-            if (IsDeclinedContactItem(item))
+            // «Отказы» hold every one that is neither a contact nor a request (declined, blocked).
+            if (!IsApprovedContactItem(item))
             {
                 declinedContacts.Add(item);
                 continue;
@@ -488,26 +490,21 @@ public sealed partial class MainWindow
     private static bool IsApprovedContactItem(ContactListItem item)
         => string.Equals(item.RelationshipState, "approved", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsDeclinedContactItem(ContactListItem item)
-        => string.Equals(item.RelationshipState, "declined", StringComparison.OrdinalIgnoreCase);
-
     private static bool MatchesContactsFilter(ContactListItem item, ContactsFilterMode filterMode)
         => filterMode switch
         {
-            ContactsFilterMode.All => true,
             ContactsFilterMode.Pending => IsPendingContactItem(item),
             ContactsFilterMode.Approved => IsApprovedContactItem(item),
-            ContactsFilterMode.Declined => IsDeclinedContactItem(item),
-            _ => true,
+            // «Отказы»: declined, and anything else not a contact nor a request (blocked).
+            _ => !IsApprovedContactItem(item) && !IsPendingContactItem(item),
         };
 
     private static ContactsFilterMode ResolveContactsFilterForItem(ContactListItem item)
         => item switch
         {
             _ when IsPendingContactItem(item) => ContactsFilterMode.Pending,
-            _ when IsDeclinedContactItem(item) => ContactsFilterMode.Declined,
             _ when IsApprovedContactItem(item) => ContactsFilterMode.Approved,
-            _ => ContactsFilterMode.All,
+            _ => ContactsFilterMode.Declined,
         };
 
     private void ApplyContactsWorkspaceMode(ContactsWorkspaceMode mode)
@@ -558,12 +555,10 @@ public sealed partial class MainWindow
 
     private void UpdateContactsFilterButtons()
     {
-        ContactsFilterAllButton.Content = BuildContactsFilterLabel("Все", contactItems.Count);
-        ContactsFilterPendingButton.Content = BuildContactsFilterLabel("Запросы", pendingContactItems.Count);
-        ContactsFilterApprovedButton.Content = BuildContactsFilterLabel("Принятые", approvedContactItems.Count);
+        ContactsFilterApprovedButton.Content = BuildContactsFilterLabel("Контакты", approvedContactItems.Count);
+        ContactsFilterPendingButton.Content = BuildContactsFilterLabel("Заявки", pendingContactItems.Count);
         ContactsFilterDeclinedButton.Content = BuildContactsFilterLabel("Отказы", declinedContactItems.Count);
 
-        SetPillButtonState(ContactsFilterAllButton, currentContactsFilterMode == ContactsFilterMode.All);
         SetPillButtonState(ContactsFilterPendingButton, currentContactsFilterMode == ContactsFilterMode.Pending);
         SetPillButtonState(ContactsFilterApprovedButton, currentContactsFilterMode == ContactsFilterMode.Approved);
         SetPillButtonState(ContactsFilterDeclinedButton, currentContactsFilterMode == ContactsFilterMode.Declined);
@@ -582,9 +577,8 @@ public sealed partial class MainWindow
     private string BuildContactsEmptyStateText()
         => currentContactsFilterMode switch
         {
-            ContactsFilterMode.All => "Пока никого. Нажмите «Добавить» вверху.",
-            ContactsFilterMode.Pending => "Новых запросов нет.",
-            ContactsFilterMode.Approved => "Принятых пока нет.",
+            ContactsFilterMode.Pending => "Новых заявок нет.",
+            ContactsFilterMode.Approved => "Пока никого. Нажмите «Добавить» вверху.",
             ContactsFilterMode.Declined => "Отказов нет.",
             _ => "В этой категории пока ничего нет.",
         };
@@ -682,6 +676,38 @@ public sealed partial class MainWindow
                 windowState.SelectedContactId!,
                 rustBridge.GetContactCard(windowState.SelectedContactId!),
                 revisionSnapshot?.Revision));
+        }
+        catch (Exception ex)
+        {
+            ContactManagementStatusTextBlock.Text = ex.Message;
+        }
+    }
+
+    /// The card read OFF the UI thread (a section switch), applied only if the same contact is still chosen.
+    private async void RefreshSelectedContactCardAsync()
+    {
+        string? contactId = windowState.SelectedContactId;
+        if (string.IsNullOrWhiteSpace(contactId))
+        {
+            RefreshSelectedContactCard();
+            return;
+        }
+
+        try
+        {
+            SelectedContactRefreshPayload payload = await System.Threading.Tasks.Task.Run(() =>
+            {
+                SelectedContactRefreshPayload read = new(
+                    contactId,
+                    rustBridge.GetContactCard(contactId),
+                    rustBridge.GetContactCardRevision(contactId)?.Revision);
+                ReadMeshConnectionState();
+                return read;
+            });
+            if (windowState.SelectedContactId == contactId)
+            {
+                ApplySelectedContactRefreshPayload(payload);
+            }
         }
         catch (Exception ex)
         {

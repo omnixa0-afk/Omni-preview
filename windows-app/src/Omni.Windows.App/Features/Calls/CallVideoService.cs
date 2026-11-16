@@ -187,7 +187,9 @@ internal sealed partial class CallVideoService : IAsyncDisposable
     private RealtimeMediaSelection? activeLocalSelection;
     private string? activeReceiverSelectionSignature;
     private CallVideoCodecKind activeNativeCodecKind = CallVideoCodecKind.H264;
-    private IntPtr nativeHandle;
+    /// <summary>The call's inbound route and send target are wired in the core (the core's handle is
+    /// taken per call, <see cref="RustBridge.WithCoreHandle{T}"/>).</summary>
+    private bool nativeWired;
     private bool localCameraActive;
     // Group-call local mic mute (increment 2). Distinct from the 1:1 call-state mute
     // (rustBridge.SetLocalMicMuted, keyed by a 1:1 CallId that group calls don't have). Muting
@@ -208,6 +210,9 @@ internal sealed partial class CallVideoService : IAsyncDisposable
     // instantly with nothing accepted. Live test 2026-08-11: audio datagrams flowing at
     // 10:55:02, CallInvite at 10:55:11.
     private volatile bool callMediaRequested;
+    // The core's count of call datagrams dropped as not opening or replayed, when this call's media
+    // started: Diagnostics → Media shows the growth over the call, not the process's history.
+    private ulong mediaUnopenedAtCallStart;
     // Screen share (Zoom/Telemost "share screen"): when requested, the video track carries the
     // captured screen INSTEAD of the camera (source swap). The native video sender already exists
     // for audio+video; StartScreenCapture just feeds it screen frames (ScreenShareCaptureSource)
@@ -523,8 +528,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
     internal string? PreferredSpeakerId { get; set; }
 
     // Task #87: Settings pushes the chosen encode/decode device keys here (CallVideoDeviceSelection
-    // keys). They take effect on the next session create (call start / renegotiation), like the
-    // codec/quality/fps preferences.
+    // keys). Read on every session create; a change in a call goes through ApplyDevicePreferencesAsync.
     internal void SetDevicePreferences(string? encodeDeviceKey, string? decodeDeviceKey)
     {
         encodeDevicePreferenceKey = string.IsNullOrWhiteSpace(encodeDeviceKey)
@@ -533,6 +537,52 @@ internal sealed partial class CallVideoService : IAsyncDisposable
         decodeDevicePreferenceKey = string.IsNullOrWhiteSpace(decodeDeviceKey)
             ? CallVideoDeviceSelection.AutoKey
             : decodeDeviceKey;
+    }
+
+    /// <summary>
+    /// A device picked in Settings during a call takes effect in that call: it used to wait for the
+    /// next call or a renegotiation, and nothing said so. The encode card changes the passport (a
+    /// card picked by name offers only its own codecs), so the passport goes out again and the
+    /// sender is rebuilt on the new card; the decoder is dropped and rebuilt on the next packet.
+    /// The picture skips for the length of a key frame, as with a codec change. True when a call
+    /// was running and took the change.
+    /// </summary>
+    internal async Task<bool> ApplyDevicePreferencesAsync(string? encodeDeviceKey, string? decodeDeviceKey)
+    {
+        string previousEncode = encodeDevicePreferenceKey;
+        string previousDecode = decodeDevicePreferenceKey;
+        SetDevicePreferences(encodeDeviceKey, decodeDeviceKey);
+        bool encodeChanged = !string.Equals(previousEncode, encodeDevicePreferenceKey, StringComparison.OrdinalIgnoreCase);
+        bool decodeChanged = !string.Equals(previousDecode, decodeDevicePreferenceKey, StringComparison.OrdinalIgnoreCase);
+
+        string? dialogKey;
+        CancellationToken token;
+        lock (lifecycleSync)
+        {
+            dialogKey = activeDialogKey;
+            token = mediaCancellation?.Token ?? CancellationToken.None;
+            if (string.IsNullOrWhiteSpace(dialogKey) || (!encodeChanged && !decodeChanged))
+            {
+                return false;
+            }
+
+            activeSelectionSignature = null;
+            nativeMediaDiagnostics = "pending_renegotiation";
+        }
+
+        if (decodeChanged)
+        {
+            lock (nativeMediaSync)
+            {
+                // The decoder's adapter is fixed when it is built: forget the format it was built
+                // for, and the republished selection below retires it.
+                activeReceiverSelectionSignature = null;
+            }
+        }
+
+        CallVideoCaptureProbeResult captureProbe = await EnsureCaptureProbeAsync(CancellationToken.None);
+        await RepublishLocalCapabilitiesAsync(dialogKey, token, localSenderActive: true, captureProbe);
+        return true;
     }
 
     // Resolve the stored encode/decode preference keys against the live capability probe into the
@@ -654,8 +704,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
         // back to legacy media." Surface this BEFORE starting receive/send
         // loops that would otherwise silently no-op on a null handle.
         // See docs/decisions/h264-runtime-proof.md.
-        IntPtr resolvedHandle = rustBridge.GetInitializedHandleForRealtimeMedia();
-        if (resolvedHandle == IntPtr.Zero)
+        if (!rustBridge.IsInitialized)
         {
             throw new InvalidOperationException(
                 "VIDEO_TRANSPORT_V2_REQUIRED: native realtime media handle is unavailable; QUIC DATAGRAM carrier is required for video calls.");
@@ -663,11 +712,13 @@ internal sealed partial class CallVideoService : IAsyncDisposable
 
         CancellationTokenSource cancellation = new();
         DialogKeyPin dialogKeyPin = new(dialogKey);
-        ulong packetTargetId = CreatePacketTarget(resolvedHandle, dialogKeyPin);
+        // Each call into the core with its handle holds the core alive for that call only (F01):
+        // the service keeps no handle of its own.
+        ulong packetTargetId = rustBridge.WithCoreHandle(core => CreatePacketTarget(core, dialogKeyPin));
         NativeWebRtcMediaEngine.MediaRouter mediaRouter;
         try
         {
-            mediaRouter = CreateWiredMediaRouter(resolvedHandle, dialogKeyPin, groupMode);
+            mediaRouter = rustBridge.WithCoreHandle(core => CreateWiredMediaRouter(core, dialogKeyPin, groupMode));
         }
         catch
         {
@@ -682,7 +733,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
             activeDialogKeyPin = dialogKeyPin;
             activePacketTargetId = packetTargetId;
             activeMediaRouter = mediaRouter;
-            nativeHandle = resolvedHandle;
+            nativeWired = true;
             mediaCancellation = cancellation;
             activeGroupMode = groupMode;
             ResetMediaCounters();
@@ -708,6 +759,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
                 negotiationMonitorLoopTask = Task.Run(
                     () => MonitorGroupMediaAsync(dialogKey, cancellation.Token),
                     cancellation.Token);
+                _ = Task.Run(() => ReportGroupAudioLevelAsync(dialogKey, cancellation.Token), cancellation.Token);
             }
         }
 
@@ -856,6 +908,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
         // WatchDialogAsync stops whatever was running and clears this, so claim the call
         // AFTER it: from here on the negotiation monitor is allowed to open the mic.
         await WatchDialogAsync(dialogKey);
+        mediaUnopenedAtCallStart = Core.NativeMethods.omni_calls_media_unopened_total();
         callMediaRequested = true;
         long watchDoneAtMs = Environment.TickCount64;
 
@@ -919,6 +972,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
         }
 
         await WatchDialogAsync(groupDialogKey, groupMode: true);
+        mediaUnopenedAtCallStart = Core.NativeMethods.omni_calls_media_unopened_total();
         callMediaRequested = true;
 
         CancellationToken token;
@@ -973,7 +1027,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
         DialogKeyPin? dialogKeyPinForCleanup;
         ulong packetTargetIdForCleanup;
         NativeWebRtcMediaEngine.MediaRouter? mediaRouterForCleanup;
-        IntPtr handleForCleanup;
+        bool wiredForCleanup;
         Task? trackedFrameTaskForCleanup;
         Task? trackedPreviewTaskForCleanup;
         Task? trackedRemoteRenderTaskForCleanup;
@@ -1063,10 +1117,10 @@ internal sealed partial class CallVideoService : IAsyncDisposable
             activePacketTargetId = 0;
             mediaRouterForCleanup = activeMediaRouter;
             activeMediaRouter = null;
-            handleForCleanup = nativeHandle;
+            wiredForCleanup = nativeWired;
             activeSelectionSignature = null;
             activeReceiverSelectionSignature = null;
-            nativeHandle = IntPtr.Zero;
+            nativeWired = false;
             captureDiagnostics = "none";
             codecDiagnostics = "none";
             nativeMediaDiagnostics = "none";
@@ -1106,7 +1160,11 @@ internal sealed partial class CallVideoService : IAsyncDisposable
         ClearPendingRemoteRenderFrame();
         // Inbound media stops FIRST: the core's unwire returns only when no delivery is in flight,
         // so nothing reaches the router — or a session behind it — while the rest is torn down.
-        UnwireInboundMedia(handleForCleanup, dialogKeyPinForCleanup);
+        if (wiredForCleanup)
+        {
+            // A core already freed took the call's inbound route with it.
+            rustBridge.TryWithCoreHandle(core => UnwireInboundMedia(core, dialogKeyPinForCleanup));
+        }
         cancellation?.Cancel();
         captureCancel?.Cancel();
 
@@ -1277,7 +1335,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
             remoteVideoBitmap = null;
             localPreviewImage.Source = null;
             remoteVideoImage.Source = null;
-            diagnosticsTextBlock.Text = "Media: off";
+            diagnosticsTextBlock.Text = "Медиа: выкл.";
         });
         if (!string.IsNullOrWhiteSpace(dialogKeyForCleanup))
         {
@@ -1557,6 +1615,44 @@ internal sealed partial class CallVideoService : IAsyncDisposable
     /// says what they decode (per-pair-video-codec-selection.md §9, phase 4a). Follow its selection —
     /// and when our own codec breaks, publish the passport again without it.
     /// </summary>
+    /// How often our microphone level goes to the core for active-speaker gating: forwarders hold a
+    /// level for 600 ms, so a few reports fit in that window.
+    private const int GroupAudioLevelEveryMs = 100;
+
+    /// Our microphone level, to the core, for the whole group call (C1c, ADR group-call-cascade-sfu
+    /// §11): it rides our frames and decides whether forwarders pass our audio and video once more
+    /// than four people talk at once. 0 while muted — the capture reports none.
+    private async Task ReportGroupAudioLevelAsync(string dialogKey, CancellationToken token)
+    {
+        string groupId = dialogKey["group:".Length..];
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                float level = localAudioMuted ? 0f : nativeAudioCaptureSession?.ReadLevel() ?? 0f;
+                rustBridge.SetGroupCallAudioLevel(groupId, level);
+                await Task.Delay(GroupAudioLevelEveryMs, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                // A missed level only leaves us ranked as silent for a moment.
+                RecordError($"Group audio level report failed: {FormatExceptionForDiagnostics(ex)}");
+                try
+                {
+                    await Task.Delay(1000, token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
     private async Task MonitorGroupMediaAsync(string dialogKey, CancellationToken token)
     {
         while (!token.IsCancellationRequested)
@@ -1656,7 +1752,7 @@ internal sealed partial class CallVideoService : IAsyncDisposable
                 // Audio-first: the local sender (audio always, camera optional) must
                 // reconfigure for ANY active call on this dialog, not only when the camera is
                 // on — the old `localCameraActive` gate skipped audio-only calls and left them
-                // half-duplex. См. docs/notes/calls-full-duplex-CONTINUE.md.
+                // half-duplex.
                 //
                 // This is also the backstop when a selection lands after StartAsync gave up
                 // waiting for it. That used to be the NORMAL path for the caller, whose media
@@ -1946,10 +2042,17 @@ internal sealed partial class CallVideoService : IAsyncDisposable
             return [];
         }
 
+        // A card picked by name encodes in its own codecs only — otherwise the passport offers what
+        // another card proved and that card does the encoding (CallVideoDeviceSelection).
+        ResolvedVideoDevice encodeDevice = ResolveEncodeDevice();
+        IReadOnlyList<CallVideoCodecKind>? encodeHardwareCodecs = encodeDevice.Explicit
+            ? CallVideoDeviceSelection.HardwareEncodeCodecs(encodeDevice.VendorId, canEncodeH264: true, probe.HardwareEncoderVendors)
+            : null;
         IReadOnlyList<CallVideoCodecSupport> codecs = CallVideoCodecFactory.RestrictToDevices(
             CallVideoCodecFactory.GetSupportedCodecs(probe),
-            encodeSoftwareOnly: ResolveEncodeDevice().UseSoftware,
-            decodeSoftwareOnly: ResolveDecodeDevice().UseSoftware);
+            encodeSoftwareOnly: encodeDevice.UseSoftware,
+            decodeSoftwareOnly: ResolveDecodeDevice().UseSoftware,
+            encodeHardwareCodecs);
         lock (lifecycleSync)
         {
             return codecHealth.Apply(codecs);
@@ -3798,6 +3901,30 @@ internal sealed partial class CallVideoService : IAsyncDisposable
 
 
 
+    private string? ReadNativeSenderDiagnosticString(string propertyName)
+    {
+        NativeWebRtcMediaEngine.Session? sender;
+        lock (nativeMediaSync)
+        {
+            sender = nativeSenderSession;
+        }
+
+        if (sender is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(sender.GetDiagnosticsJson());
+            return ReadNativeDiagnosticsString(document.RootElement, propertyName, string.Empty);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private long ReadNativeSenderDiagnosticLong(string propertyName)
     {
         NativeWebRtcMediaEngine.Session? sender;
@@ -3992,16 +4119,20 @@ internal sealed partial class CallVideoService : IAsyncDisposable
     /// reached it (docs/bugs/group-call-joiner-saw-no-video.md). Caller holds nativeMediaSync.
     private void AttachGroupFeedbackSink(NativeWebRtcMediaEngine.Session receiver, string senderTagHex)
     {
-        IntPtr handle = nativeHandle;
         string? dialogKey = activeDialogKey;
-        if (handle == IntPtr.Zero || dialogKey is null)
+        if (!nativeWired || dialogKey is null)
         {
             return;
         }
 
         // The core copies the key into its route, so the pin only has to live through the call.
         using DialogKeyPin pin = new($"{dialogKey}{GroupFeedbackKeyMark}{senderTagHex}");
-        ulong targetId = CreatePacketTarget(handle, pin);
+        ulong targetId = 0;
+        if (!rustBridge.TryWithCoreHandle(core => targetId = CreatePacketTarget(core, pin)))
+        {
+            return;
+        }
+
         groupFeedbackTargetIds.Add(targetId);
         receiver.SetPacketSink(Core.NativeMethods.RealtimeMediaPacketSinkFunction, (IntPtr)(long)targetId);
     }

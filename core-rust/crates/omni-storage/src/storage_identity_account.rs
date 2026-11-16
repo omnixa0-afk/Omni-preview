@@ -3,12 +3,8 @@ const LOCAL_PROFILE_DELETED_META_KEY: &str = "local_profile_deleted";
 impl Storage {
     pub fn export_database_backup(&self, destination_path: impl AsRef<Path>) -> OmniResult<()> {
         let destination_path = destination_path.as_ref();
-        // TM-006 follow-up (2026-05-21): confine the destructive
-        // destination before deleting `.db`, `-wal`, `-shm`,
-        // `-journal`, attachments/ and profile-media/ siblings at
-        // the caller-supplied location. Validation-only: actual
-        // delete + VACUUM INTO use the original path.
-        // See docs/decisions/tm-006-destructive-path-confinement.md.
+        // TM-006: confine the caller-supplied destination. Validation-only: VACUUM INTO uses the
+        // original path. See docs/decisions/tm-006-destructive-path-confinement.md.
         let _confined = confine_destructive_path(destination_path)?;
         if Self::paths_refer_to_same_location(&self.db_path, destination_path)? {
             return Err(OmniError::InvalidInput(
@@ -24,7 +20,20 @@ impl Storage {
             })?;
         }
 
-        Self::delete_local_data_files(destination_path)?;
+        // V-24 (review 2026-10-18): the export deletes nothing at the destination. It used to wipe
+        // whatever a database there would own — journals, sidecars, and the `attachments/` and
+        // `profile-media/` folders next to it — so a copy saved into a folder that held anything else
+        // (another profile, the user's own `attachments`) took that with it. Now it writes only its
+        // own files, and a destination that already has one of them is refused.
+        if let Some(existing) = Self::database_copy_files(destination_path)?
+            .into_iter()
+            .find(|file| file.exists())
+        {
+            return Err(OmniError::InvalidInput(format!(
+                "backup destination already has '{}': choose a new file name or an empty folder",
+                existing.display()
+            )));
+        }
         self.connection
             .execute_batch(&format!(
                 "VACUUM INTO {}",
@@ -354,15 +363,17 @@ impl Storage {
         let row = self
             .get_profile_secrets_row(profile_id)?
             .ok_or_else(|| OmniError::InvalidInput("profile was not found".to_string()))?;
-        validate_profile_password_against_secrets_row(&row, password)?;
-        let profile_secrets = load_profile_secrets_from_profile_secrets_row(&row)?.ok_or_else(|| {
-            OmniError::InvalidInput(
-                "recovery phrase is unavailable for legacy profile without root secrets"
+        let unlock_key = validate_profile_password_against_secrets_row(&row, password)?;
+        match read_stored_profile_root(&row, Some(&unlock_key))? {
+            StoredProfileRoot::Open(secrets) => Ok(secrets.recovery_phrase_v2),
+            StoredProfileRoot::OtherMachine => Err(OmniError::InvalidInput(
+                "this computer cannot open the stored phrase: the profile came from another computer"
                     .to_string(),
-            )
-        })?;
-
-        Ok(profile_secrets.recovery_phrase_v2)
+            )),
+            StoredProfileRoot::Absent | StoredProfileRoot::NeedsPassword => Err(OmniError::InvalidInput(
+                "this profile keeps no recovery phrase on this computer".to_string(),
+            )),
+        }
     }
 
     pub fn unlock_profile_with_password(
@@ -388,6 +399,17 @@ impl Storage {
         self.update_profile_state(profile_id, omni_identity::LocalProfileState::SignedIn, now)?;
         self.set_active_profile_id(Some(profile_id))?;
         self.certify_local_device_with_password_key(&unlock_key, now)?;
+        // A root that is not under the password yet (a password set before 2026-10-29, or a root
+        // the phrase resealed) goes under it now; its database-key wrap is checked while it is open.
+        if !row.profile_master_key_password_layer {
+            self.rewrap_profile_root(profile_id, None, Some(&unlock_key), now)?;
+        }
+        let row = self
+            .get_profile_secrets_row(profile_id)?
+            .ok_or_else(|| OmniError::InvalidInput("profile was not found".to_string()))?;
+        if let StoredProfileRoot::Open(secrets) = read_stored_profile_root(&row, Some(&unlock_key))? {
+            self.add_database_key_wraps(vec![(AccountId(row.account_id.clone()), secrets.root_secret)])?;
+        }
 
         self.get_local_profile_summary(profile_id)?
             .ok_or_else(|| OmniError::Storage("profile summary missing after unlock".to_string()))
@@ -407,6 +429,8 @@ impl Storage {
         // is certified now.
         self.certify_local_device_with_root(&account_id, &root_secret, now)?;
         self.ensure_database_key_wraps()?;
+        // A root under the profile password is not among the openable ones; the phrase has it.
+        self.add_database_key_wraps(vec![(account_id, root_secret)])?;
 
         self.get_local_profile_summary(profile_id)?
             .ok_or_else(|| OmniError::Storage("profile summary missing after unlock".to_string()))
@@ -469,16 +493,23 @@ impl Storage {
         // The phrase proves the account by itself. The stored copy of the root, when this machine
         // can open it, must agree; a folder copied from another machine cannot open it (sealed to
         // that machine) — the phrase seals the root and the phrase again, for this one.
+        // A root under the profile password stays as it is: the phrase already proved the account,
+        // and resealing it would drop the password layer.
         let account_id = AccountId(row.account_id.clone());
-        match load_profile_secrets_from_profile_secrets_row(&row) {
-            Ok(Some(stored)) => {
+        match read_stored_profile_root(&row, None) {
+            Ok(StoredProfileRoot::Open(stored)) => {
                 if stored.root_secret != root_secret {
                     return Err(OmniError::InvalidInput(
                         "mnemonic does not match encrypted root secret for this profile".to_string(),
                     ));
                 }
             }
-            Ok(None) | Err(_) => self.reseal_profile_secrets(profile_id, &account_id, &root_secret)?,
+            Ok(StoredProfileRoot::NeedsPassword) => {}
+            // Resealed without the password layer; a profile with a password gets it back at the
+            // next password unlock (`unlock_profile_with_password`).
+            Ok(StoredProfileRoot::Absent | StoredProfileRoot::OtherMachine) | Err(_) => {
+                self.reseal_profile_secrets(profile_id, &account_id, &root_secret)?
+            }
         }
         Ok((account_id, root_secret))
     }
@@ -507,6 +538,7 @@ impl Storage {
                 SET profile_master_key_protection_scheme = ?2,
                     profile_master_key_blob_hex = ?3,
                     encrypted_profile_secrets_json = ?4,
+                    profile_master_key_password_layer = 0,
                     recovery_version = ?5,
                     updated_at_unix_ms = ?6
                 WHERE profile_id = ?1
@@ -518,6 +550,53 @@ impl Storage {
                     sealed.encrypted_profile_secrets_json,
                     recovery_version,
                     current_unix_ms(),
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// Move the root's seal between this machine alone and this machine plus the profile password,
+    /// following the password: set (`None` → key), changed (old → new), removed (old → `None`). A
+    /// root not under the password yet ignores `from`. A root this machine cannot open (a copied
+    /// folder) is left for the phrase.
+    fn rewrap_profile_root(
+        &self,
+        profile_id: &LocalProfileId,
+        from_unlock_key: Option<&[u8; 32]>,
+        to_unlock_key: Option<&[u8; 32]>,
+        now_unix_ms: i64,
+    ) -> OmniResult<()> {
+        let row = self
+            .get_profile_secrets_row(profile_id)?
+            .ok_or_else(|| OmniError::InvalidInput("profile was not found".to_string()))?;
+        let profile_master_key = match open_profile_master_key(&row, from_unlock_key)? {
+            Ok(key) => key,
+            Err(StoredProfileRoot::NeedsPassword) => {
+                return Err(OmniError::Storage(
+                    "the root is under the profile password, but the current password was not given"
+                        .to_string(),
+                ))
+            }
+            Err(_) => return Ok(()),
+        };
+        let sealed = seal_profile_master_key(&row.account_id, &profile_master_key, to_unlock_key)?;
+        self.connection
+            .execute(
+                "
+                UPDATE profile_secrets
+                SET profile_master_key_protection_scheme = ?2,
+                    profile_master_key_blob_hex = ?3,
+                    profile_master_key_password_layer = ?4,
+                    updated_at_unix_ms = ?5
+                WHERE profile_id = ?1
+                ",
+                params![
+                    profile_id.0.as_str(),
+                    sealed.scheme.as_db_value(),
+                    sealed.blob_hex,
+                    bool_to_sqlite_integer(to_unlock_key.is_some()),
+                    now_unix_ms,
                 ],
             )
             .map_err(map_sqlite_error)?;
@@ -548,33 +627,38 @@ impl Storage {
             .get_profile_secrets_row(profile_id)?
             .ok_or_else(|| OmniError::InvalidInput("profile was not found".to_string()))?;
 
-        // The password guards the working key only. The root secret and the phrase stay under this
-        // machine's protection alone: a copied folder plus the password must not yield the root, or
-        // a thief could out-migrate the owner (docs/decisions/multi-device-equal-nodes.md).
+        // The password guards the working key, and the root secret with the phrase INSIDE this
+        // machine's seal: DPAPI(password(root)). A copied folder plus the password still yields no
+        // root (a thief could out-migrate the owner, docs/decisions/multi-device-equal-nodes.md), and
+        // a process of the same user without the password no longer does either (r2 question 12).
         let salt = random_salt_hex()?;
         let unlock_key = derive_password_unlock_key(password, &salt)?;
         let verifier = password_verifier_hex(&unlock_key);
         let now = current_unix_ms();
-        self.rewrap_working_key(
-            &AccountId(row.account_id.clone()),
-            previous_unlock_key,
-            Some(&unlock_key),
-            now,
-        )?;
+        self.with_immediate_transaction("apply_local_profile_password", |storage| {
+            storage.rewrap_working_key(
+                &AccountId(row.account_id.clone()),
+                previous_unlock_key,
+                Some(&unlock_key),
+                now,
+            )?;
+            storage.rewrap_profile_root(profile_id, previous_unlock_key, Some(&unlock_key), now)?;
 
-        self.connection
-            .execute(
-                "
-                UPDATE profile_secrets
-                SET password_enabled = 1,
-                    password_salt_hex = ?2,
-                    password_verifier_hex = ?3,
-                    updated_at_unix_ms = ?4
-                WHERE profile_id = ?1
-                ",
-                params![profile_id.0.as_str(), salt.as_str(), verifier.as_str(), now],
-            )
-            .map_err(map_sqlite_error)?;
+            storage.connection
+                .execute(
+                    "
+                    UPDATE profile_secrets
+                    SET password_enabled = 1,
+                        password_salt_hex = ?2,
+                        password_verifier_hex = ?3,
+                        updated_at_unix_ms = ?4
+                    WHERE profile_id = ?1
+                    ",
+                    params![profile_id.0.as_str(), salt.as_str(), verifier.as_str(), now],
+                )
+                .map_err(map_sqlite_error)?;
+            Ok(())
+        })?;
 
         Ok(password_protection_summary(profile.profile_id, true))
     }
@@ -618,20 +702,24 @@ impl Storage {
             .get_profile_secrets_row(profile_id)?
             .map(|row| AccountId(row.account_id))
             .ok_or_else(|| OmniError::InvalidInput("profile was not found".to_string()))?;
-        self.rewrap_working_key(&account_id, Some(&previous_unlock_key), None, now)?;
-        self.connection
-            .execute(
-                "
-                UPDATE profile_secrets
-                SET password_enabled = 0,
-                    password_salt_hex = NULL,
-                    password_verifier_hex = NULL,
-                    updated_at_unix_ms = ?2
-                WHERE profile_id = ?1
-                ",
-                params![profile_id.0.as_str(), now],
-            )
-            .map_err(map_sqlite_error)?;
+        self.with_immediate_transaction("remove_local_profile_password", |storage| {
+            storage.rewrap_working_key(&account_id, Some(&previous_unlock_key), None, now)?;
+            storage.rewrap_profile_root(profile_id, Some(&previous_unlock_key), None, now)?;
+            storage.connection
+                .execute(
+                    "
+                    UPDATE profile_secrets
+                    SET password_enabled = 0,
+                        password_salt_hex = NULL,
+                        password_verifier_hex = NULL,
+                        updated_at_unix_ms = ?2
+                    WHERE profile_id = ?1
+                    ",
+                    params![profile_id.0.as_str(), now],
+                )
+                .map_err(map_sqlite_error)?;
+            Ok(())
+        })?;
 
         Ok(password_protection_summary(profile.profile_id, false))
     }
@@ -654,11 +742,58 @@ impl Storage {
             storage.delete_attachment_files(attachment_file_paths.clone())?;
             storage.delete_public_profile_assets_for_profile(profile_id)?;
 
+            storage.delete_profile_meta(profile_id)?;
             let has_remaining_profiles = !storage.list_local_profiles()?.profiles.is_empty();
+            if !has_remaining_profiles {
+                storage.delete_rows_of_the_last_profile()?;
+            }
             storage.mark_local_profile_deleted(!has_remaining_profiles)?;
 
             Ok(())
         })
+    }
+
+    /// Leave one profile in a COPY of the database (never in the profile's own): every row of every
+    /// other profile goes, and the key file beside the copy keeps the wrap of this profile's account
+    /// alone. Rows only — the files those rows name belong to the live profiles and are not touched.
+    /// The copy is then rebuilt, so the removed rows are not left in its free pages. Returns the
+    /// attachment files the kept profile's rows name.
+    ///
+    /// A backup was a snapshot of the whole install under one profile's key: whoever held that
+    /// profile's phrase read the chats and keys of every other profile on the machine (blind audit
+    /// 2026-11-11, pass 14).
+    pub fn keep_one_profile_in_copy(copy_db_path: &Path, keep: &LocalProfileId) -> OmniResult<Vec<PathBuf>> {
+        let kept_files = {
+            let copy = Storage::open(copy_db_path)?;
+            let Some(kept) = copy.get_local_profile_summary(keep)? else {
+                return Err(OmniError::Storage("the copy does not hold the profile it is made for".to_string()));
+            };
+            let others: Vec<_> =
+                copy.list_local_profiles()?.profiles.into_iter().filter(|profile| profile.profile_id != *keep).collect();
+            copy.with_immediate_transaction("keep_one_profile_in_copy", |copy| {
+                for other in &others {
+                    let account_id = other.account_id.0.as_str();
+                    copy.delete_profile_rows_by_profile_id(&other.profile_id)?;
+                    copy.delete_profile_auxiliary_rows(account_id)?;
+                    copy.delete_profile_foundation_rows(&other.profile_id)?;
+                    copy.delete_profile_account_rows(account_id)?;
+                    copy.delete_profile_meta(&other.profile_id)?;
+                    copy.connection
+                        .execute("DELETE FROM app_meta WHERE key = ?1", params![format!("last_backup_at_unix_ms:{account_id}")])
+                        .map_err(map_sqlite_error)?;
+                }
+                Ok(())
+            })?;
+            copy.connection.execute_batch("VACUUM").map_err(map_sqlite_error)?;
+            // The copy is packed as one file: nothing of it may stay in a journal beside it.
+            copy.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .map_err(map_sqlite_error)?;
+            Self::keep_one_account_key_wrap(copy_db_path, &kept.account_id)?;
+            copy.attachment_file_paths_for_profile(keep)?
+        };
+        Self::forget_key_of_database(copy_db_path);
+        Ok(kept_files)
     }
 
     pub fn get_local_profile_footprint_summary(
@@ -877,6 +1012,65 @@ impl Storage {
         ))
     }
 
+    /// The last profile is gone: the rows no profile column ties to one go too — message marks, keys
+    /// and revocations of accounts, this node's mesh books, the profiles' own `app_meta` values. They
+    /// are the deleted identity's; the install keeps only what the user set for it (relays, couriers)
+    /// and its own marks. Until 2026-11-09 they stayed, though the database was called «an empty
+    /// container» by then.
+    fn delete_rows_of_the_last_profile(&self) -> OmniResult<()> {
+        // Every row of them goes, so a reference between two of them is checked at the commit.
+        self.connection.execute_batch("PRAGMA defer_foreign_keys = ON").map_err(map_sqlite_error)?;
+        for entry in STORAGE_OWNERSHIP_MAP.iter().filter(|entry| entry.category != StorageOwnershipCategory::GlobalInstallScoped) {
+            let exists = self
+                .connection
+                .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", params![entry.name], |_| Ok(()))
+                .optional()
+                .map_err(map_sqlite_error)?
+                .is_some();
+            if exists {
+                self.connection.execute(&format!("DELETE FROM \"{}\"", entry.name), []).map_err(map_sqlite_error)?;
+            }
+        }
+        for prefix in [PROFILE_META_PREFIX, "last_backup_at_unix_ms:"].iter().chain(LEGACY_PROFILE_META_PREFIXES) {
+            self.connection
+                .execute("DELETE FROM app_meta WHERE substr(key, 1, length(?1)) = ?1", params![prefix])
+                .map_err(map_sqlite_error)?;
+        }
+        Ok(())
+    }
+
+    /// Values a profile kept in `app_meta` before they carried its id (until 2026-11-09): they move to
+    /// the active profile (or the only one); with none, they go. Keys under the id never match.
+    fn move_legacy_profile_meta(&self) -> OmniResult<()> {
+        let owner: Option<String> = match self.get_app_meta(ACTIVE_PROFILE_ID_META_KEY)? {
+            Some(active) if !active.is_empty() => Some(active),
+            _ => {
+                let ids: Vec<String> = self
+                    .connection
+                    .prepare("SELECT profile_id FROM profile_registry")
+                    .and_then(|mut statement| statement.query_map([], |row| row.get(0))?.collect())
+                    .map_err(map_sqlite_error)?;
+                (ids.len() == 1).then(|| ids[0].clone())
+            }
+        };
+        for prefix in LEGACY_PROFILE_META_PREFIXES {
+            match &owner {
+                Some(profile_id) => self
+                    .connection
+                    .execute(
+                        "UPDATE OR REPLACE app_meta SET key = ?1 || key WHERE substr(key, 1, length(?2)) = ?2",
+                        params![profile_meta_key(&LocalProfileId(profile_id.clone()), ""), prefix],
+                    )
+                    .map_err(map_sqlite_error)?,
+                None => self
+                    .connection
+                    .execute("DELETE FROM app_meta WHERE substr(key, 1, length(?1)) = ?1", params![prefix])
+                    .map_err(map_sqlite_error)?,
+            };
+        }
+        Ok(())
+    }
+
     fn mark_local_profile_deleted(&self, deleted: bool) -> OmniResult<()> {
         self.upsert_app_meta(
             LOCAL_PROFILE_DELETED_META_KEY,
@@ -967,13 +1161,61 @@ fn validate_profile_password_against_secrets_row(
     Ok(unlock_key)
 }
 
-fn load_profile_secrets_from_profile_secrets_row(
-    row: &ProfileSecretsRow,
-) -> OmniResult<Option<StoredProfileSecretsV1>> {
-    let Some(encrypted_profile_secrets_json) = row.encrypted_profile_secrets_json.as_deref() else {
-        return Ok(None);
-    };
+/// Where the stored root secret of a profile stands on this machine.
+enum StoredProfileRoot {
+    /// No root kept in this profile.
+    Absent,
+    /// Sealed to another machine (a copied folder): only the phrase brings it here.
+    OtherMachine,
+    /// Under the profile password as well; the caller had no unlock key.
+    NeedsPassword,
+    Open(StoredProfileSecretsV1),
+}
 
+impl StoredProfileRoot {
+    fn open(self) -> Option<StoredProfileSecretsV1> {
+        match self {
+            Self::Open(secrets) => Some(secrets),
+            _ => None,
+        }
+    }
+}
+
+fn profile_master_key_password_context(account_id: &str) -> Vec<u8> {
+    format!("omni-profile-master-key-password-v1|{account_id}").into_bytes()
+}
+
+/// Seal the profile master key to this machine, with the profile password inside the seal when
+/// `password_unlock_key` is given: DPAPI(password(key)). A copied folder still opens nothing
+/// without this machine, and a process of the same user no longer opens the root without the
+/// password (r2 question 12).
+fn seal_profile_master_key(
+    account_id: &str,
+    profile_master_key: &[u8; PROFILE_MASTER_KEY_LEN],
+    password_unlock_key: Option<&[u8; 32]>,
+) -> OmniResult<ProtectedSecret> {
+    match password_unlock_key {
+        None => protect_bytes(profile_master_key),
+        Some(unlock_key) => {
+            let wrapped = encrypt_at_rest_bytes(
+                unlock_key,
+                &profile_master_key_password_context(account_id),
+                profile_master_key,
+            )?;
+            protect_bytes(&serde_json::to_vec(&wrapped).map_err(map_serde_error_to_storage)?)
+        }
+    }
+}
+
+/// The profile master key, or the state that keeps it from being had here. A wrong unlock key is
+/// an error, not `NeedsPassword`.
+fn open_profile_master_key(
+    row: &ProfileSecretsRow,
+    password_unlock_key: Option<&[u8; 32]>,
+) -> OmniResult<Result<[u8; PROFILE_MASTER_KEY_LEN], StoredProfileRoot>> {
+    if row.encrypted_profile_secrets_json.is_none() {
+        return Ok(Err(StoredProfileRoot::Absent));
+    }
     let scheme = row
         .profile_master_key_protection_scheme
         .as_deref()
@@ -983,16 +1225,46 @@ fn load_profile_secrets_from_profile_secrets_row(
         .as_deref()
         .ok_or_else(|| OmniError::Storage("profile master key blob is missing".to_string()))?;
     let protected_master_key = protected_secret_from_db(scheme, blob_hex)?;
-    let profile_master_key = unprotect_bytes(&protected_master_key)?;
-    if profile_master_key.len() != PROFILE_MASTER_KEY_LEN {
-        return Err(OmniError::Storage(
-            "profile master key has unexpected length".to_string(),
-        ));
-    }
+    let Ok(sealed) = unprotect_bytes(&protected_master_key) else {
+        return Ok(Err(StoredProfileRoot::OtherMachine));
+    };
+    let profile_master_key = if row.profile_master_key_password_layer {
+        let Some(unlock_key) = password_unlock_key else {
+            return Ok(Err(StoredProfileRoot::NeedsPassword));
+        };
+        let wrapped: AtRestEncryptedBlob =
+            serde_json::from_slice(&sealed).map_err(map_serde_error_to_storage)?;
+        omni_crypto::Zeroizing::new(
+            decrypt_at_rest_bytes(
+                unlock_key,
+                &profile_master_key_password_context(&row.account_id),
+                &wrapped,
+            )
+            .map_err(|_| OmniError::InvalidInput("password does not unlock this profile".to_string()))?,
+        )
+    } else {
+        sealed
+    };
     let profile_master_key: [u8; PROFILE_MASTER_KEY_LEN] = profile_master_key
         .as_slice()
         .try_into()
         .map_err(|_| OmniError::Storage("profile master key has unexpected length".to_string()))?;
+    Ok(Ok(profile_master_key))
+}
+
+/// The root secret and the phrase of a profile. `password_unlock_key` opens a root that is under
+/// the profile password; without it such a root is `NeedsPassword`.
+fn read_stored_profile_root(
+    row: &ProfileSecretsRow,
+    password_unlock_key: Option<&[u8; 32]>,
+) -> OmniResult<StoredProfileRoot> {
+    let profile_master_key = match open_profile_master_key(row, password_unlock_key)? {
+        Ok(key) => key,
+        Err(state) => return Ok(state),
+    };
+    let Some(encrypted_profile_secrets_json) = row.encrypted_profile_secrets_json.as_deref() else {
+        return Ok(StoredProfileRoot::Absent);
+    };
 
     let encrypted_blob: AtRestEncryptedBlob =
         serde_json::from_str(encrypted_profile_secrets_json).map_err(map_serde_error_to_storage)?;
@@ -1004,7 +1276,7 @@ fn load_profile_secrets_from_profile_secrets_row(
     let profile_secrets: StoredProfileSecretsV1 =
         serde_json::from_slice(&plaintext).map_err(map_serde_error_to_storage)?;
 
-    Ok(Some(profile_secrets))
+    Ok(StoredProfileRoot::Open(profile_secrets))
 }
 
 

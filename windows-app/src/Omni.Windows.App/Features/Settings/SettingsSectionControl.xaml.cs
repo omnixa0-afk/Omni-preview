@@ -28,6 +28,12 @@ public sealed partial class SettingsSectionControl : UserControl
     /// «Отозвать» in a device's row; the device id is the argument.
     internal event EventHandler<string>? RevokeDeviceRequested;
 
+    /// The page on screen, by its tag.
+    internal string CurrentSection => (SettingsNavList.SelectedItem as ListViewItem)?.Tag as string ?? "profile";
+
+    /// Another page came on screen.
+    internal event Action? SectionShown;
+
     /// Open a section by its tag (profile, devices, privacy, network, calls, general, advanced).
     internal void ShowSection(string tag)
     {
@@ -43,8 +49,8 @@ public sealed partial class SettingsSectionControl : UserControl
 
     private void ShowSelectedSection()
     {
-        string tag = (SettingsNavList.SelectedItem as ListViewItem)?.Tag as string ?? "profile";
-        foreach (StackPanel section in new[]
+        string tag = CurrentSection;
+        foreach (FrameworkElement section in new FrameworkElement[]
                  {
                      SettingsSection_profile, SettingsSection_devices, SettingsSection_privacy,
                      SettingsSection_network, SettingsSection_calls, SettingsSection_general,
@@ -55,6 +61,8 @@ public sealed partial class SettingsSectionControl : UserControl
         }
 
         SettingsContentScroll.ChangeView(null, 0, null, disableAnimation: true);
+        if (tag == "general") _ = RefreshWorkspaceFoldersAsync();
+        SectionShown?.Invoke();
     }
 
     private void OnRevokeDeviceRowClicked(object sender, RoutedEventArgs e)

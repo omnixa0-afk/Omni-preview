@@ -20,7 +20,6 @@ public sealed partial class MainWindow
 {
     private bool rendezvousProvidersAddWired;
     private bool dhtRendezvousToggleWired;
-    private bool rendezvousVisibilityWired;
     private bool suppressDhtEntryNodeToggle;
     private bool suppressProviderModeChange;
 
@@ -28,8 +27,8 @@ public sealed partial class MainWindow
     // row (and its mode box) is not rebuilt under the user's hand every few seconds.
     private readonly System.Collections.Generic.Dictionary<long, TextBlock> providerStatusLines = new();
 
-    // Live DHT-status poll: runs only while the Settings section is visible (started/stopped in
-    // OnSettingsVisibilityChangedForRendezvous). Each tick reads dht_rendezvous_status OFF the UI thread
+    // Live DHT-status poll: runs only while the page showing it is on screen (started/stopped in
+    // MainWindow.SettingsPages.cs). Each tick reads dht_rendezvous_status OFF the UI thread
     // (a stuck helper must not freeze the poll) and updates the swarm-connection indicator.
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? dhtStatusPollTimer;
     private bool dhtPollInFlight;
@@ -112,41 +111,12 @@ public sealed partial class MainWindow
             dhtRendezvousToggleWired = true;
         }
 
-        if (!rendezvousVisibilityWired)
-        {
-            // This initializer runs once (post-sign-in), often before the Rust core handle is ready,
-            // so the first read fails and the card shows its cold-load fallback. Re-read whenever the
-            // Settings section becomes visible — by the time the user opens it the core is warm and the
-            // list / DHT toggle / segment status all populate (same pattern as ContactsSectionControl).
-            SettingsSectionRoot.RegisterPropertyChangedCallback(
-                UIElement.VisibilityProperty, OnSettingsVisibilityChangedForRendezvous);
-            rendezvousVisibilityWired = true;
-        }
-
+        // This initializer runs once (post-sign-in), often before the Rust core handle is ready, so the
+        // first read fails and the card shows its cold-load fallback. The pages re-read when shown
+        // (MainWindow.SettingsPages.cs): by then the core is warm.
         RefreshRendezvousProviders();
         RefreshDhtBootstrap();
         RefreshDhtEntryNode();
-    }
-
-    private void OnSettingsVisibilityChangedForRendezvous(DependencyObject sender, DependencyProperty dp)
-    {
-        if (SettingsSectionRoot.Visibility != Visibility.Visible)
-        {
-            StopDhtStatusPolling();
-            return;
-        }
-
-        DispatcherQueue.TryEnqueue(() =>
-        {
-            RefreshRendezvousProviders();
-            RefreshDhtBootstrap();
-            RefreshDhtEntryNode();
-            // Re-read discoverability too: like the rendezvous card, the one post-sign-in read often
-            // runs before the core handle is warm, so the Omni-ID box comes up empty and never refills.
-            // By the time Settings is opened the core is warm — repopulate the copyable Omni-ID.
-            RefreshDiscoverabilitySettings();
-            StartDhtStatusPolling();
-        });
     }
 
     // Whether the DHT helper can actually LAUNCH — either a sibling omni-dht-helper.exe ships next to
@@ -322,7 +292,7 @@ public sealed partial class MainWindow
             rustBridge.AddDhtBootstrapNode(addr);
             SettingsDhtBootstrapAddressTextBox.Text = string.Empty;
             SettingsDhtBootstrapStatusTextBlock.Text =
-                "Bootstrap-нода добавлена. Вступит в силу при следующем запуске профиля.";
+                "Узел добавлен. Вступит в силу при следующем запуске профиля.";
         }
         catch (Exception ex)
         {
@@ -337,7 +307,7 @@ public sealed partial class MainWindow
         try
         {
             rustBridge.RemoveDhtBootstrapNode(address);
-            SettingsDhtBootstrapStatusTextBlock.Text = "Bootstrap-нода удалена.";
+            SettingsDhtBootstrapStatusTextBlock.Text = "Узел удалён.";
         }
         catch (Exception ex)
         {
@@ -744,10 +714,10 @@ public sealed partial class MainWindow
     // Who sees what, and what the courier is good at — the consequence of keeping it, not its protocol.
     private static string ProviderTradeOff(Core.RendezvousProviderDto provider) => provider.Kind switch
     {
-        "dht" => "Без владельца и без лимитов, работает, когда остальные недоступны. Ваш IP видят узлы роя, провайдер видит запросы. Без уведомлений: контакт находится за 1–2 минуты",
-        "ntfy" => "Одна компания видит ваш IP и когда вы на связи. Мгновенные уведомления. Лимит — 250 публикаций в сутки на IP, общий со всеми за вашим роутером",
-        _ when provider.Pooled => "Реле видит ваш IP, но только для части контактов: каждую пару обслуживают 2–3 реле из шести общих. Мгновенные уведомления",
-        _ => "Реле видит ваш IP и всех, с кем вы встречаетесь через него. Мгновенные уведомления",
+        "dht" => "Без владельца и лимитов. Ваш IP видят узлы роя, но не кого вы ищете. Контакт находится за 1–2 минуты",
+        "ntfy" => "Одна компания видит ваш IP и когда вы на связи. Мгновенно; 250 публикаций в сутки на роутер",
+        _ when provider.Pooled => "Реле видит ваш IP и часть контактов: каждую пару обслуживают 2–3 реле из шести. Мгновенно",
+        _ => "Реле видит ваш IP и всех, с кем вы встречаетесь через него. Мгновенно",
     };
 
     // What the courier did last, in the user's terms.

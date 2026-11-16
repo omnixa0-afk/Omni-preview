@@ -50,7 +50,7 @@ impl Storage {
     pub fn message_exists(&self, message_id: &str) -> OmniResult<bool> {
         let found: Option<i64> = self
             .connection
-            .query_row("SELECT 1 FROM messages WHERE id = ?1", params![message_id], |row| row.get(0))
+            .query_row("SELECT 1 FROM messages WHERE id = ?1 AND profile_id = ?2", params![message_id, self.resolve_transition_profile_id()?.0], |row| row.get(0))
             .optional()
             .map_err(map_sqlite_error)?;
         Ok(found.is_some())
@@ -122,9 +122,9 @@ impl Storage {
             .execute(
                 "
                 UPDATE messages SET status = 'delivered', remote_delivered_at_unix_ms = COALESCE(remote_delivered_at_unix_ms, ?2)
-                WHERE id = ?1 AND direction = 'outgoing' AND status = 'sent'
+                WHERE profile_id = ?3 AND id = ?1 AND direction = 'outgoing' AND status = 'sent'
                 ",
-                params![message_id, now_unix_ms],
+                params![message_id, now_unix_ms, self.resolve_transition_profile_id()?.0],
             )
             .map_err(map_sqlite_error)?;
         Ok(())

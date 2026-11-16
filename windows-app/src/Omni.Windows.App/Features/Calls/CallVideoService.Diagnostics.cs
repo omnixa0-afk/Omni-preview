@@ -84,22 +84,37 @@ internal sealed partial class CallVideoService
     /// The codec of each direction in words, as rows of Diagnostics → Media (ADR §8): «Ваше видео:
     /// AV1 — лучший из возможных», «Видео собеседника: HEVC — отправитель не кодирует AV1». Empty
     /// without video. Ends with a newline so the technical line stays a row of its own.
+    /// <paramref name="sendEncoder"/>: the encoder that really runs (the MFT's own name, e.g.
+    /// «Intel® Quick Sync Video H.264 Encoder MFT») — which card encodes was invisible before, and
+    /// a card chosen in Settings could be silently replaced by another (live 2026-10-30).
     /// </summary>
-    internal static string FormatVideoDirectionsForPeople(RealtimeVideoStream? send, RealtimeVideoStream? receive)
+    internal static string FormatVideoDirectionsForPeople(
+        RealtimeVideoStream? send,
+        RealtimeVideoStream? receive,
+        string? sendEncoder = null)
     {
         if (send is null && receive is null)
         {
             return string.Empty;
         }
 
-        static string Line(string label, RealtimeVideoStream? stream)
+        static string Line(string label, RealtimeVideoStream? stream, string? encoder)
             => stream is null
                 ? $"{label}: не идёт\n"
                 : $"{label}: {CodecForPeople(stream.Codec)}, {stream.Width}×{stream.Height}, {stream.Fps} к/с" +
-                  (string.IsNullOrWhiteSpace(stream.Reason) ? string.Empty : $" — {stream.Reason}") + "\n";
+                  (string.IsNullOrWhiteSpace(stream.Reason) ? string.Empty : $" — {stream.Reason}") +
+                  (string.IsNullOrWhiteSpace(encoder) ? string.Empty : $"; кодирует {encoder}") + "\n";
 
-        return Line("Ваше видео", send) + Line("Видео собеседника", receive);
+        return Line("Ваше видео", send, sendEncoder) + Line("Видео собеседника", receive, null);
     }
+
+    /// Call media is always sealed end to end (1:1 and group); the count is what was dropped on the
+    /// way in because it did not open with the sender's key or came twice — a steady count in a
+    /// working call means someone on the path is sending into it.
+    private static string FormatEndToEndForPeople(ulong dropped)
+        => dropped == 0
+            ? "Сквозное шифрование: включено\n"
+            : $"Сквозное шифрование: включено, отброшено {dropped} (не открылись или повтор)\n";
 
     private static string CodecForPeople(string codec)
         => CallVideoCodecFactory.ParseCodec(codec) switch
@@ -228,7 +243,24 @@ internal sealed partial class CallVideoService
         string audio = audioCapture + audioPlayback;
         string error = string.IsNullOrWhiteSpace(lastError) ? string.Empty : $" | error={lastError}";
         string passport = string.IsNullOrEmpty(lastPublishedPassport) ? string.Empty : $" | passport={lastPublishedPassport}";
-        return $"{FormatVideoDirectionsForPeople(activeSendStream, activeReceiveStream)}Media: {state}{passport}{localVideo}{remoteVideo}{codec}{nativeWebRtc}{nativeMedia}{nativeSession}{transport}{negotiation}{captureProbe}{capture}{health}{abr}{audio}{control}{processing} | sent={sentFrames}f/{ReadNativeSenderDiagnosticLong("rtp_packets_sent")}p | recv={Interlocked.Read(ref framesReceived)}f/{ReadRouterCounters().Delivered}p | rendered={renderedFrames}f{error}";
+        // The negotiated streams exist from the answer on, camera or not: shown as they were, an
+        // audio-only call read «Ваше видео: AV1, 1280×720» with nothing on the wire. A direction is
+        // named only while its video runs.
+        string directions = FormatVideoDirectionsForPeople(
+            localCameraActive ? activeSendStream : null,
+            remoteVideoSeen ? activeReceiveStream : null,
+            ReadNativeSenderDiagnosticString("encoder_implementation"));
+        if (directions.Length == 0 && callMediaRequested)
+        {
+            directions = "Видео не идёт: звонок со звуком\n";
+        }
+        if (callMediaRequested)
+        {
+            directions += FormatEndToEndForPeople(
+                Core.NativeMethods.omni_calls_media_unopened_total() - mediaUnopenedAtCallStart);
+        }
+
+        return $"{directions}Media: {state}{passport}{localVideo}{remoteVideo}{codec}{nativeWebRtc}{nativeMedia}{nativeSession}{transport}{negotiation}{captureProbe}{capture}{health}{abr}{audio}{control}{processing} | sent={sentFrames}f/{ReadNativeSenderDiagnosticLong("rtp_packets_sent")}p | recv={Interlocked.Read(ref framesReceived)}f/{ReadRouterCounters().Delivered}p | rendered={renderedFrames}f{error}";
     }
 
     private string BuildNativeSessionDiagnostics()
@@ -461,7 +493,10 @@ internal sealed partial class CallVideoService
             // scaler judges by the real output), a software one does (-> the QP scaler). Chasing
             // "why did the picture not shrink" without this is chasing two mechanisms at once.
             string encoderBackend = ReadNativeDiagnosticsString(root, "encoder_backend", "?");
+            // And WHOSE: the MFT's own name says which card encodes, the vendor filter only asks.
+            string encoderName = ReadNativeDiagnosticsString(root, "encoder_implementation", string.Empty);
             string adaptSuffix =
+                (string.IsNullOrEmpty(encoderName) ? string.Empty : $" enc=\"{encoderName}\"") +
                 $" adapt={degradation}/{encoderBackend} cpu({cpuRes}res/{cpuFps}fps) quality({qualityRes}res/{qualityFps}fps)" +
                 $" wants={wantsPixels}px/{wantsFps}fps({wantsNarrowed}v/{wantsWidened}^)" +
                 $" scaling=[{scaling}]x{scalingUpdates} encOut={encW}x{encH}@{encBps / 1000}kbps qp={encQp}" +

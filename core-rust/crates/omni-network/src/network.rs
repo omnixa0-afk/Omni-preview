@@ -141,6 +141,21 @@ const PATH_REQUEST_DEFAULT_HOP_LIMIT: u8 = 4;
 /// giving up (and falling through to "no path"). Bounded so a dial never hangs on discovery.
 const PATH_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 
+/// How long a PathRequest we sent or relayed still accepts replies: the origin's wait plus the
+/// time a late reply takes back over the relays.
+const PATH_REPLY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Most PathRequests remembered as awaiting replies (own and relayed); the oldest goes first.
+const MAX_PENDING_PATH_REQUESTS: usize = 1024;
+
+/// Longest TTL an announce may claim for itself (route and replay window alike).
+const MAX_ANNOUNCE_TTL_SECONDS: u32 = 600;
+
+/// Most peers the address book learns from announces. Endpoints injected out-of-band (rendezvous,
+/// relays the user added) are never evicted for announce-learned ones; among those, the stalest
+/// announce goes first.
+const MAX_PEER_BOOK_ENTRIES: usize = 4096;
+
 /// Poll cadence while waiting for the discovered route to appear in the path table.
 const PATH_REQUEST_POLL: Duration = Duration::from_millis(50);
 
@@ -158,6 +173,83 @@ const MAX_DURABLE_FRAMES: usize = 8192;
 /// Per-`from` cap on stored durable frames, so one source can't monopolise the
 /// global budget (fairness — extends TM-005/008 to the durable layer).
 const MAX_DURABLE_FRAMES_PER_SOURCE: usize = 512;
+/// How many durable frames may be on their way through the app at once (see `durable_in_flight`).
+const DURABLE_IN_FLIGHT_MAX: usize = 4096;
+
+/// A durable frame handed to the app and not settled yet — handled, or given up on. Dropped, it is
+/// settled: a frame cannot keep its place in [`DURABLE_IN_FLIGHT_MAX`] whatever becomes of it on the
+/// way (a queue it waits in, a pause before it is offered again, an answer never given).
+pub struct DurableInFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for DurableInFlight {
+    fn drop(&mut self) {
+        let _ = self.0.try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |frames| {
+            Some(frames.saturating_sub(1))
+        });
+    }
+}
+/// Longest a durable frame lives, counted from its origin's send time; a frame's own `ttl_secs` can
+/// only shorten it. Before, every holder restarted the frame's `ttl_secs` on arrival, so a frame
+/// lived as long as holders kept handing it on, with whatever TTL its sender wrote (V-05).
+const MAX_DURABLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// How far a sender's clock may run ahead of ours before its durable frame is refused as dated in
+/// the future (it would otherwise outlive the cap above by that much).
+const DURABLE_CLOCK_SKEW_SECS: u64 = 10 * 60;
+
+/// Seconds since the unix epoch (0 if the clock is before it).
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Room in the address book for an announce-learned record of `dest` (V-07): always for a peer
+/// already there; otherwise, when full, the announce-learned record with the stalest announce is
+/// dropped. Records injected out-of-band are never dropped for it; with only those left, false.
+fn admit_peer_book_entry(book: &mut HashMap<NodeAddress, PeerRecord>, dest: &NodeAddress) -> bool {
+    if book.contains_key(dest) || book.len() < MAX_PEER_BOOK_ENTRIES {
+        return true;
+    }
+    let stalest = book
+        .iter()
+        .filter(|(_, record)| record.announce_timestamp > 0)
+        .min_by_key(|(_, record)| record.announce_timestamp)
+        .map(|(addr, _)| *addr);
+    match stalest {
+        Some(addr) => {
+            book.remove(&addr);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Blinded interest in group destination `dest`, as `from` advertises it to `to` in an
+/// anti-entropy HAVE: `blake3("omni.ae.interest|" ‖ dest ‖ from ‖ to)[..20]`. Only a node that
+/// knows `dest` (a member) can recognise it; it differs for every pair. See
+/// `Network::own_interests_for`.
+fn interest_token(dest: &NodeAddress, from: &NodeAddress, to: &NodeAddress) -> NodeAddress {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"omni.ae.interest|");
+    hasher.update(dest.as_bytes());
+    hasher.update(from.as_bytes());
+    hasher.update(to.as_bytes());
+    let mut bytes = [0u8; 20];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..20]);
+    NodeAddress::from_bytes(bytes)
+}
+
+/// How long `frame` has left at `now_unix`: from its send time, at most `MAX_DURABLE_TTL_SECS`.
+/// Zero for a frame dated in the future beyond the allowed skew.
+fn durable_lifetime(frame: &DurableDataFrame, now_unix: u64) -> Duration {
+    if frame.sent_at_unix_secs > now_unix.saturating_add(DURABLE_CLOCK_SKEW_SECS) {
+        return Duration::ZERO;
+    }
+    let ttl = u64::from(frame.ttl_secs).min(MAX_DURABLE_TTL_SECS);
+    let expires = frame.sent_at_unix_secs.saturating_add(ttl);
+    Duration::from_secs(expires.saturating_sub(now_unix))
+}
 
 /// After coordinating a hole-punch, how long to let the relay's `PunchSync` reach both
 /// sides + both probes open the pinholes before the direct dial. P2 auto-upgrade.
@@ -170,6 +262,29 @@ const PUNCH_PROBE_GRACE: Duration = Duration::from_millis(200);
 enum PunchRole {
     Dialer,
     Listener,
+}
+
+/// Hole-punch attempts a `PunchSync` may have under way at once: each is a connection to an endpoint
+/// another node named.
+const PUNCH_ATTEMPTS_AT_ONCE: usize = 8;
+
+/// One hole-punch attempt under way, counted in `Network::punch_attempts` until dropped.
+struct PunchAttempt(Arc<std::sync::atomic::AtomicUsize>);
+
+impl PunchAttempt {
+    fn start(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        count
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |now| (now < PUNCH_ATTEMPTS_AT_ONCE).then_some(now + 1))
+            .ok()
+            .map(|_| PunchAttempt(Arc::clone(count)))
+    }
+}
+
+impl Drop for PunchAttempt {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Elect the single hole-punch dialer deterministically: the **lower `NodeAddress` dials**, the
@@ -248,12 +363,15 @@ const PEER_PING_HOP_LIMIT: u8 = 6;
 const PEER_PING_REMEMBERED: usize = 5;
 
 /// Bounded durable-frame store with TTL expiry + global/per-source caps. Keyed by
-/// `(feed, seq)`. `now` is injected (not read from the clock) so TTL is unit-
-/// testable. Holds others' frames for store-and-forward + our own for delivery +
+/// `(feed, seq)`. `now` and `now_unix` are injected (not read from the clock) so TTL is unit-
+/// testable. Frames reach it verified (signed by `from`, feed owned by `from`), so the per-source
+/// quota counts real senders. Holds others' frames for store-and-forward + our own for delivery +
 /// dedup; bounds memory against flooding. См. mesh-durable-delivery.md §DoS.
 #[derive(Default)]
 struct DurableStore {
-    frames: HashMap<(FeedId, u64), (DurableDataFrame, Instant)>,
+    /// Each frame, when it expires, and whether this node needs it itself (our own, addressed to us,
+    /// or of a group we are in) — the rest we only carry for others.
+    frames: HashMap<(FeedId, u64), (DurableDataFrame, Instant, bool)>,
 }
 
 impl DurableStore {
@@ -278,6 +396,7 @@ impl DurableStore {
         &mut self,
         frame: DurableDataFrame,
         now: Instant,
+        now_unix: u64,
         total_cap: usize,
         per_source_cap: usize,
         needed: bool,
@@ -288,21 +407,48 @@ impl DurableStore {
             return false; // dedup — already held
         }
         let expires_at = now
-            .checked_add(Duration::from_secs(frame.ttl_secs as u64))
+            .checked_add(durable_lifetime(&frame, now_unix))
             .unwrap_or(now);
         if expires_at <= now {
             return false; // ttl 0 / expired on arrival — don't hold
         }
         let from = frame.from;
-        if self.frames.len() >= total_cap && !(needed && self.evict_oldest_from(from)) {
+        // A frame we need makes room in a full budget from its source's own first, else from what we
+        // only carry: the frames of the source that holds the most of those. Only from its own source,
+        // keys anyone can make filled the budget — sixteen of them, 512 frames each — and a contact's
+        // frame to us found no room at all (blind audit 2026-11-11, I1).
+        if self.frames.len() >= total_cap
+            && !(needed && (self.evict_oldest_from(from) || self.evict_oldest_carried_of_the_largest_source()))
+        {
             return false; // global budget full
         }
-        let from_count = self.frames.values().filter(|(f, _)| f.from == from).count();
+        let from_count = self.frames.values().filter(|(f, _, _)| f.from == from).count();
         if from_count >= per_source_cap && !(needed && self.evict_oldest_from(from)) {
             return false; // this source's quota is full
         }
-        self.frames.insert(key, (frame, expires_at));
+        self.frames.insert(key, (frame, expires_at, needed));
         true
+    }
+
+    /// Drop the oldest frame we only carry of the source that holds the most of those. False when we
+    /// carry nothing for anyone.
+    fn evict_oldest_carried_of_the_largest_source(&mut self) -> bool {
+        let mut carried: HashMap<NodeAddress, usize> = HashMap::new();
+        for (frame, _, needed) in self.frames.values() {
+            if !needed {
+                *carried.entry(frame.from).or_default() += 1;
+            }
+        }
+        let Some((largest, _)) = carried.into_iter().max_by_key(|(_, count)| *count) else {
+            return false;
+        };
+        let oldest = self
+            .frames
+            .iter()
+            .filter(|(_, (f, _, needed))| !needed && f.from == largest)
+            .min_by_key(|(_, (_, expires_at, _))| *expires_at)
+            .map(|(key, _)| *key);
+        oldest.is_some_and(|key| self.frames.remove(&key).is_some())
     }
 
     /// Drop the frame of `from` that expires first — with one TTL for all, the oldest. False when
@@ -311,15 +457,25 @@ impl DurableStore {
         let oldest = self
             .frames
             .iter()
-            .filter(|(_, (f, _))| f.from == from)
-            .min_by_key(|(_, (_, expires_at))| *expires_at)
+            .filter(|(_, (f, _, _))| f.from == from)
+            .min_by_key(|(_, (_, expires_at, _))| *expires_at)
             .map(|(key, _)| *key);
         oldest.is_some_and(|key| self.frames.remove(&key).is_some())
     }
 
+    /// Drop the 1:1 frames for `destination` that its own high-water covers: it has them, and has
+    /// handled them (its mark stops below the first one it has not), so holding them on is only
+    /// waste — the ADR's delivery-by-high-water GC. Only frames addressed to that very node: its
+    /// mark says nothing for anyone else, and a group frame is for every member. A node that lies
+    /// about its marks loses only its own mail. Our reconcile marks stay, so another holder's
+    /// copy is not fetched back.
+    fn drop_delivered_to(&mut self, destination: &NodeAddress, marks: &ReconcileState) {
+        self.frames.retain(|(feed, seq), (frame, _, _)| frame.to != *destination || *seq > marks.high_water(feed));
+    }
+
     /// Drop entries whose TTL has elapsed at `now`.
     fn gc(&mut self, now: Instant) {
-        self.frames.retain(|_, (_, expires_at)| *expires_at > now);
+        self.frames.retain(|_, (_, expires_at, _)| *expires_at > now);
     }
 
     #[cfg(test)]
@@ -328,11 +484,11 @@ impl DurableStore {
     }
 
     fn get(&self, key: &(FeedId, u64)) -> Option<&DurableDataFrame> {
-        self.frames.get(key).map(|(f, _)| f)
+        self.frames.get(key).map(|(f, _, _)| f)
     }
 
     fn frames(&self) -> impl Iterator<Item = &DurableDataFrame> {
-        self.frames.values().map(|(f, _)| f)
+        self.frames.values().map(|(f, _, _)| f)
     }
 
     #[cfg(test)]
@@ -360,6 +516,10 @@ struct PeerRecord {
     /// The announce came straight from the peer (hop 0), not forwarded by a relay, so its advertised
     /// LAN addresses are the peer's own (`lan_door`).
     heard_direct: bool,
+    /// Signed timestamp (unix ms) of the announce this record came from; 0 for an endpoint injected
+    /// out-of-band. An older announce does not overwrite a newer one (V-07: a replayed announce put
+    /// back addresses the peer had left).
+    announce_timestamp: i64,
 }
 
 /// Role of an in-flight challenge we are awaiting a response to, keyed by
@@ -426,6 +586,8 @@ pub struct Network {
     relay_enabled: bool,
     /// Address book: verified-announce identities → where to dial them.
     peer_book: Arc<SyncMutex<HashMap<NodeAddress, PeerRecord>>>,
+    /// Hole-punch attempts a `PunchSync` started that are still under way ([`PUNCH_ATTEMPTS_AT_ONCE`]).
+    punch_attempts: Arc<std::sync::atomic::AtomicUsize>,
     /// Inbound reliable-Data queues for active Links, keyed by the **end-peer
     /// identity** (`data.from` for inbound, `destination` for outbound) — NOT
     /// the arrival neighbor. Multi-hop: a frame from origin A relayed by
@@ -493,6 +655,10 @@ pub struct Network {
     /// PathRequest once (the flood loop/dup guard). Separate window from `seen_frames` so a
     /// request nonce can't collide with a Data msg_id from the same origin (R3).
     seen_path_requests: Arc<SyncMutex<SeenFrames>>,
+    /// PathRequests we sent or relayed, `(origin, nonce) → (target, when)`: a PathReply is taken
+    /// only for one of them (V-07; before, any verified neighbour could push routes with unasked
+    /// replies). Bounded by `MAX_PENDING_PATH_REQUESTS`, entries live `PATH_REPLY_WINDOW`.
+    pending_path_requests: Arc<SyncMutex<HashMap<(NodeAddress, u64), (NodeAddress, Instant)>>>,
     /// Monotone source of PathRequest nonces, seeded from the wall clock so post-restart nonces
     /// don't collide with a still-cached pre-restart `(origin, nonce)` on some node (R3).
     path_request_seq: std::sync::atomic::AtomicU64,
@@ -538,11 +704,21 @@ pub struct Network {
     durable_store: Arc<SyncMutex<DurableStore>>,
     /// Which `(feed, seq)` we hold — drives anti-entropy high-water/offers.
     durable_reconcile: Arc<SyncMutex<ReconcileEngine>>,
-    /// Frames addressed to us that the app has finished handling (`note_durable_handled`). Only
-    /// these are exported along with the frames held for others: re-imported, they restore our
+    /// Frames the app has finished handling (`note_durable_handled`). For a frame addressed to us:
+    /// only these are exported along with the frames held for others; re-imported, they restore our
     /// high-water so holders stop re-offering what we already have, while a frame that reached the
-    /// network but not the app stays unmarked and is offered again after a restart.
+    /// network but not the app stays unmarked and is offered again after a restart. For a frame of
+    /// a group we are in: the mark persists beside the frame (`restore_durable_handled`), so a
+    /// restart hands the app only what it has not seen.
     durable_handled: SyncMutex<HashSet<(FeedId, u64)>>,
+    /// Frames of a group the app could not take yet and was no longer offered
+    /// (`note_durable_given_up`): handed to it again once another frame of the same group is handled
+    /// (`redeliver_given_up_to`) — its epoch may have come. Given up for the run, a group message that
+    /// waited for missing commits was not handed over again when they came (blind audit 2026-11-13,
+    /// pass 22). Bounded as the store is.
+    durable_given_up: SyncMutex<HashSet<(FeedId, u64)>>,
+    // Already stored but not yet handed to the app because all inbox slots were in use.
+    durable_waiting: SyncMutex<std::collections::BTreeSet<(FeedId, u64)>>,
     /// Group subscriptions (G3): synthetic group destination → the member node
     /// addresses to gossip-push to. A durable frame addressed to a subscribed
     /// destination is delivered to OUR inbox (subscription-based delivery — no
@@ -550,14 +726,30 @@ pub struct Network {
     /// group message reaches online members sub-second while anti-entropy stays
     /// the catch-all. См. docs/decisions/group-envelope-and-transport.md §2.
     group_subscriptions: Arc<SyncMutex<HashMap<NodeAddress, Vec<NodeAddress>>>>,
+    /// The nodes the app trusts to carry its 1:1 frames — its own devices and its contacts' — once it
+    /// has named them (`None` until then: every neighbour, as before). A 1:1 frame is offered only to
+    /// its addressee, to a node that forwards our traffic, or to one of these: offered to every
+    /// verified neighbour, it told any of them who writes to whom and when (maintainers' decision
+    /// 2026-11-11, blind audit E7).
+    durable_carriers: Arc<SyncMutex<Option<HashSet<NodeAddress>>>>,
     /// Each peer's last-advertised anti-entropy INTERESTS (the group destinations + own address it
     /// wants frames for). Populated from inbound HAVE frames; used to scope what we offer/advertise
     /// so we stop broadcasting our full feed inventory to route-candidates that aren't co-members and
     /// aren't forwarding for us. See docs/decisions/anti-entropy-have-scoping.md.
     peer_interests: Arc<SyncMutex<HashMap<NodeAddress, Vec<NodeAddress>>>>,
-    /// Durable frames addressed to US, delivered for the app to drain (`recv_durable`).
-    durable_inbox_tx: mpsc::Sender<DurableDataFrame>,
-    durable_inbox_rx: AsyncMutex<mpsc::Receiver<DurableDataFrame>>,
+    /// Durable frames addressed to US, delivered for the app to drain (`recv_durable`). Unbounded: a
+    /// frame goes in only after the reconcile engine counts it as held, so one dropped here was never
+    /// asked for again — a start that replays a group's stored frames (old ones first) used to fill a
+    /// 256-slot queue and lose the new ones that came while the node was off
+    /// (docs/bugs/group-frames-lost-past-the-inbox.md). What it holds is bounded by the durable store.
+    durable_inbox_tx: mpsc::UnboundedSender<DurableDataFrame>,
+    /// Frames handed to the inbox and not settled by the app yet: in the inbox, in the queue to the
+    /// app's wire thread, or waiting to be offered again ([`DurableInFlight`]). Past
+    /// [`DURABLE_IN_FLIGHT_MAX`] a new frame for the app is not taken in at all — its holder offers
+    /// it again — or a peer outpacing the app grew the inbox, and the frames waiting for another
+    /// offer, without end (blind audit 2026-11-11, L1).
+    durable_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    durable_inbox_rx: AsyncMutex<mpsc::UnboundedReceiver<DurableDataFrame>>,
     /// Peers that became fully unreachable (their last path was pruned), for the
     /// app to drain (`try_recv_peer_down`) and tear down stale session state — so a
     /// message to a just-offline peer falls through to durable instead of a dead link.
@@ -614,6 +806,11 @@ pub struct Network {
     /// links already up and refuses a contact who dials us directly (it knows an old address of ours).
     /// Without it «Только через релей» / a pinned relay left a direct link standing (stand 2026-10-14).
     direct_only_with: SyncMutex<Option<std::collections::HashSet<NodeAddress>>>,
+    /// Identities we hold no direct connection with whatever else allows it: blocked contacts (the
+    /// app's choice, `refuse_direct_with`). Their direct link is closed and their dial refused, so
+    /// they neither relay for us nor we for them; traffic with them that must flow (a group both are
+    /// in) goes through other nodes.
+    refused_direct: SyncMutex<std::collections::HashSet<NodeAddress>>,
     /// The carrier of our own hops ([`CarrierPreference`]), as `CarrierPreference as u8`. Set at
     /// mesh-start from the profile's carrier policy.
     carrier_preference: std::sync::atomic::AtomicU8,
@@ -754,6 +951,12 @@ fn net_trace(msg: &str) {
             &format!("{ms}\t[net-trace] {msg}\n"),
         );
     }
+}
+
+/// Whether a datagram addressed to us may name `from` as its source when it came from the verified
+/// neighbour `arrival`: the neighbour itself, or a node it carries for us (`carries`, asked only then).
+fn media_source_admissible(from: NodeAddress, arrival: NodeAddress, carries: impl FnOnce() -> bool) -> bool {
+    from == arrival || carries()
 }
 
 /// Decide whether to admit an on-demand multi-hop origin — a peer we never dialed
@@ -897,7 +1100,7 @@ impl Network {
     pub fn new(identity: SigningKey, interfaces: Vec<InterfaceHandle>) -> Self {
         let local_address = NodeAddress::from_pubkey(&identity.verifying_key());
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
-        let (durable_inbox_tx, durable_inbox_rx) = mpsc::channel(256);
+        let (durable_inbox_tx, durable_inbox_rx) = mpsc::unbounded_channel();
         let (peer_down_tx, peer_down_rx) = mpsc::channel(64);
         let (dht_proxy_request_tx, dht_proxy_request_rx) = mpsc::channel(64);
         let (dht_boot_request_tx, dht_boot_request_rx) = mpsc::channel(64);
@@ -910,6 +1113,7 @@ impl Network {
             path_table: Arc::new(PathTable::new()),
             relay_enabled: true,
             peer_book: Arc::new(SyncMutex::new(HashMap::new())),
+            punch_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             link_inboxes: Arc::new(SyncMutex::new(HashMap::new())),
             link_datagram_inboxes: Arc::new(SyncMutex::new(HashMap::new())),
             verified_neighbors: Arc::new(SyncMutex::new(HashMap::new())),
@@ -924,6 +1128,7 @@ impl Network {
             multihop_origins: Arc::new(SyncMutex::new(HashMap::new())),
             seen_frames: Arc::new(SyncMutex::new(SeenFrames::new(SEEN_FRAMES_CAP))),
             seen_path_requests: Arc::new(SyncMutex::new(SeenFrames::new(SEEN_FRAMES_CAP))),
+            pending_path_requests: Arc::new(SyncMutex::new(HashMap::new())),
             path_request_seq: std::sync::atomic::AtomicU64::new(current_unix_ms() as u64),
             path_control_quota: Arc::new(SyncMutex::new(HashMap::new())),
             reflexive_observations: Arc::new(SyncMutex::new(HashMap::new())),
@@ -936,9 +1141,13 @@ impl Network {
             durable_store: Arc::new(SyncMutex::new(DurableStore::new())),
             durable_reconcile: Arc::new(SyncMutex::new(ReconcileEngine::new())),
             durable_handled: SyncMutex::new(HashSet::new()),
+            durable_given_up: SyncMutex::new(HashSet::new()),
+            durable_waiting: SyncMutex::new(std::collections::BTreeSet::new()),
             group_subscriptions: Arc::new(SyncMutex::new(HashMap::new())),
+            durable_carriers: Arc::new(SyncMutex::new(None)),
             peer_interests: Arc::new(SyncMutex::new(HashMap::new())),
             durable_inbox_tx,
+            durable_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             durable_inbox_rx: AsyncMutex::new(durable_inbox_rx),
             peer_down_tx,
             peer_down_rx: AsyncMutex::new(peer_down_rx),
@@ -954,6 +1163,7 @@ impl Network {
             relay_upgrade_rx: AsyncMutex::new(relay_upgrade_rx),
             allow_direct_punch: std::sync::atomic::AtomicBool::new(true),
             direct_only_with: SyncMutex::new(None),
+            refused_direct: SyncMutex::new(std::collections::HashSet::new()),
             carrier_preference: std::sync::atomic::AtomicU8::new(CarrierPreference::Auto as u8),
             capabilities: std::sync::atomic::AtomicU8::new(0),
             door_port: std::sync::atomic::AtomicU16::new(0),
@@ -1570,7 +1780,11 @@ impl Network {
             })
             .collect();
         let mut last_error: Option<NetworkError> = None;
-        while let Some((iface, neighbor)) = race_connect(&mut candidates).await {
+        // Why each endpoint gave no connection — `NoAnswer` when nothing else fails. Without it a dial
+        // whose every handshake timed out came out as `NoPathToDestination`, «no address known»,
+        // while the addresses were known and tried.
+        let mut unanswered: Vec<String> = Vec::new();
+        while let Some((iface, neighbor)) = race_connect(&mut candidates, &mut unanswered).await {
             // The inboxes + link entries were created at the verification point
             // (handle_challenge_response) so any Data that raced ahead is already buffered.
             match self
@@ -1612,7 +1826,13 @@ impl Network {
             return Ok(link);
         }
 
-        Err(last_error.unwrap_or(NetworkError::NoPathToDestination(destination)))
+        Err(last_error.unwrap_or_else(|| {
+            if unanswered.is_empty() {
+                NetworkError::NoPathToDestination(destination)
+            } else {
+                NetworkError::NoAnswer { destination, attempts: unanswered.join("; ") }
+            }
+        }))
     }
 
     /// Dial `destination` at caller-supplied `endpoints` learned out-of-band (e.g. via
@@ -1635,6 +1855,7 @@ impl Network {
                 capabilities: 0,
                 door_port: 0,
                 heard_direct: false,
+                announce_timestamp: 0,
             });
             merge_rendezvous_endpoints(&mut record.advertised_addresses, endpoints);
         }
@@ -1714,10 +1935,9 @@ impl Network {
             .find(|i| i.kind() == carrier)
             .cloned()
             .ok_or(NetworkError::NoPathToDestination(destination))?;
-        let neighbor = iface
-            .connect_endpoint(endpoint)
-            .await
-            .map_err(|_| NetworkError::NoPathToDestination(destination))?;
+        let neighbor = iface.connect_endpoint(endpoint).await.map_err(|error| {
+            NetworkError::NoAnswer { destination, attempts: format!("{endpoint} {error}") }
+        })?;
         self.challenge_and_register_direct(&iface, neighbor, destination)
             .await
     }
@@ -1805,19 +2025,25 @@ impl Network {
         previous
     }
 
-    /// Our reflexive address from public STUN, asked from the socket of the native-UDP QUIC carrier —
-    /// the socket peers dial. `None` if no interface can ask or fewer than two servers agree.
-    pub async fn stun_reflexive(
+    /// What public STUN says about us, asked from the socket of the native-UDP QUIC carrier — the
+    /// socket peers dial. The first interface whose servers agree wins; without a consensus, the
+    /// first probe that was asked at all (so a lone answer or the silence is still reported). `None`
+    /// only when no interface can ask.
+    pub async fn stun_probe(
         &self,
         servers: &[&str],
         timeout: Duration,
-    ) -> Option<omni_net_primitives::stun::Reflexive> {
+    ) -> Option<omni_net_primitives::stun::StunProbe> {
+        let mut first = None;
         for iface in &self.interfaces {
-            if let Some(reflexive) = iface.stun_reflexive(servers, timeout).await {
-                return Some(reflexive);
+            if let Some(probe) = iface.stun_probe(servers, timeout).await {
+                if probe.consensus().is_some() {
+                    return Some(probe);
+                }
+                first.get_or_insert(probe);
             }
         }
-        None
+        first
     }
 
     pub async fn route_peer_over_door(&self, peer: &NodeAddress, door: SocketAddr) -> io::Result<bool> {
@@ -1872,6 +2098,47 @@ impl Network {
             return Err(NetworkError::NoPathToDestination(peer));
         }
         self.dial_at_endpoints(peer, vec![door]).await
+    }
+
+    /// The dialing side of the TCP hole punch, once its connect got through: `stream` is a TCP
+    /// connection from our door's `door_port` to `peer`'s punch address `punch`. Carry it as a door
+    /// tunnel (the peer's end is its ordinary door, which bridges it into its quinn) and dial `peer`
+    /// AT `punch` over it. Success is only the verified link — a connection that carries no data ends
+    /// in a handshake timeout, like any dead path. See docs/decisions/tcp-hole-punch.md.
+    pub async fn dial_over_punched(
+        &self,
+        peer: NodeAddress,
+        punch: SocketAddr,
+        stream: tokio::net::TcpStream,
+        door_port: u16,
+    ) -> Result<Link, NetworkError> {
+        if self.carrier_preference() == CarrierPreference::Quic {
+            return Err(NetworkError::NoPathToDestination(peer));
+        }
+        let mut stream = Some(stream);
+        let mut routed = false;
+        for iface in &self.interfaces {
+            if iface.kind() != InterfaceKind::QuicOverUdp {
+                continue;
+            }
+            if let Some(stream) = stream.take() {
+                routed = iface.route_peer_over_punched(punch, stream, door_port).is_ok();
+            }
+            break;
+        }
+        if !routed {
+            return Err(NetworkError::NoPathToDestination(peer));
+        }
+        self.install_peer_door_key(peer, punch);
+        self.dial_at_endpoints(peer, vec![punch]).await
+    }
+
+    /// Drop the tunnel a punch dial put under `punch` (it connected but no link came up over it), so
+    /// its redials from the door's port do not hold the four-tuple the next punch attempt needs.
+    pub fn forget_punched_route(&self, punch: SocketAddr) {
+        for iface in &self.interfaces {
+            iface.route_peer_over_udp(punch);
+        }
     }
 
     /// Route the address `door` through the TLS-over-TCP tunnel to that door, so a dial AT it rides
@@ -2152,13 +2419,16 @@ impl Network {
         self.seen_path_requests
             .lock()
             .note((self.local_address, nonce));
-        let wire = NetworkFrame::PathRequest(PathRequestFrame {
+        self.note_pending_path_request(self.local_address, nonce, target);
+        let mut request = PathRequestFrame {
             origin: self.local_address,
             target,
             nonce,
             hop_limit: PATH_REQUEST_DEFAULT_HOP_LIMIT,
-        })
-        .encode_to_wire();
+            signature: Vec::new(),
+        };
+        request.sign(&self.identity);
+        let wire = NetworkFrame::PathRequest(request).encode_to_wire();
         self.broadcast_to_verified_neighbours(&wire, None).await;
         let started = Instant::now();
         net_trace(&format!("PATH_REQ target={target:?} nonce={nonce} neighbours={}", self.verified_neighbors.lock().len()));
@@ -2172,6 +2442,28 @@ impl Network {
             tokio::time::sleep(PATH_REQUEST_POLL).await;
         }
         net_trace(&format!("PATH_REQ target={target:?} TIMEOUT"));
+    }
+
+    /// Remember a PathRequest we sent or relayed, so its replies are taken (`path_reply_expected`).
+    fn note_pending_path_request(&self, origin: NodeAddress, nonce: u64, target: NodeAddress) {
+        let now = Instant::now();
+        let mut pending = self.pending_path_requests.lock();
+        pending.retain(|_, (_, at)| now.duration_since(*at) < PATH_REPLY_WINDOW);
+        if pending.len() >= MAX_PENDING_PATH_REQUESTS {
+            let oldest = pending.iter().min_by_key(|(_, (_, at))| *at).map(|(key, _)| *key);
+            if let Some(key) = oldest {
+                pending.remove(&key);
+            }
+        }
+        pending.insert((origin, nonce), (target, now));
+    }
+
+    /// Whether `rep` answers a PathRequest we sent or relayed, for the same target, recently.
+    fn path_reply_expected(&self, rep: &PathReplyFrame) -> bool {
+        self.pending_path_requests
+            .lock()
+            .get(&(rep.origin, rep.nonce))
+            .is_some_and(|(target, at)| *target == rep.target && at.elapsed() < PATH_REPLY_WINDOW)
     }
 
     /// Anti-eclipse/DoS admission for a path-control frame from `neighbor`: false (drop) once the
@@ -2203,6 +2495,11 @@ impl Network {
         }
         if !self.path_control_admit(neighbor) {
             return; // neighbour over its path-control rate budget — drop
+        }
+        // Only a request its origin signed leaves a route to the origin (V-07). Checked before the
+        // dedup, so a forged copy cannot use up the real request's (origin, nonce).
+        if !req.verify() {
+            return;
         }
         if !self.seen_path_requests.lock().note((req.origin, req.nonce)) {
             return; // already processed this request — drop (loop/dup)
@@ -2244,11 +2541,10 @@ impl Network {
         }
         // No answer — re-broadcast onward (TTL-bounded), never back to the arrival neighbour.
         if req.hop_limit > 0 {
+            self.note_pending_path_request(req.origin, req.nonce, req.target);
             let fwd = NetworkFrame::PathRequest(PathRequestFrame {
-                origin: req.origin,
-                target: req.target,
-                nonce: req.nonce,
                 hop_limit: req.hop_limit - 1,
+                ..req
             })
             .encode_to_wire();
             self.broadcast_to_verified_neighbours(&fwd, Some(neighbor)).await;
@@ -2270,6 +2566,10 @@ impl Network {
         if !self.path_control_admit(neighbor) {
             net_trace(&format!("PATH_REPLY target={:?} DROP over budget", rep.target));
             return; // neighbour over its path-control rate budget — drop (anti-eclipse/DoS)
+        }
+        if !self.path_reply_expected(&rep) {
+            net_trace(&format!("PATH_REPLY target={:?} DROP unasked", rep.target));
+            return;
         }
         net_trace(&format!("PATH_REPLY target={:?} origin={:?} cost={}", rep.target, rep.origin, rep.cost));
         // `rep.cost` is the replier's own cost to the target (0 when the replier IS the target).
@@ -2462,6 +2762,11 @@ impl Network {
         if !self.path_control_admit(neighbor) {
             return;
         }
+        // The app lets our own devices and approved contacts use our DHT, by `from`: a request
+        // whose `from` did not sign it is neither served nor carried on (V-20).
+        if !req.verify() {
+            return;
+        }
         if req.to == self.local_address {
             // Deliver to the app to serve via its local omni-dht-helper (the opt-in gate + the helper
             // IPC live in omni-app, which holds the endpoint); it answers with `send_dht_proxy_response`.
@@ -2592,10 +2897,9 @@ impl Network {
             .find(|iface| iface.kind() == InterfaceKind::QuicOverUdp)
             .cloned()
             .ok_or(NetworkError::NoPathToDestination(NodeAddress::ANY))?;
-        let neighbor = iface
-            .connect_endpoint(&endpoint.to_string())
-            .await
-            .map_err(|_| NetworkError::NoPathToDestination(NodeAddress::ANY))?;
+        let neighbor = iface.connect_endpoint(&endpoint.to_string()).await.map_err(|error| {
+            NetworkError::NoAnswer { destination: NodeAddress::ANY, attempts: format!("{endpoint} {error}") }
+        })?;
         let channels = match self.run_dialer_challenge(&iface, &neighbor, NodeAddress::ANY).await {
             Ok(channels) => channels,
             Err(error) => {
@@ -2828,19 +3132,30 @@ impl Network {
                 // Durable delivery (P4): store + deliver-if-ours / hold for S&F.
                 // A subscribed group frame is additionally gossip-pushed once to
                 // linked co-members (G3) — dedup at each hop bounds the flood.
+                // Only from a verified neighbour, only signed by its origin (V-05): see
+                // `admit_inbound_durable`.
                 NetworkFrame::DurableData(durable) => {
-                    let push_targets = self.handle_durable_data(durable.clone());
-                    self.push_durable_to(&durable, &push_targets).await;
+                    if self.admit_inbound_durable(&durable, &neighbor) {
+                        let push_targets = self.handle_durable_data(durable.clone());
+                        self.push_durable_to(&durable, &push_targets).await;
+                    }
                 }
-                // Anti-entropy reconciliation (P4-3b): have → offer → request → send.
+                // Anti-entropy reconciliation (P4-3b): have → offer → request → send. Verified
+                // neighbours only — an unverified connection learns nothing of what we hold.
                 NetworkFrame::AntiEntropyHave(have) => {
-                    self.handle_anti_entropy_have(have, &neighbor, &iface).await;
+                    if self.verified_neighbors.lock().contains_key(&neighbor) {
+                        self.handle_anti_entropy_have(have, &neighbor, &iface).await;
+                    }
                 }
                 NetworkFrame::AntiEntropyOffer(offer) => {
-                    self.handle_anti_entropy_offer(offer, &neighbor, &iface).await;
+                    if self.verified_neighbors.lock().contains_key(&neighbor) {
+                        self.handle_anti_entropy_offer(offer, &neighbor, &iface).await;
+                    }
                 }
                 NetworkFrame::AntiEntropyRequest(request) => {
-                    self.handle_anti_entropy_request(request, &neighbor, &iface).await;
+                    if self.verified_neighbors.lock().contains_key(&neighbor) {
+                        self.handle_anti_entropy_request(request, &neighbor, &iface).await;
+                    }
                 }
                 // Hole-punch coordination (P2). Both handlers are fast (only
                 // send_frame) — no dial here, so no dispatcher hang; the direct
@@ -2850,7 +3165,7 @@ impl Network {
                     self.handle_punch_request(req, &neighbor, &iface).await;
                 }
                 NetworkFrame::PunchSync(sync) => {
-                    self.handle_punch_sync(sync, &iface).await;
+                    self.handle_punch_sync(sync, &neighbor, &iface).await;
                 }
                 // Liveness probe from a verified neighbour → answer so it keeps us
                 // marked alive. Don't answer unverified neighbours (no free echo).
@@ -2919,6 +3234,23 @@ impl Network {
     /// Link's datagram inbox. Datagrams are loss-tolerant — anything from an
     /// unverified neighbor (or with no Link inbox yet) is simply dropped, no
     /// buffering. Runs only on `supports_datagrams()` interfaces.
+    /// Whether `neighbor` is how `origin` reaches us: a path to it through that neighbour (a relay's
+    /// leg of the peer's path set, the routing table's next hop, an admitted multi-hop origin).
+    fn neighbor_carries(&self, origin: &NodeAddress, neighbor: &NeighborId) -> bool {
+        let in_path_set = self
+            .peer_paths
+            .lock()
+            .get(origin)
+            .cloned()
+            .is_some_and(|set| set.lock().paths.iter().any(|path| &path.neighbor == neighbor));
+        in_path_set
+            || self
+                .path_table
+                .lookup(origin, Instant::now())
+                .is_some_and(|entry| &entry.next_hop_neighbor == neighbor)
+            || self.multihop_origins.lock().get(origin) == Some(neighbor)
+    }
+
     async fn datagram_dispatcher_loop(self: Arc<Self>, iface: InterfaceHandle) {
         loop {
             let (neighbor, bytes) = match iface.recv_datagram().await {
@@ -2927,15 +3259,21 @@ impl Network {
                 Err(_) => break,
             };
             // Per-hop auth: only a verified neighbour may inject media (anti-spoof / anti-open-relay).
-            if !self.verified_neighbors.lock().contains_key(&neighbor) {
+            let Some(arrival) = self.verified_neighbors.lock().get(&neighbor).copied() else {
                 continue;
-            }
+            };
             // Parse the routing envelope; an unparseable / wrong-version datagram is dropped (media
             // is loss-tolerant — there is no raw fallback once framing is uniform).
             let Some(datagram) = MediaDatagram::decode(&bytes) else {
                 continue;
             };
             if datagram.to == self.local_address {
+                // Its `from` is the neighbour itself, or someone this neighbour carries for us — our
+                // path to `from` goes through it (V-02, second part). The payload is sealed end to end
+                // above us anyway; this keeps a verified neighbour from posing as another source.
+                if !media_source_admissible(datagram.from, arrival, || self.neighbor_carries(&datagram.from, &neighbor)) {
+                    continue;
+                }
                 // Destined for us → deliver the payload to the Link of its logical SOURCE (`from`),
                 // so a RELAYED datagram (arrival neighbour = relay, not the source) still reaches the
                 // right Link's inbox (keyed by identity, like the reliable plane).
@@ -3219,7 +3557,7 @@ impl Network {
         self.dht_proxy_pending.lock().insert(req_id, tx);
 
         // Route the request toward the proxy via the path_table next hop.
-        let req = DhtProxyRequestFrame {
+        let mut req = DhtProxyRequestFrame {
             from: self.local_address,
             to: proxy,
             req_id,
@@ -3228,7 +3566,9 @@ impl Network {
             salt,
             value,
             hop_limit: PEER_PING_HOP_LIMIT,
+            signature: Vec::new(),
         };
+        req.sign(&self.identity);
         let now = Instant::now();
         let routed = match self.path_table.lookup(&proxy, now) {
             Some(entry) => match self.interfaces.iter().find(|i| i.id() == entry.next_hop_interface) {
@@ -3625,6 +3965,20 @@ impl Network {
         best.as_ref().is_some_and(path_rides_door)
     }
 
+    /// Whether the best path to `peer` rides a TCP door in either direction: a tunnel we dialed into
+    /// its door ([`peer_on_door`](Self::peer_on_door)), or its connection into OUR door, which our
+    /// quinn sees as a UDP peer at the bridge's socket. For telling the user the carrier: the door's
+    /// owner used to label such a link «QUIC» (stand 2026-11-09, the listening side of a TCP punch).
+    /// `peer_on_door` stays the narrower question — the UDP upgrade migrates only a tunnel we own.
+    pub fn peer_through_a_door(&self, peer: &NodeAddress) -> bool {
+        let best = self
+            .peer_paths
+            .lock()
+            .get(peer)
+            .and_then(|set| set.lock().best());
+        best.as_ref().is_some_and(|path| path_rides_door(path) || path_enters_our_door(path))
+    }
+
     /// Snapshot the DIRECT endpoints per peer — the source for the warm-rejoin cache (G3). Each
     /// Direct path contributes the socket it was reached on, which a restart re-dials straight away instead of
     /// re-running LAN/UPnP/rendezvous cold. Every Direct path, not just the first: a peer reached
@@ -3650,6 +4004,11 @@ impl Network {
     /// are delivered to OUR inbox (we are a member) and gossip-pushed once to
     /// `members` (the co-member node addresses) when they have live paths.
     /// Re-subscribing replaces the member push set (membership changed).
+    /// Name the nodes trusted to carry our 1:1 frames (see `durable_carriers`). The whole set, each time.
+    pub fn set_durable_carriers(&self, carriers: HashSet<NodeAddress>) {
+        *self.durable_carriers.lock() = Some(carriers);
+    }
+
     pub fn subscribe_group_destination(&self, dest: NodeAddress, members: Vec<NodeAddress>) {
         let newly = self.group_subscriptions.lock().insert(dest, members).is_none();
         if !newly {
@@ -3664,12 +4023,16 @@ impl Network {
             .lock()
             .frames
             .values()
-            .filter(|(frame, _)| frame.to == dest && frame.from != self.local_address)
-            .map(|(frame, _)| frame.clone())
+            .filter(|(frame, _, _)| {
+                frame.to == dest
+                    && frame.from != self.local_address
+                    && !self.durable_handled.lock().contains(&(frame.feed_id, frame.seq))
+            })
+            .map(|(frame, _, _)| frame.clone())
             .collect();
         held.sort_by(|a, b| a.feed_id.cmp(&b.feed_id).then(a.seq.cmp(&b.seq)));
         for frame in held {
-            let _ = self.durable_inbox_tx.try_send(frame);
+            self.hand_to_durable_inbox(frame);
         }
     }
 
@@ -3677,6 +4040,29 @@ impl Network {
     /// this destination degrade to ordinary store-and-forward holding.
     pub fn unsubscribe_group_destination(&self, dest: &NodeAddress) {
         self.group_subscriptions.lock().remove(dest);
+    }
+
+    /// Whether an inbound DurableData may enter the store (V-05). It must come over a verified
+    /// neighbour, carry a valid signature of the node it names as `from` (so nobody forges a frame
+    /// under another address, or alters one it carries), and sit in a feed that `from` owns (so a
+    /// stranger cannot take a `(feed, seq)` slot of someone else's feed and crowd the real frame
+    /// out — the store keys by it). Before, a frame from any connection was stored as it came: a
+    /// forged `from` drained other senders' quotas and a forged slot swallowed a real offline
+    /// message until its re-send.
+    fn admit_inbound_durable(&self, frame: &DurableDataFrame, neighbor: &NeighborId) -> bool {
+        if !self.verified_neighbors.lock().contains_key(neighbor) {
+            return false;
+        }
+        if !frame.verify() || !crate::durable::feed_is_bound_to(&frame.feed_id, &frame.from) {
+            net_trace(&format!(
+                "DURABLE_REJECT from={:?} feed_bound={} seq={}",
+                frame.from,
+                crate::durable::feed_is_bound_to(&frame.feed_id, &frame.from),
+                frame.seq
+            ));
+            return false;
+        }
+        true
     }
 
     /// Handle an inbound DurableData (P4): dedup by `(feed, seq)`; store it (so we
@@ -3689,6 +4075,21 @@ impl Network {
     /// never back toward the original sender — dedup at every hop bounds the
     /// flood to ~one copy per link.
     fn handle_durable_data(&self, frame: DurableDataFrame) -> Vec<NodeAddress> {
+        // Held once this run and let go since (a source's quota): it stays gone. Taken back, it would
+        // push out the next oldest, which a co-member at its own quota hands back in turn, for ever:
+        // two members and a source past its quota ran up 380 000 copies in the app's queue in minutes,
+        // over a gigabyte (docs/bugs/group-frames-lost-past-the-inbox.md).
+        if self.durable_reconcile.lock().contains(&frame.feed_id, frame.seq) {
+            return Vec::new();
+        }
+        // The app has not caught up with what it was handed: a frame for it is not taken in, its
+        // holder offers it again (L1). Taken in without being handed on, it would be ours by the
+        // marks and lost. Our own frame going out and a frame only carried do not go to the app.
+        let for_the_app = frame.to == self.local_address
+            || (frame.from != self.local_address && self.group_subscriptions.lock().contains_key(&frame.to));
+        if for_the_app && self.durable_in_flight.load(std::sync::atomic::Ordering::Relaxed) >= DURABLE_IN_FLIGHT_MAX {
+            return Vec::new();
+        }
         // Admit into the bounded store (dedup + TTL + global/per-source caps). If
         // it's a duplicate / expired / over a cap, stop — don't re-reconcile or
         // re-deliver.
@@ -3696,6 +4097,7 @@ impl Network {
         let newly_stored = self.durable_store.lock().insert(
             frame.clone(),
             Instant::now(),
+            unix_now_secs(),
             MAX_DURABLE_FRAMES,
             MAX_DURABLE_FRAMES_PER_SOURCE,
             needed,
@@ -3707,7 +4109,7 @@ impl Network {
             .lock()
             .insert(frame.feed_id, frame.seq);
         if frame.to == self.local_address {
-            let _ = self.durable_inbox_tx.try_send(frame);
+            self.hand_to_durable_inbox(frame);
             return Vec::new();
         }
         let members = self.group_subscriptions.lock().get(&frame.to).cloned();
@@ -3726,7 +4128,7 @@ impl Network {
             // Our own outbound frame is already applied locally — deliver only
             // co-members' frames to the inbox.
             if frame.from != self.local_address {
-                let _ = self.durable_inbox_tx.try_send(frame);
+                self.hand_to_durable_inbox(frame);
             }
             return push_targets;
         }
@@ -3735,12 +4137,62 @@ impl Network {
         // destination becomes reachable.
     }
 
+    /// Hand a frame to the app's inbox, counted until the app has settled it. Counted before it is
+    /// handed over: counted after, a frame the pump took and settled in between left the count one
+    /// too high for good, and enough of those closed the intake (blind audit 2026-11-11, M2).
+    fn hand_to_durable_inbox(&self, frame: DurableDataFrame) {
+        if !self.reserve_durable_slot() {
+            let store = self.durable_store.lock();
+            let mut waiting = self.durable_waiting.lock();
+            waiting.insert((frame.feed_id, frame.seq));
+            if waiting.len() > MAX_DURABLE_FRAMES {
+                waiting.retain(|key| store.frames.contains_key(key));
+            }
+            return;
+        }
+        if self.durable_inbox_tx.send(frame).is_err() {
+            self.durable_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn reserve_durable_slot(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.durable_in_flight.try_update(Relaxed, Relaxed, |n| (n < DURABLE_IN_FLIGHT_MAX).then_some(n + 1)).is_ok()
+    }
+
+    fn next_waiting_durable(&self) -> Option<DurableDataFrame> {
+        // Drop the queue lock before taking the store or subscription locks.
+        loop {
+            let key = self.durable_waiting.lock().pop_first()?;
+            let frame = self.durable_store.lock().get(&key).cloned();
+            if let Some(frame) = frame {
+                if (frame.to == self.local_address || self.group_subscriptions.lock().contains_key(&frame.to))
+                    && !self.durable_handled.lock().contains(&key)
+                {
+                    return Some(frame);
+                }
+            }
+        }
+    }
+
     /// A durable frame this node needs itself rather than only carries: ours, addressed to us, or
     /// for a group we are in. See `DurableStore::insert`.
     fn needs_durable_frame(&self, frame: &DurableDataFrame) -> bool {
-        frame.from == self.local_address
-            || frame.to == self.local_address
-            || self.group_subscriptions.lock().contains_key(&frame.to)
+        // Ours, or for us from a node we know — one of the app's carriers (our devices, our approved
+        // contacts), or a member of the group it is for. Addressed to us was enough before, and keys
+        // anyone can make filled the whole budget with frames "needed" so (blind audit 2026-11-11,
+        // J1). From a stranger it is only carried: its room is the first to go.
+        if frame.from == self.local_address {
+            return true;
+        }
+        let known_sender = self.durable_carriers.lock().as_ref().is_none_or(|carriers| carriers.contains(&frame.from));
+        if frame.to == self.local_address {
+            return known_sender;
+        }
+        match self.group_subscriptions.lock().get(&frame.to) {
+            Some(members) => known_sender || members.contains(&frame.from),
+            None => false,
+        }
     }
 
     /// Push an already-stored durable frame to specific peers over their best
@@ -3767,7 +4219,19 @@ impl Network {
     /// and anti-entropy delivers it when a path appears — send is best-effort.
     /// For a subscribed group destination there is no single owner to route to —
     /// the frame is gossip-pushed to every linked co-member instead.
-    pub async fn send_durable(&self, frame: DurableDataFrame) -> io::Result<()> {
+    ///
+    /// The frame must be ours (`from` = this node, in a feed of ours, see `FeedId`); it is signed
+    /// here, so holders can check it came from us unaltered.
+    pub async fn send_durable(&self, mut frame: DurableDataFrame) -> io::Result<()> {
+        if frame.from != self.local_address
+            || !crate::durable::feed_is_bound_to(&frame.feed_id, &frame.from)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable frame must be ours, in a feed of ours",
+            ));
+        }
+        frame.sign(&self.identity);
         let push_targets = self.handle_durable_data(frame.clone());
         if push_targets.is_empty() {
             let group_members = self.group_subscriptions.lock().get(&frame.to).cloned();
@@ -3798,16 +4262,125 @@ impl Network {
         }
     }
 
-    /// Drain the next durable frame addressed to us, if one has been delivered.
-    pub fn try_recv_durable(&self) -> Option<DurableDataFrame> {
+    /// Drain the next durable frame addressed to us, if one has been delivered. It counts as on its
+    /// way through the app until what comes with it is dropped.
+    pub fn try_recv_durable_in_flight(&self) -> Option<(DurableDataFrame, DurableInFlight)> {
         let mut rx = self.durable_inbox_rx.try_lock().ok()?;
-        rx.try_recv().ok()
+        if let Ok(frame) = rx.try_recv() {
+            return Some((frame, DurableInFlight(Arc::clone(&self.durable_in_flight))));
+        }
+        if self.durable_waiting.lock().is_empty() || !self.reserve_durable_slot() {
+            return None;
+        }
+        let slot = DurableInFlight(Arc::clone(&self.durable_in_flight));
+        self.next_waiting_durable().map(|frame| (frame, slot))
     }
 
-    /// The app has finished handling a durable frame addressed to us (the pump calls this after
-    /// `on_wire` returns). From now on the frame is exported, so our high-water survives a restart.
+    /// Drain the next durable frame addressed to us, settled as it is taken.
+    pub fn try_recv_durable(&self) -> Option<DurableDataFrame> {
+        self.try_recv_durable_in_flight().map(|(frame, _)| frame)
+    }
+
+    /// Whether the store still holds this frame (not gone by its TTL or a quota).
+    pub fn holds_durable_frame(&self, feed: &FeedId, seq: u64) -> bool {
+        self.durable_store.lock().get(&(*feed, seq)).is_some()
+    }
+
+    /// How many durable frames handed to the app it has not settled yet.
+    pub fn durable_in_flight(&self) -> usize {
+        self.durable_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The app has finished handling a durable frame addressed to us (the pump calls this when the
+    /// app answers `Handled`, omni-mesh-runtime). From now on the frame is exported, so our high-water
+    /// survives a restart.
     pub fn note_durable_handled(&self, feed: FeedId, seq: u64) {
-        self.durable_handled.lock().insert((feed, seq));
+        // Marks only frames still held, and no more than the store holds: a mark outlived its frame
+        // (gone by TTL or quota) and was swept only by an export that ran when the store changed — a
+        // peer sending short-lived frames grew the marks for good (blind audit 2026-11-11, L2).
+        let store = self.durable_store.lock();
+        if store.get(&(feed, seq)).is_none() {
+            return;
+        }
+        let mut handled = self.durable_handled.lock();
+        handled.insert((feed, seq));
+        if handled.len() > MAX_DURABLE_FRAMES {
+            handled.retain(|key| store.get(key).is_some());
+        }
+    }
+
+    /// The app could not take this frame yet and it is no longer offered in this run: kept to be
+    /// handed over again by [`Self::redeliver_given_up_to`].
+    pub fn note_durable_given_up(&self, feed: FeedId, seq: u64) {
+        let store = self.durable_store.lock();
+        let mut given_up = self.durable_given_up.lock();
+        given_up.insert((feed, seq));
+        if given_up.len() > MAX_DURABLE_FRAMES {
+            given_up.retain(|key| store.frames.contains_key(key));
+        }
+    }
+
+    /// A frame for `dest` was handled: the frames for it given up before go to the app again (those
+    /// still held and not handled, while the app has room). Returns how many.
+    pub fn redeliver_given_up_to(&self, dest: &NodeAddress) -> usize {
+        let frames: Vec<DurableDataFrame> = {
+            let store = self.durable_store.lock();
+            let mut given_up = self.durable_given_up.lock();
+            if given_up.is_empty() {
+                return 0;
+            }
+            let handled = self.durable_handled.lock();
+            given_up.retain(|key| store.frames.contains_key(key) && !handled.contains(key));
+            let mut frames: Vec<DurableDataFrame> = given_up
+                .iter()
+                .filter_map(|key| store.frames.get(key).map(|(frame, _, _)| frame.clone()))
+                .filter(|frame| frame.to == *dest)
+                .collect();
+            frames.sort_by(|a, b| a.feed_id.cmp(&b.feed_id).then(a.seq.cmp(&b.seq)));
+            let room = DURABLE_IN_FLIGHT_MAX.saturating_sub(self.durable_in_flight.load(std::sync::atomic::Ordering::Relaxed));
+            frames.truncate(room);
+            for frame in &frames {
+                given_up.remove(&(frame.feed_id, frame.seq));
+            }
+            frames
+        };
+        let count = frames.len();
+        for frame in frames {
+            self.hand_to_durable_inbox(frame);
+        }
+        count
+    }
+
+    /// Whether the app has finished handling this frame: the app persists it beside the frame.
+    pub fn durable_frame_handled(&self, feed: &FeedId, seq: u64) -> bool {
+        self.durable_handled.lock().contains(&(*feed, seq))
+    }
+
+    /// The marks persisted beside the frames, put back BEFORE `import_durable`: a group's stored
+    /// frames the app has handled stay held for the other members, and are not handed to it again.
+    /// Every start used to push them all through group decryption, which threw them away as too old
+    /// while the app waited (docs/bugs/group-frames-lost-past-the-inbox.md).
+    pub fn restore_durable_handled(&self, keys: impl IntoIterator<Item = (FeedId, u64)>) {
+        self.durable_handled.lock().extend(keys);
+    }
+
+    /// A fingerprint of what `export_durable` would give, marks included, without copying a frame:
+    /// the periodic persist looks at this and exports only when it changed.
+    pub fn durable_export_marks(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let me = self.local_address;
+        let store = self.durable_store.lock();
+        let handled = self.durable_handled.lock();
+        let mut keys: Vec<(FeedId, u64, bool)> = store
+            .frames()
+            .map(|f| (f.feed_id, f.seq, handled.contains(&(f.feed_id, f.seq)), f.to))
+            .filter(|(_, _, marked, to)| *to != me || *marked)
+            .map(|(feed, seq, marked, _)| (feed, seq, marked))
+            .collect();
+        keys.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        keys.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Snapshot, for the app to persist (omni-storage) so it survives a restart: the store-and-
@@ -3836,12 +4409,16 @@ impl Network {
     /// each through the bounded store (dedup + TTL + caps) and marks reconcile, so
     /// limits/dedup hold across restart and anti-entropy can offer them again.
     /// Store-only for frames held for others; a frame of a SUBSCRIBED group
-    /// destination (register subscriptions BEFORE importing) is re-delivered to
-    /// the inbox — our reconcile marks make peers never re-offer it, so this is
-    /// the only path that gets an arrived-but-undrained group message to the app
-    /// after a restart. The app dedups by message_id, so re-delivery is idempotent.
+    /// destination (register subscriptions BEFORE importing) that the app has not
+    /// handled (`restore_durable_handled`) is re-delivered to the inbox — our
+    /// reconcile marks make peers never re-offer it, so this is the only path that
+    /// gets an arrived-but-undrained group message to the app after a restart.
+    ///
+    /// Frames are not re-verified here: each was verified on arrival or signed by us before it was
+    /// stored, and the persisted copy lives in the profile's encrypted database.
     pub fn import_durable(&self, frames: Vec<DurableDataFrame>) {
         let now = Instant::now();
+        let now_unix = unix_now_secs();
         let stored: Vec<DurableDataFrame> = {
             let mut store = self.durable_store.lock();
             frames
@@ -3850,6 +4427,7 @@ impl Network {
                     store.insert(
                         frame.clone(),
                         now,
+                        now_unix,
                         MAX_DURABLE_FRAMES,
                         MAX_DURABLE_FRAMES_PER_SOURCE,
                         // Restoring old frames never evicts: within the caps, as they were.
@@ -3858,19 +4436,28 @@ impl Network {
                 })
                 .collect()
         };
-        let mut reconcile = self.durable_reconcile.lock();
-        let subscriptions = self.group_subscriptions.lock();
-        let mut handled = self.durable_handled.lock();
-        for frame in stored {
-            reconcile.insert(frame.feed_id, frame.seq);
-            if frame.to == self.local_address {
-                // Exported only once the app had handled it (`export_durable`): mark, don't deliver.
-                handled.insert((frame.feed_id, frame.seq));
-                continue;
+        let mut inbox = Vec::new();
+        {
+            let mut reconcile = self.durable_reconcile.lock();
+            let subscriptions = self.group_subscriptions.lock();
+            let mut handled = self.durable_handled.lock();
+            for frame in stored {
+                reconcile.insert(frame.feed_id, frame.seq);
+                if frame.to == self.local_address {
+                    // Exported only once the app had handled it (`export_durable`): mark, don't deliver.
+                    handled.insert((frame.feed_id, frame.seq));
+                    continue;
+                }
+                if frame.from != self.local_address
+                    && subscriptions.contains_key(&frame.to)
+                    && !handled.contains(&(frame.feed_id, frame.seq))
+                {
+                    inbox.push(frame);
+                }
             }
-            if frame.from != self.local_address && subscriptions.contains_key(&frame.to) {
-                let _ = self.durable_inbox_tx.try_send(frame);
-            }
+        }
+        for frame in inbox {
+            self.hand_to_durable_inbox(frame);
         }
     }
 
@@ -3881,15 +4468,36 @@ impl Network {
     // lack) → DurableData. Kicked off on link-up; this is what actually moves a
     // store-and-forward-held frame to its destination. См. mesh-durable-delivery.md.
 
-    /// The destinations we want anti-entropy frames for: the group destinations we're subscribed to,
-    /// plus our own address (1:1 durable frames are addressed to us). We ADVERTISE this as our
-    /// `interests` so a holder can offer us the right frames without us — or it — listing the full
-    /// feed inventory. See docs/decisions/anti-entropy-have-scoping.md.
-    fn own_interests(&self) -> Vec<NodeAddress> {
-        let mut interests: Vec<NodeAddress> =
-            self.group_subscriptions.lock().keys().copied().collect();
+    /// The destinations we want anti-entropy frames for, as we advertise them to `peer`: our own
+    /// address (1:1 durable frames are addressed to us; the peer knows it anyway) and, for each
+    /// group destination we're subscribed to, its blinded token for this pair
+    /// (`interest_token`). A holder that is in the same group recognises the token and offers us the
+    /// group's frames; any other neighbour sees 20 random-looking bytes that differ from peer to
+    /// peer, so it cannot tell which groups we are in or match us with other members (V-06; before,
+    /// the group destinations went out in the clear to every neighbour). See
+    /// docs/decisions/anti-entropy-have-scoping.md.
+    fn own_interests_for(&self, peer: &NodeAddress) -> Vec<NodeAddress> {
+        let mut interests: Vec<NodeAddress> = self
+            .group_subscriptions
+            .lock()
+            .keys()
+            .map(|dest| interest_token(dest, &self.local_address, peer))
+            .collect();
         interests.push(self.local_address);
         interests
+    }
+
+    /// The group destinations of ours that `peer` said it wants: the tokens in its HAVE that match
+    /// one of our subscriptions for this pair. A token for a group we are not in matches nothing —
+    /// and only our groups' frames are scoped (`feed_relevant_to_peer`), so nothing else is needed.
+    fn resolve_peer_interests(&self, peer: &NodeAddress, advertised: &[NodeAddress]) -> Vec<NodeAddress> {
+        let advertised: HashSet<&NodeAddress> = advertised.iter().collect();
+        self.group_subscriptions
+            .lock()
+            .keys()
+            .filter(|dest| advertised.contains(&interest_token(dest, peer, &self.local_address)))
+            .copied()
+            .collect()
     }
 
     /// Whether `node` currently FORWARDS traffic for us — it is the next hop for some OTHER
@@ -3915,6 +4523,27 @@ impl Network {
             .any(|(dest, entry)| dest != *node && neighbor_ids.contains(&entry.next_hop_neighbor))
     }
 
+    /// Whether `peer` is the next hop of our path toward any of `dests` — it forwards our traffic to
+    /// one of them. A forwarder of some route is no forwarder for a group none of whose members it
+    /// leads to (blind audit 2026-11-11, K2).
+    fn forwards_toward(&self, peer: &NodeAddress, dests: &[NodeAddress]) -> bool {
+        let neighbor_ids: Vec<NeighborId> = self
+            .verified_neighbors
+            .lock()
+            .iter()
+            .filter(|(_, n)| **n == *peer)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if neighbor_ids.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        dests
+            .iter()
+            .filter(|dest| *dest != peer)
+            .any(|dest| self.path_table.lookup(dest, now).is_some_and(|entry| neighbor_ids.contains(&entry.next_hop_neighbor)))
+    }
+
     /// Whether a held frame for `dest` is worth offering/advertising to a peer.
     ///
     /// Only frames for a GROUP WE ARE A MEMBER OF (`dest` ∈ our subscriptions) are scoped — those are
@@ -3927,16 +4556,24 @@ impl Network {
         &self,
         dest: &NodeAddress,
         peer_node: Option<&NodeAddress>,
-        peer_interests: &[NodeAddress],
         peer_is_forwarder: bool,
     ) -> bool {
         match self.group_subscriptions.lock().get(dest) {
-            None => true, // not one of our groups → 1:1 / carried S&F: flood as before
-            Some(members) => {
+            // Not one of our groups: a 1:1 frame, ours or carried. Its addressee, a node forwarding our
+            // traffic, or a carrier the app trusts (see `durable_carriers`).
+            None => {
                 peer_is_forwarder
-                    || peer_interests.contains(dest)
-                    || peer_node.is_some_and(|p| members.contains(p))
+                    || peer_node.is_some_and(|peer| {
+                        peer == dest
+                            || self.durable_carriers.lock().as_ref().is_none_or(|carriers| carriers.contains(peer))
+                    })
             }
+            // A group frame: its members and our forwarders. An interest the peer declared is no
+            // right to it — the token is computed from what a removed member still knows, and it kept
+            // getting the group's frames (blind audit 2026-11-11, J5).
+            // A forwarder only toward this group's members: a forwarder of some unrelated route got
+            // the group's frames too (blind audit 2026-11-11, K2).
+            Some(members) => peer_node.is_some_and(|p| members.contains(p) || self.forwards_toward(p, members)),
         }
     }
 
@@ -3951,12 +4588,6 @@ impl Network {
         iface: &InterfaceHandle,
         peer_node: &NodeAddress,
     ) {
-        let peer_interests = self
-            .peer_interests
-            .lock()
-            .get(peer_node)
-            .cloned()
-            .unwrap_or_default();
         let peer_is_forwarder = self.is_forwarder(peer_node);
         // Feed → destination for what we currently HOLD; a GC'd feed drops out (nothing to serve).
         let held_feed_dests: HashMap<FeedId, NodeAddress> = {
@@ -3972,21 +4603,39 @@ impl Network {
         let relevant_feeds: Vec<FeedId> = held_feed_dests
             .into_iter()
             .filter(|(_, dest)| {
-                self.feed_relevant_to_peer(dest, Some(peer_node), &peer_interests, peer_is_forwarder)
+                self.feed_relevant_to_peer(dest, Some(peer_node), peer_is_forwarder)
             })
             .map(|(feed, _)| feed)
             .collect();
+        // For a feed addressed to us the mark stops below the first frame the app has not handled
+        // yet: a holder drops what our mark covers (`DurableStore::drop_delivered_to`), and a frame still in
+        // the on_wire queue would be lost with a crash or a sign-out.
+        let first_unhandled: HashMap<FeedId, u64> = {
+            let store = self.durable_store.lock();
+            let handled = self.durable_handled.lock();
+            let mut first = HashMap::new();
+            for frame in store.frames() {
+                if frame.to == self.local_address && !handled.contains(&(frame.feed_id, frame.seq)) {
+                    let seq = first.entry(frame.feed_id).or_insert(frame.seq);
+                    *seq = (*seq).min(frame.seq);
+                }
+            }
+            first
+        };
         let marks: Vec<(FeedId, u64)> = {
             let reconcile = self.durable_reconcile.lock();
             relevant_feeds
                 .into_iter()
-                .map(|feed| (feed, reconcile.state().high_water(&feed)))
+                .map(|feed| {
+                    let hw = reconcile.state().high_water(&feed);
+                    (feed, first_unhandled.get(&feed).map_or(hw, |first| hw.min(first.saturating_sub(1))))
+                })
                 .filter(|(_, hw)| *hw > 0)
                 .collect()
         };
         let frame = NetworkFrame::AntiEntropyHave(AntiEntropyHaveFrame {
             marks,
-            interests: self.own_interests(),
+            interests: self.own_interests_for(peer_node),
         });
         let _ = iface.send_frame(neighbor, &frame.encode_to_wire()).await;
     }
@@ -4055,9 +4704,44 @@ impl Network {
         }
     }
 
-    /// A direct link to `peer` is not kept (see `keep_direct_only_with`).
+    /// Hold no direct connection with `refused` (blocked contacts), whatever else allows it. A direct
+    /// link already up with one newly in the set is closed now; a new one is refused before we prove
+    /// who we are (as for `keep_direct_only_with`). One taken out of the set may connect again.
+    pub async fn refuse_direct_with(&self, refused: std::collections::HashSet<NodeAddress>) {
+        let added: Vec<NodeAddress> = {
+            let mut current = self.refused_direct.lock();
+            let added = refused.difference(&current).copied().collect();
+            *current = refused;
+            added
+        };
+        if added.is_empty() {
+            return;
+        }
+        let closing: Vec<(NeighborId, NodeAddress)> = self
+            .verified_neighbors
+            .lock()
+            .iter()
+            .filter(|(_, peer)| added.contains(peer))
+            .map(|(neighbor, peer)| (neighbor.clone(), *peer))
+            .collect();
+        for (neighbor, peer) in closing {
+            crate::tcp_transport::tcp_trace("net/direct-refused", &format!("closing neighbor={neighbor:?} peer={peer:?}"));
+            for iface in &self.interfaces {
+                iface.close_neighbor(&neighbor).await;
+            }
+            self.prune_path(&neighbor);
+        }
+    }
+
+    /// Whether the identities refused a direct link are exactly `refused` (nothing to apply).
+    pub fn refuses_direct_with_exactly(&self, refused: &std::collections::HashSet<NodeAddress>) -> bool {
+        *self.refused_direct.lock() == *refused
+    }
+
+    /// A direct link to `peer` is not kept (see `keep_direct_only_with`, `refuse_direct_with`).
     fn direct_refused(&self, peer: &NodeAddress) -> bool {
-        self.direct_only_with.lock().as_ref().is_some_and(|allowed| !allowed.contains(peer))
+        self.refused_direct.lock().contains(peer)
+            || self.direct_only_with.lock().as_ref().is_some_and(|allowed| !allowed.contains(peer))
     }
 
     /// A connection at `neighbor` rides a carrier our hops do not use (see [`CarrierPreference`]).
@@ -4248,6 +4932,12 @@ impl Network {
     /// unaffected. See docs/decisions/friend-proxy-by-consent.md.
     pub fn consent_to_relay_for(&self, peer: NodeAddress) {
         self.relay_consent.lock().insert(peer);
+    }
+
+    /// Name every node we carry traffic for (see [`consent_to_relay_for`](Self::consent_to_relay_for)).
+    /// The whole set, each time: whoever is not in it has no consent from the next carriage admission.
+    pub fn set_relay_consents(&self, peers: std::collections::HashSet<NodeAddress>) {
+        *self.relay_consent.lock() = peers;
     }
 
     /// Withdraw a prior [`consent_to_relay_for`](Self::consent_to_relay_for) — effective on the next
@@ -4691,17 +5381,33 @@ impl Network {
     /// Both arms spawn, so the dispatcher never blocks (a real dial would). D1 fix: the probe is a
     /// real `connect_endpoint`, not `send_frame` (which is a prod no-op for an unlinked neighbour).
     /// P2 / docs/decisions/mesh-hole-punching.md.
-    async fn handle_punch_sync(self: &Arc<Self>, sync: PunchSyncFrame, iface: &InterfaceHandle) {
+    async fn handle_punch_sync(
+        self: &Arc<Self>,
+        sync: PunchSyncFrame,
+        from_neighbor: &NeighborId,
+        iface: &InterfaceHandle,
+    ) {
         // The peer may climb to UDP; our hop stays TCP.
         if self.carrier_preference() == CarrierPreference::Tcp {
             return;
         }
+        // Only from a relay we verified, as a `PunchRequest`: anyone who reached our socket had us
+        // open connections to whatever endpoint it named, as many as it sent (blind audit
+        // 2026-11-10). A sync may come unasked (the other side asked), so there is no nonce to hold
+        // it to — the cap on attempts at once bounds what a verified node can make us do.
+        if !self.verified_neighbors.lock().contains_key(from_neighbor) {
+            return;
+        }
+        let Some(attempt) = PunchAttempt::start(&self.punch_attempts) else {
+            return;
+        };
         match decide_punch_role(&self.local_address, &sync.peer) {
             PunchRole::Listener => {
                 let iface = iface.clone();
                 let endpoint = sync.peer_endpoint.to_string();
                 tokio::spawn(async move {
                     let _ = iface.connect_endpoint(&endpoint).await;
+                    drop(attempt);
                 });
             }
             PunchRole::Dialer => {
@@ -4711,6 +5417,7 @@ impl Network {
                 tokio::spawn(async move {
                     tokio::time::sleep(PUNCH_PROBE_GRACE).await;
                     let _ = this.dial_at_endpoints(peer, vec![endpoint]).await;
+                    drop(attempt);
                 });
             }
         }
@@ -4734,33 +5441,41 @@ impl Network {
         // the peer wants, or the peer carries our traffic. Everything else stays with us — closing the
         // "offer the whole inventory to any route-candidate" leak.
         let peer_node = self.verified_neighbors.lock().get(neighbor).copied();
-        let peer_interests = have.interests;
+        let peer_interests = peer_node
+            .map(|node| self.resolve_peer_interests(&node, &have.interests))
+            .unwrap_or_default();
         if let Some(node) = peer_node {
             self.peer_interests
                 .lock()
                 .insert(node, peer_interests.clone());
         }
         let peer_is_forwarder = peer_node.map(|n| self.is_forwarder(&n)).unwrap_or(false);
-
-        let offers = self.durable_reconcile.lock().offers_for(&peer);
-        if offers.is_empty() {
-            return;
+        if let Some(node) = peer_node {
+            self.durable_store.lock().drop_delivered_to(&node, &peer);
         }
+
         // Snapshot (feed, seq, dest, msg_id) under the store lock, THEN filter by relevance (which
         // locks group_subscriptions) — never nested, keeping the store → group_subscriptions order.
+        // What is offered is what the store holds past the peer's marks: built from the marks we
+        // keep, the list first took every feed ever seen — any node can make up feeds under its own
+        // prefix — and only then dropped what is no longer held (blind audit 2026-11-10).
         let candidates: Vec<(FeedId, u64, NodeAddress, u64)> = {
             let store = self.durable_store.lock();
-            offers
-                .into_iter()
-                .filter_map(|(feed, seq)| {
-                    store.get(&(feed, seq)).map(|f| (feed, seq, f.to, f.msg_id))
-                })
-                .collect()
+            let mut held: Vec<(FeedId, u64, NodeAddress, u64)> = store
+                .frames()
+                .filter(|frame| frame.seq > peer.high_water(&frame.feed_id))
+                .map(|frame| (frame.feed_id, frame.seq, frame.to, frame.msg_id))
+                .collect();
+            held.sort_unstable_by_key(|(feed, seq, _, _)| (*feed, *seq));
+            held
         };
+        if candidates.is_empty() {
+            return;
+        }
         let entries: Vec<(FeedId, u64, u64)> = candidates
             .into_iter()
             .filter(|(_, _, to, _)| {
-                self.feed_relevant_to_peer(to, peer_node.as_ref(), &peer_interests, peer_is_forwarder)
+                self.feed_relevant_to_peer(to, peer_node.as_ref(), peer_is_forwarder)
             })
             .map(|(feed, seq, _, msg_id)| (feed, seq, msg_id))
             .take(MAX_ANTI_ENTROPY_ENTRIES)
@@ -4796,14 +5511,27 @@ impl Network {
         let _ = iface.send_frame(neighbor, &frame.encode_to_wire()).await;
     }
 
-    /// Peer requested msg_ids → send the matching durable frames it lacks.
+    /// Peer requested msg_ids → send the matching durable frames it lacks, of those we would have
+    /// offered it (`feed_relevant_to_peer`). A request is not a pass: msg_ids of a group's frames are
+    /// guessable from feed ids seen elsewhere, and before, any neighbour that named them got the
+    /// frames of a group it is not in (V-06).
     async fn handle_anti_entropy_request(
         &self,
         request: AntiEntropyRequestFrame,
         neighbor: &NeighborId,
         iface: &InterfaceHandle,
     ) {
-        let wanted: HashSet<u64> = request.msg_ids.into_iter().collect();
+        let Some(peer_node) = self.verified_neighbors.lock().get(neighbor).copied() else {
+            return;
+        };
+        let peer_is_forwarder = self.is_forwarder(&peer_node);
+        let wanted: HashSet<u64> = request
+            .msg_ids
+            .into_iter()
+            .take(MAX_ANTI_ENTROPY_ENTRIES)
+            .collect();
+        // Snapshot under the store lock, THEN filter by relevance (locks group_subscriptions) —
+        // never nested, keeping the store → group_subscriptions order.
         let frames: Vec<DurableDataFrame> = {
             let store = self.durable_store.lock();
             store
@@ -4812,6 +5540,9 @@ impl Network {
                 .cloned()
                 .collect()
         };
+        let frames = frames.into_iter().filter(|f| {
+            self.feed_relevant_to_peer(&f.to, Some(&peer_node), peer_is_forwarder)
+        });
         for frame in frames {
             let wire = NetworkFrame::DurableData(frame).encode_to_wire();
             let _ = iface.send_frame(neighbor, &wire).await;
@@ -4829,11 +5560,27 @@ impl Network {
             return Ok(());
         }
         // 2. Verify signature (anti-impersonation gate).
+        let now_ms = current_unix_ms();
         announce
-            .verify(current_unix_ms())
+            .verify(now_ms)
             .map_err(AnnounceHandlerError::Verify)?;
+        // 2a. Fresh only (V-07): an announce past its own TTL is a replay, not news of the peer. The
+        // TTL a peer may claim is capped, so a replay cannot live long either.
+        let ttl_secs = announce.ttl_seconds.min(MAX_ANNOUNCE_TTL_SECONDS);
+        if announce.timestamp.saturating_add(i64::from(ttl_secs) * 1000) < now_ms {
+            net_trace(&format!("ANNOUNCE stale dest={:?}", announce.destination));
+            return Ok(());
+        }
         // 3. Remember who this is and where to dial them (address book).
         let dest = announce.destination;
+        // The hop count is not signed (forwarders raise it), so 0 is believed only from the peer
+        // itself. A verified neighbour that is someone else and hands us X's announce at hop 0 would
+        // otherwise pass for X's direct link (V-07).
+        let arrival_identity = self.verified_neighbors.lock().get(neighbor).copied();
+        let hop_count = match arrival_identity {
+            Some(identity) if identity != dest => announce.hop_count.max(1),
+            _ => announce.hop_count,
+        };
         // NB: deliberately do NOT refresh `peer_last_seen` from an announce. A relay CACHES a peer's
         // announce and keeps re-forwarding it for up to its TTL (~300s) AFTER the peer dies, so an
         // announce is NOT proof of CURRENT liveness — treating it as such re-seeds the dead peer and
@@ -4842,23 +5589,32 @@ impl Network {
         // SOLICITED routed `PeerPong` — Data is excluded for the SAME reason (a relay drains a dead
         // peer's buffered Data; see the data handler), so neither cacheable announce nor buffered Data
         // re-seeds it. See docs/bugs/relay-presence-false-online-dead-peer.md.
-        self.peer_book.lock().insert(
-            dest,
-            PeerRecord {
-                pubkey: Some(announce.pubkey),
-                advertised_addresses: announce.advertised_addresses.clone(),
-                capabilities: announce.capabilities,
-                door_port: announce.door_port,
-                heard_direct: announce.hop_count == 0,
-            },
-        );
+        {
+            let mut book = self.peer_book.lock();
+            let newer_known = book
+                .get(&dest)
+                .is_some_and(|known| known.announce_timestamp > announce.timestamp);
+            if !newer_known && admit_peer_book_entry(&mut book, &dest) {
+                book.insert(
+                    dest,
+                    PeerRecord {
+                        pubkey: Some(announce.pubkey),
+                        advertised_addresses: announce.advertised_addresses.clone(),
+                        capabilities: announce.capabilities,
+                        door_port: announce.door_port,
+                        heard_direct: hop_count == 0,
+                        announce_timestamp: announce.timestamp,
+                    },
+                );
+            }
+        }
         // 4. Update path table soft-state (feeds Phase β multi-hop routing).
-        let ttl = Duration::from_secs(announce.ttl_seconds as u64);
+        let ttl = Duration::from_secs(u64::from(ttl_secs));
         self.path_table.update(
             dest,
             iface.id(),
             neighbor.clone(),
-            announce.hop_count,
+            hop_count,
             ttl,
             Instant::now(),
         );
@@ -4919,7 +5675,16 @@ impl Network {
             return;
         }
 
-        let response = respond_to_challenge(&self.identity, &request.nonce);
+        // The answer is bound to THIS connection's TLS session (V-03): relayed by a man in the middle
+        // onto its own session with the challenger, it no longer verifies.
+        let Some(binding) = iface.channel_binding(neighbor) else {
+            crate::tcp_transport::tcp_trace(
+                "net/challenge",
+                &format!("no channel binding on neighbor={neighbor:?}: not answering"),
+            );
+            return;
+        };
+        let response = respond_to_challenge(&self.identity, &request.nonce, &binding);
         let response_frame = NetworkFrame::ChallengeResponse(ChallengeResponseFrame {
             nonce: request.nonce,
             from: self.local_address,
@@ -5025,7 +5790,14 @@ impl Network {
         } else {
             challenge.expected
         };
-        let verify = verify_challenge_response(&response.response, &challenge.nonce, &expected);
+        let verify = match iface.channel_binding(neighbor) {
+            Some(binding) => {
+                verify_challenge_response(&response.response, &challenge.nonce, &binding, &expected)
+            }
+            None => Err(crate::cert::CertError::InvalidSignature(
+                "no channel binding on this connection".to_string(),
+            )),
+        };
         let challenge = OutboundChallenge { expected, ..challenge };
         // Direct links are kept only with the relays: the peer goes on through one of them.
         if verify.is_ok() && self.direct_refused(&challenge.expected) {
@@ -5037,7 +5809,7 @@ impl Network {
             iface.close_neighbor(neighbor).await;
             if let ChallengeRole::Dialer { waker } = challenge.role {
                 let _ = waker.send(Err(NetworkError::ChallengeRejected(
-                    "direct links are off: through a relay only".to_string(),
+                    "no direct link with this peer: through a relay only".to_string(),
                 )));
             }
             return;
@@ -5591,6 +6363,16 @@ fn path_rides_door(path: &PeerPath) -> bool {
             .is_some_and(|addr| path.iface.peer_on_door(addr))
 }
 
+/// The peer reached us through our own door: its connection arrives from the door bridge's socket.
+fn path_enters_our_door(path: &PeerPath) -> bool {
+    matches!(path.quality, PathQuality::Direct)
+        && path.iface.kind() == InterfaceKind::QuicOverUdp
+        && path
+            .iface
+            .remote_addr(&path.neighbor)
+            .is_some_and(crate::tcp_transport::is_door_bridge_source)
+}
+
 /// Pure two-axis ranking with the UDP fail-back demotion — no `PeerPath`/`InterfaceHandle`, so it is
 /// unit-testable without standing up interfaces. A demoted direct-UDP path gets carrier axis 2 (below
 /// TCP's 1); everything else is `path_rank_parts` unchanged.
@@ -5841,16 +6623,9 @@ fn is_enumerable_wan(addr: &SocketAddr) -> bool {
     }
 }
 
-/// Pick the addresses to advertise in an open (signed, hop-forwarded) announce. Explicit LAN /
-/// configured addresses are kept; the reflexive (NAT-mapped) address is added only when AutoNAT has
-/// confirmed it is directly dialable. **Address privacy:** routable WAN endpoints are
-/// then STRIPPED — a relay's or peer's globally-blockable IP must NOT ride the open gossip plane
-/// (a hostile mesh member would harvest it via forwarded announces / FoF). WAN reachability is
-/// distributed only on the pinned registry + invite bundle + sealed per-pair rendezvous beacon, not
-/// here; relay/multicast still reach us regardless (see `is_enumerable_wan`,
-/// the relay-address privacy rule). The CI invariant
-/// Сколько адресов пира держим в книге. `dial` перебирает их ПОСЛЕДОВАТЕЛЬНО, ожидая каждый
-/// QUIC-connect, поэтому длина списка — это прямое время до соединения, а не просто память.
+/// Сколько адресов пира держим в книге. `dial` гоняет их параллельно (`race_connect`), но каждый
+/// следующий стартует через `DIAL_ATTEMPT_DELAY` и не больше `DIAL_CONCURRENCY` сразу — длина
+/// списка всё ещё стоит времени до соединения, а не только памяти.
 const MAX_PEER_ADVERTISED_ADDRESSES: usize = 8;
 
 /// Happy Eyeballs (RFC 8305) over a dial's `candidates`: start the first connect, start the next
@@ -5863,8 +6638,11 @@ const MAX_PEER_ADVERTISED_ADDRESSES: usize = 8;
 /// close) — nothing is left adopted behind the winner. The losers go back to the FRONT of
 /// `candidates` in their order, so if the winner then fails the identity challenge the caller races
 /// them again. `None` once every candidate failed to connect.
+///
+/// Every endpoint that failed to connect is added to `failures` as `"<endpoint> <error>"`.
 async fn race_connect(
     candidates: &mut VecDeque<(InterfaceHandle, String)>,
+    failures: &mut Vec<String>,
 ) -> Option<(InterfaceHandle, NeighborId)> {
     async fn attempt(
         id: usize,
@@ -5926,7 +6704,8 @@ async fn race_connect(
                     }
                     // This interface can't reach this endpoint (connectionless, or the connect
                     // failed) — don't wait out the delay for the next one.
-                    Err(_) => {
+                    Err(error) => {
+                        failures.push(format!("{endpoint} {error}"));
                         if in_flight.len() < DIAL_CONCURRENCY {
                             start_next(&mut in_flight, &mut started, candidates);
                         }
@@ -5967,6 +6746,14 @@ fn merge_rendezvous_endpoints(known: &mut Vec<SocketAddr>, fresh: Vec<SocketAddr
     known.truncate(MAX_PEER_ADVERTISED_ADDRESSES);
 }
 
+/// Pick the addresses to advertise in an open (signed, hop-forwarded) announce. Explicit LAN /
+/// configured addresses are kept; the reflexive (NAT-mapped) address is added only when AutoNAT has
+/// confirmed it is directly dialable. **Address privacy:** routable WAN endpoints are
+/// then STRIPPED — a relay's or peer's globally-blockable IP must NOT ride the open gossip plane
+/// (a hostile mesh member would harvest it via forwarded announces / FoF). WAN reachability is
+/// distributed only on the pinned registry + invite bundle + sealed per-pair rendezvous beacon, not
+/// here; relay/multicast still reach us regardless (see `is_enumerable_wan`,
+/// the relay-address privacy rule). The CI invariant
 /// `announce_never_gossips_a_wan_endpoint` enforces it. Pure → unit-testable. P2 / review §4.1F.
 fn select_advertised_addresses(
     mut explicit: Vec<SocketAddr>,
@@ -6125,8 +6912,14 @@ impl Link {
 pub enum NetworkError {
     #[error("cannot dial own address (would loop)")]
     DialSelf,
-    #[error("no reachable address for destination {0:?} (no verified announce?)")]
+    /// Neither an address nor a route is known for the destination: nothing was tried.
+    #[error("no address or route known for destination {0:?}")]
     NoPathToDestination(NodeAddress),
+    /// Addresses were known and dialed, and none connected — on a real network nearly always
+    /// «connect: timed out»: not one packet of the handshake came back. `attempts` lists every
+    /// endpoint with its error. See docs/bugs/contact-request-said-sent-without-a-link.md.
+    #[error("no answer from {destination:?} at any known address: {attempts}")]
+    NoAnswer { destination: NodeAddress, attempts: String },
     #[error("interface {0} no longer in network's interface list")]
     InterfaceMissing(String),
     #[error("failed to send identity challenge: {0}")]
@@ -6155,6 +6948,7 @@ fn current_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::direct_feed_id;
     use crate::protocol::DATA_DEFAULT_HOP_LIMIT;
 
     // --- Phase β: pure multi-hop Data forwarding decision ---
@@ -6249,6 +7043,16 @@ mod tests {
     }
 
     // --- on-demand multi-hop origin admission (per-relay + global cap) ---
+    /// V-02, second part: a datagram for us names as its source its own neighbour, or a node that
+    /// neighbour carries for us — never anyone else (the carry check is not asked for the neighbour).
+    #[test]
+    fn a_media_datagram_names_its_neighbour_or_someone_it_carries() {
+        let (neighbour, other) = (NodeAddress::from_bytes([1; 20]), NodeAddress::from_bytes([2; 20]));
+        assert!(media_source_admissible(neighbour, neighbour, || panic!("not asked for the neighbour itself")));
+        assert!(media_source_admissible(other, neighbour, || true), "relayed for a node it carries");
+        assert!(!media_source_admissible(other, neighbour, || false), "posing as another source");
+    }
+
     #[test]
     fn admit_origin_caps_per_relay_then_rejects() {
         let mut origins = HashMap::new();
@@ -6295,6 +7099,89 @@ mod tests {
     }
 
     // --- durable delivery: store-and-forward + deliver-if-ours (P4) ---
+    /// V-05: a durable frame enters the store only over a verified neighbour, signed by the node it
+    /// names, unaltered, and in a feed of that node.
+    #[test]
+    fn inbound_durable_needs_verified_neighbour_signature_and_own_feed() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let neighbor = NeighborId("n1".into());
+        let neighbor_key = fresh_signing();
+        let neighbor_node = NodeAddress::from_pubkey(&neighbor_key.verifying_key());
+        let sender_key = fresh_signing();
+        let sender = NodeAddress::from_pubkey(&sender_key.verifying_key());
+        let to = node();
+        let signed = |key: &SigningKey, from: NodeAddress, feed_id: FeedId| {
+            let mut frame = DurableDataFrame {
+                to,
+                from,
+                feed_id,
+                seq: 1,
+                msg_id: 1,
+                ttl_secs: 3600,
+                sent_at_unix_secs: unix_now_secs(),
+                ciphertext: vec![1, 2, 3],
+                signature: vec![],
+            };
+            frame.sign(key);
+            frame
+        };
+        let honest = signed(&sender_key, sender, direct_feed_id(&sender, &to));
+
+        assert!(!net.admit_inbound_durable(&honest, &neighbor), "unverified neighbour");
+        net.verified_neighbors.lock().insert(neighbor.clone(), neighbor_node);
+        assert!(net.admit_inbound_durable(&honest, &neighbor), "carried by a verified neighbour");
+
+        let unsigned = DurableDataFrame { signature: vec![], ..honest.clone() };
+        assert!(!net.admit_inbound_durable(&unsigned, &neighbor), "unsigned");
+        let altered = DurableDataFrame { ciphertext: vec![9], ..honest.clone() };
+        assert!(!net.admit_inbound_durable(&altered, &neighbor), "altered on the way");
+        // The neighbour signs a frame of its own into the sender's feed: valid signature, wrong feed.
+        let squat = signed(&neighbor_key, neighbor_node, direct_feed_id(&sender, &to));
+        assert!(!net.admit_inbound_durable(&squat, &neighbor), "someone else's feed");
+        // ...or claims to be the sender outright.
+        let forged = signed(&neighbor_key, sender, direct_feed_id(&sender, &to));
+        assert!(!net.admit_inbound_durable(&forged, &neighbor), "forged origin");
+    }
+
+    /// V-05: a durable frame lives from its send time, at most `MAX_DURABLE_TTL_SECS`, whatever TTL
+    /// it carries and however late a holder gets it; one dated in the future is not held.
+    #[test]
+    fn durable_lifetime_counts_from_send_and_is_capped() {
+        let mk = |ttl_secs: u32, sent_at_unix_secs: u64| DurableDataFrame {
+            to: node(),
+            from: node(),
+            feed_id: [1u8; 16],
+            seq: 1,
+            msg_id: 1,
+            ttl_secs,
+            sent_at_unix_secs,
+            ciphertext: vec![],
+            signature: vec![],
+        };
+        let now = 10_000_000;
+        assert_eq!(durable_lifetime(&mk(3600, now), now), Duration::from_secs(3600));
+        assert_eq!(durable_lifetime(&mk(3600, now - 600), now), Duration::from_secs(3000), "aged on the way");
+        assert_eq!(durable_lifetime(&mk(3600, now - 3600), now), Duration::ZERO, "expired before it got here");
+        assert_eq!(
+            durable_lifetime(&mk(u32::MAX, now), now),
+            Duration::from_secs(MAX_DURABLE_TTL_SECS),
+            "capped"
+        );
+        assert_eq!(
+            durable_lifetime(&mk(3600, now + DURABLE_CLOCK_SKEW_SECS + 1), now),
+            Duration::ZERO,
+            "dated in the future"
+        );
+        assert_eq!(
+            durable_lifetime(&mk(3600, now + 60), now),
+            Duration::from_secs(3660),
+            "a sender clock slightly ahead is tolerated"
+        );
+
+        let mut store = DurableStore::new();
+        assert!(!store.insert(mk(3600, now - 3600), Instant::now(), now, 100, 100, true), "not held");
+    }
+
     #[test]
     fn durable_data_delivered_if_ours_stored_if_relayed() {
         let net = Network::new(fresh_signing(), vec![]);
@@ -6307,6 +7194,7 @@ mod tests {
             seq,
             msg_id: seq,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![1, 2, 3],
             signature: vec![],
         };
@@ -6347,6 +7235,7 @@ mod tests {
             seq,
             msg_id: seq,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![4, 5, 6],
             signature: vec![],
         };
@@ -6413,6 +7302,7 @@ mod tests {
             seq,
             msg_id: seq,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![1],
             signature: vec![],
         };
@@ -6424,6 +7314,356 @@ mod tests {
         let got = net.try_recv_durable().expect("subscribed import redelivered");
         assert_eq!(got.seq, 1);
         assert!(net.try_recv_durable().is_none());
+    }
+
+    /// A restart hands the app every stored frame of a group, old ones first — and the new ones after
+    /// them that came while the node was off. A 256-slot inbox kept the first 256 and dropped the rest,
+    /// which the reconcile marks then never asked for again.
+    #[test]
+    fn a_restart_hands_every_stored_group_frame_to_the_app_new_ones_after_hundreds_of_old() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let group_dest = crate::durable::group_destination_address("gid-many");
+        let sender = node();
+        net.subscribe_group_destination(group_dest, vec![]);
+        let frames: Vec<DurableDataFrame> = (1..=300)
+            .map(|seq| DurableDataFrame {
+                to: group_dest,
+                from: sender,
+                feed_id: [7u8; 16],
+                seq,
+                msg_id: seq,
+                ttl_secs: 3600,
+                sent_at_unix_secs: unix_now_secs(),
+                ciphertext: vec![1],
+                signature: vec![],
+            })
+            .collect();
+        net.import_durable(frames);
+        let got: Vec<u64> = std::iter::from_fn(|| net.try_recv_durable()).map(|f| f.seq).collect();
+        assert_eq!(got.len(), 300, "every stored frame reaches the app");
+        assert_eq!(got.last(), Some(&300), "the newest too");
+    }
+
+    /// Blind audit 2026-11-11, L1: what is on its way through the app is bounded — past it a new
+    /// frame for the app is not taken in (its holder offers it again), and a frame the app has
+    /// settled makes room. Our own frame going out and a frame only carried are taken as before.
+    #[test]
+    fn a_frame_for_the_app_is_not_taken_in_while_the_app_is_behind() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let frame = |from: NodeAddress, to: NodeAddress, seq: u64| DurableDataFrame {
+            to,
+            from,
+            feed_id: [3u8; 16],
+            seq,
+            msg_id: seq,
+            ttl_secs: 600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![],
+            signature: vec![],
+        };
+        let (me, peer, elsewhere) = (net.local_address(), node(), node());
+        net.durable_in_flight.store(DURABLE_IN_FLIGHT_MAX, std::sync::atomic::Ordering::Relaxed);
+        net.handle_durable_data(frame(peer, me, 1));
+        assert!(!net.durable_store.lock().contains(&([3u8; 16], 1)), "for the app: not taken in");
+        net.handle_durable_data(frame(me, peer, 2));
+        assert!(net.durable_store.lock().contains(&([3u8; 16], 2)), "ours going out: held");
+        net.handle_durable_data(frame(peer, elsewhere, 3));
+        assert!(net.durable_store.lock().contains(&([3u8; 16], 3)), "only carried: held");
+
+        net.durable_in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
+        net.handle_durable_data(frame(peer, me, 4));
+        assert_eq!(net.durable_in_flight(), 1, "handed over, counted");
+        let (_, in_flight) = net.try_recv_durable_in_flight().expect("in the inbox");
+        assert_eq!(net.durable_in_flight(), 1, "out of the inbox, not settled: still counted");
+        drop(in_flight);
+        assert_eq!(net.durable_in_flight(), 0, "settled, uncounted");
+    }
+
+    /// Blind audit 2026-11-11, L2: a handled mark outlived its frame and was swept only by an export
+    /// that ran when the store changed. Only frames still held are marked.
+    #[test]
+    fn a_handled_mark_is_kept_only_for_a_frame_still_held() {
+        let net = Network::new(fresh_signing(), vec![]);
+        net.note_durable_handled([4u8; 16], 1);
+        assert!(!net.durable_frame_handled(&[4u8; 16], 1), "no frame held: no mark");
+        net.handle_durable_data(DurableDataFrame {
+            to: net.local_address(),
+            from: node(),
+            feed_id: [4u8; 16],
+            seq: 2,
+            msg_id: 2,
+            ttl_secs: 600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![],
+            signature: vec![],
+        });
+        net.note_durable_handled([4u8; 16], 2);
+        assert!(net.durable_frame_handled(&[4u8; 16], 2), "a held frame is marked");
+    }
+
+    /// Blind audit 2026-11-11, J1: a frame addressed to us was "needed" whoever sent it, and keys anyone
+    /// can make filled the whole budget with such frames — none of it could be pushed out. Needed now
+    /// only from a sender we know: one of the app's carriers, or a member of the group it is for.
+    #[test]
+    fn a_frame_for_us_is_needed_only_from_a_sender_we_know() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let (alice, stranger, member) = (node(), node(), node());
+        let group = crate::durable::group_destination_address("needed-gid");
+        net.subscribe_group_destination(group, vec![member]);
+        net.set_durable_carriers([alice].into_iter().collect());
+        let frame = |from: NodeAddress, to: NodeAddress| DurableDataFrame {
+            to,
+            from,
+            feed_id: [9u8; 16],
+            seq: 1,
+            msg_id: 1,
+            ttl_secs: 600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![],
+            signature: vec![],
+        };
+        let me = net.local_address();
+        assert!(net.needs_durable_frame(&frame(alice, me)), "from a carrier we know");
+        assert!(!net.needs_durable_frame(&frame(stranger, me)), "not from a stranger");
+        assert!(net.needs_durable_frame(&frame(member, group)), "a member's group frame");
+        assert!(!net.needs_durable_frame(&frame(stranger, group)), "not a stranger's under the group");
+        assert!(net.needs_durable_frame(&frame(me, alice)), "our own");
+    }
+
+    /// A 1:1 frame is offered to its addressee, to a node forwarding our traffic, or to a carrier the
+    /// app trusts — not to every verified neighbour, once the app has named its carriers (owner's
+    /// decision 2026-11-11, blind audit E7). Before it has, as before: every neighbour.
+    #[test]
+    fn a_one_to_one_frame_is_offered_to_its_addressee_and_trusted_carriers_only() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let (addressee, carrier, stranger) = (node(), node(), node());
+        assert!(net.feed_relevant_to_peer(&addressee, Some(&stranger), false), "no carriers named yet: as before");
+        net.set_durable_carriers([carrier].into_iter().collect());
+        assert!(net.feed_relevant_to_peer(&addressee, Some(&addressee), false), "its addressee");
+        assert!(net.feed_relevant_to_peer(&addressee, Some(&carrier), false), "a trusted carrier");
+        assert!(net.feed_relevant_to_peer(&addressee, Some(&stranger), true), "a node forwarding our traffic");
+        assert!(!net.feed_relevant_to_peer(&addressee, Some(&stranger), false), "not a stranger");
+    }
+
+    /// Blind audit 2026-11-11, I1: keys are anyone's to make. Sixteen of them, 512 frames each, filled
+    /// the budget with frames we only carry, and a frame we need from a source holding nothing here
+    /// found no room — it could push out only its own source's. It makes room from what we carry now;
+    /// a frame we would only carry still finds none.
+    #[test]
+    fn a_frame_we_need_gets_in_when_sources_we_only_carry_for_fill_the_budget() {
+        let mut store = DurableStore::new();
+        let (now, now_unix) = (Instant::now(), unix_now_secs());
+        let mk = |from: NodeAddress, feed: u8, seq: u64| DurableDataFrame {
+            to: node(),
+            from,
+            feed_id: [feed; 16],
+            seq,
+            msg_id: seq,
+            ttl_secs: 3600,
+            sent_at_unix_secs: now_unix,
+            ciphertext: vec![1],
+            signature: vec![],
+        };
+        let sources = MAX_DURABLE_FRAMES / MAX_DURABLE_FRAMES_PER_SOURCE;
+        for n in 0..sources {
+            let from = node();
+            for seq in 1..=MAX_DURABLE_FRAMES_PER_SOURCE as u64 {
+                assert!(store.insert(mk(from, n as u8, seq), now, now_unix, MAX_DURABLE_FRAMES, MAX_DURABLE_FRAMES_PER_SOURCE, false));
+            }
+        }
+        assert_eq!(store.len(), MAX_DURABLE_FRAMES, "the budget is full");
+        assert!(
+            !store.insert(mk(node(), 200, 1), now, now_unix, MAX_DURABLE_FRAMES, MAX_DURABLE_FRAMES_PER_SOURCE, false),
+            "a frame we would only carry finds no room"
+        );
+        assert!(
+            store.insert(mk(node(), 201, 1), now, now_unix, MAX_DURABLE_FRAMES, MAX_DURABLE_FRAMES_PER_SOURCE, true),
+            "a frame we need gets in"
+        );
+        assert_eq!(store.len(), MAX_DURABLE_FRAMES);
+    }
+
+    /// A frame pushed out by its source's quota does not come back: two members at the quota handing
+    /// each other what the other just let go would never stop.
+    #[test]
+    fn a_frame_let_go_for_the_quota_is_not_taken_back_or_passed_on() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let group_dest = crate::durable::group_destination_address("gid-quota");
+        let sender = node();
+        let co_member = node();
+        net.subscribe_group_destination(group_dest, vec![co_member]);
+        let feed = [4u8; 16];
+        let mk = |seq: u64| DurableDataFrame {
+            to: group_dest,
+            from: sender,
+            feed_id: feed,
+            seq,
+            msg_id: seq,
+            ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![1],
+            signature: vec![],
+        };
+        let past_the_quota = MAX_DURABLE_FRAMES_PER_SOURCE as u64 + 20;
+        for seq in 1..=past_the_quota {
+            net.handle_durable_data(mk(seq));
+        }
+        let delivered = std::iter::from_fn(|| net.try_recv_durable()).count() as u64;
+        assert_eq!(delivered, past_the_quota, "each reaches the app once");
+        let held_before = net.export_durable().len();
+        assert_eq!(held_before, MAX_DURABLE_FRAMES_PER_SOURCE, "the quota holds");
+
+        // Every one of them handed to us again, as a co-member at its own quota would.
+        for _ in 0..3 {
+            for seq in 1..=past_the_quota {
+                assert!(net.handle_durable_data(mk(seq)).is_empty(), "not passed on");
+            }
+        }
+        assert!(net.try_recv_durable().is_none(), "not delivered a second time");
+        let held: Vec<u64> = net.export_durable().iter().map(|f| f.seq).collect();
+        assert_eq!(held.len(), held_before);
+        assert!(held.iter().all(|seq| *seq > 20), "the newest stay held, not the oldest back: {held:?}");
+    }
+
+    /// Blind audit 2026-11-13, pass 23: subscribing to a group handed the app every frame held for it
+    /// at once, past DURABLE_IN_FLIGHT_MAX. Those over go in as the group's frames are handled.
+    #[test]
+    fn group_subscribe_respects_durable_inflight_limit_with_preexisting_frames() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let group_dest = crate::durable::group_destination_address("gid-held");
+        let sender = node();
+        let mk = |seq: u64| DurableDataFrame {
+            to: group_dest,
+            from: sender,
+            feed_id: [9u8; 16],
+            seq,
+            msg_id: seq,
+            ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![seq as u8],
+            signature: vec![],
+        };
+        // Held before we are in the group: carried, not for the app.
+        for seq in 1..=3 {
+            net.handle_durable_data(mk(seq));
+        }
+        assert!(net.try_recv_durable().is_none());
+        net.durable_in_flight.store(DURABLE_IN_FLIGHT_MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        net.subscribe_group_destination(group_dest, vec![]);
+        assert_eq!(net.durable_in_flight(), DURABLE_IN_FLIGHT_MAX, "only as many as there was room for");
+        assert_eq!(net.try_recv_durable().map(|f| f.seq), Some(1));
+        assert_eq!(net.try_recv_durable().map(|f| f.seq), Some(2));
+        assert_eq!(net.try_recv_durable().map(|f| f.seq), Some(3));
+        assert!(net.try_recv_durable().is_none());
+    }
+
+    /// Blind audit 2026-11-13, pass 22: a group frame the app could not take yet (an epoch still to
+    /// come) was given up after its pauses and never handed over again in the run, though the network
+    /// still held it. Another frame of the group handled — its epoch may have come — it goes in again.
+    #[test]
+    fn durable_future_mls_is_redelivered_after_epochs_catch_up() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let group_dest = crate::durable::group_destination_address("gid-later");
+        let other_group = crate::durable::group_destination_address("gid-other");
+        let sender = node();
+        let mk = |to: NodeAddress, feed: u8, seq: u64| DurableDataFrame {
+            to,
+            from: sender,
+            feed_id: [feed; 16],
+            seq,
+            msg_id: seq,
+            ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![seq as u8],
+            signature: vec![],
+        };
+        net.subscribe_group_destination(group_dest, vec![]);
+        net.subscribe_group_destination(other_group, vec![]);
+        net.handle_durable_data(mk(group_dest, 7, 1));
+        let later = net.try_recv_durable().expect("handed to the app");
+        net.note_durable_given_up(later.feed_id, later.seq);
+
+        assert_eq!(net.redeliver_given_up_to(&other_group), 0, "another group's progress says nothing of it");
+        assert!(net.try_recv_durable().is_none());
+        assert_eq!(net.redeliver_given_up_to(&group_dest), 1);
+        assert_eq!(net.try_recv_durable().map(|f| f.seq), Some(1), "handed over again");
+        assert_eq!(net.redeliver_given_up_to(&group_dest), 0, "once");
+    }
+
+    /// A restart hands the app only the group frames it has not handled; the handled ones stay held,
+    /// so the other members can still get them and nobody re-offers them to us.
+    #[test]
+    fn a_restart_does_not_replay_group_frames_the_app_has_handled() {
+        let signing = fresh_signing();
+        let net = Network::new(signing.clone(), vec![]);
+        let group_dest = crate::durable::group_destination_address("gid-handled");
+        let sender = node();
+        let feed = [5u8; 16];
+        let mk = |seq: u64| DurableDataFrame {
+            to: group_dest,
+            from: sender,
+            feed_id: feed,
+            seq,
+            msg_id: seq,
+            ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![seq as u8],
+            signature: vec![],
+        };
+        net.subscribe_group_destination(group_dest, vec![]);
+        for seq in 1..=3 {
+            net.handle_durable_data(mk(seq));
+        }
+        for _ in 0..2 {
+            let frame = net.try_recv_durable().expect("delivered");
+            net.note_durable_handled(frame.feed_id, frame.seq);
+        }
+        let exported = net.export_durable();
+        assert_eq!(exported.len(), 3, "all stay held for the other members");
+        let marks: Vec<(FeedId, u64)> = exported
+            .iter()
+            .filter(|f| net.durable_frame_handled(&f.feed_id, f.seq))
+            .map(|f| (f.feed_id, f.seq))
+            .collect();
+        assert_eq!(marks.len(), 2);
+
+        let restarted = Network::new(signing, vec![]);
+        restarted.subscribe_group_destination(group_dest, vec![]);
+        restarted.restore_durable_handled(marks);
+        restarted.import_durable(exported);
+        let got: Vec<u64> = std::iter::from_fn(|| restarted.try_recv_durable()).map(|f| f.seq).collect();
+        assert_eq!(got, vec![3], "only the one the app never handled");
+        assert_eq!(restarted.durable_reconcile.lock().state().high_water(&feed), 3);
+        assert_eq!(restarted.export_durable().len(), 3, "still held to pass on");
+    }
+
+    /// The periodic persist looks at these marks: a new frame and a new handled mark change them,
+    /// nothing else does.
+    #[test]
+    fn durable_export_marks_change_with_a_frame_and_with_a_handled_mark() {
+        let net = Network::new(fresh_signing(), vec![]);
+        let group_dest = crate::durable::group_destination_address("gid-marks");
+        net.subscribe_group_destination(group_dest, vec![]);
+        let sender = node();
+        let mk = |seq: u64| DurableDataFrame {
+            to: group_dest,
+            from: sender,
+            feed_id: [6u8; 16],
+            seq,
+            msg_id: seq,
+            ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
+            ciphertext: vec![1],
+            signature: vec![],
+        };
+        let empty = net.durable_export_marks();
+        assert_eq!(empty, net.durable_export_marks());
+        net.handle_durable_data(mk(1));
+        let one = net.durable_export_marks();
+        assert_ne!(one, empty);
+        assert_eq!(one, net.durable_export_marks(), "nothing changed, same marks");
+        net.note_durable_handled([6u8; 16], 1);
+        assert_ne!(net.durable_export_marks(), one);
     }
 
     /// A frame for us that the app has handled survives a restart as a high-water mark, so holders
@@ -6444,6 +7684,7 @@ mod tests {
             seq,
             msg_id: seq,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![seq as u8],
             signature: vec![],
         };
@@ -6530,6 +7771,7 @@ mod tests {
             seq,
             msg_id: seq,
             ttl_secs: ttl,
+            sent_at_unix_secs: 1_000,
             ciphertext: vec![],
             signature: vec![],
         };
@@ -6537,26 +7779,26 @@ mod tests {
         // TTL: a frame is GC'd once its ttl elapses (now is injected).
         let mut store = DurableStore::new();
         let src = node();
-        assert!(store.insert(mk(src, 1, 10), t0, 100, 100, false));
+        assert!(store.insert(mk(src, 1, 10), t0, 1_000, 100, 100, false));
         assert!(store.contains(&([1u8; 16], 1)));
         store.gc(t0 + Duration::from_secs(11));
         assert!(!store.contains(&([1u8; 16], 1)), "expired frame must be GC'd");
         // ttl 0 is never stored.
-        assert!(!store.insert(mk(src, 2, 0), t0, 100, 100, false));
+        assert!(!store.insert(mk(src, 2, 0), t0, 1_000, 100, 100, false));
 
         // Dedup by (feed, seq).
         let mut store = DurableStore::new();
-        assert!(store.insert(mk(src, 5, 10), t0, 100, 100, false));
-        assert!(!store.insert(mk(src, 5, 10), t0, 100, 100, false));
+        assert!(store.insert(mk(src, 5, 10), t0, 1_000, 100, 100, false));
+        assert!(!store.insert(mk(src, 5, 10), t0, 1_000, 100, 100, false));
         assert_eq!(store.len(), 1);
 
         // Global cap rejects past total_cap.
         let mut store = DurableStore::new();
         for s in 1..=3 {
-            assert!(store.insert(mk(node(), s, 10), t0, 3, 100, false));
+            assert!(store.insert(mk(node(), s, 10), t0, 1_000, 3, 100, false));
         }
         assert!(
-            !store.insert(mk(node(), 99, 10), t0, 3, 100, false),
+            !store.insert(mk(node(), 99, 10), t0, 1_000, 3, 100, false),
             "over global cap"
         );
 
@@ -6565,13 +7807,13 @@ mod tests {
         let mut store = DurableStore::new();
         let heavy = node();
         for s in 1..=2 {
-            assert!(store.insert(mk(heavy, s, 10), t0, 100, 2, false));
+            assert!(store.insert(mk(heavy, s, 10), t0, 1_000, 100, 2, false));
         }
         assert!(
-            !store.insert(mk(heavy, 3, 10), t0, 100, 2, false),
+            !store.insert(mk(heavy, 3, 10), t0, 1_000, 100, 2, false),
             "over per-source cap"
         );
-        assert!(store.insert(mk(node(), 7, 10), t0, 100, 2, false));
+        assert!(store.insert(mk(node(), 7, 10), t0, 1_000, 100, 2, false));
     }
 
     /// A frame this node needs is never refused for a full budget: it goes in, the source's oldest
@@ -6589,6 +7831,7 @@ mod tests {
             seq,
             msg_id: seq,
             ttl_secs: 600,
+            sent_at_unix_secs: 1_000,
             ciphertext: vec![],
             signature: vec![],
         };
@@ -6596,11 +7839,11 @@ mod tests {
         // The source's quota is full of frames we only carry; its next frame is one we need.
         let mut store = DurableStore::new();
         for s in 1..=2 {
-            assert!(store.insert(mk(source, s), t0 + Duration::from_secs(s), 100, 2, false));
+            assert!(store.insert(mk(source, s), t0 + Duration::from_secs(s), 1_000, 100, 2, false));
         }
-        assert!(!store.insert(mk(source, 3), t0, 100, 2, false), "a carried frame stays refused");
+        assert!(!store.insert(mk(source, 3), t0, 1_000, 100, 2, false), "a carried frame stays refused");
         assert!(
-            store.insert(mk(source, 4), t0 + Duration::from_secs(4), 100, 2, true),
+            store.insert(mk(source, 4), t0 + Duration::from_secs(4), 1_000, 100, 2, true),
             "a needed frame must be stored"
         );
         assert!(!store.contains(&([2u8; 16], 1)), "the source's oldest frame makes room");
@@ -6609,18 +7852,22 @@ mod tests {
         // Global budget full: the needed frame rotates out its own source's oldest, never another's.
         let mut store = DurableStore::new();
         let other = node();
-        assert!(store.insert(mk(other, 10), t0, 3, 100, false));
-        assert!(store.insert(mk(other, 11), t0, 3, 100, false));
-        assert!(store.insert(mk(source, 12), t0, 3, 100, false));
-        assert!(store.insert(mk(source, 13), t0, 3, 100, true));
+        assert!(store.insert(mk(other, 10), t0, 1_000, 3, 100, false));
+        assert!(store.insert(mk(other, 11), t0, 1_000, 3, 100, false));
+        assert!(store.insert(mk(source, 12), t0, 1_000, 3, 100, false));
+        assert!(store.insert(mk(source, 13), t0, 1_000, 3, 100, true));
         assert!(store.contains(&([2u8; 16], 10)) && store.contains(&([2u8; 16], 11)));
         assert!(!store.contains(&([2u8; 16], 12)));
-        // With nothing of that source to drop, a full budget still refuses.
+        // With nothing of that source to drop, it takes the room of what we only carry: the oldest
+        // carried frame of the source holding the most. Refused, a budget full of frames under keys
+        // anyone can make kept every frame we need out (blind audit 2026-11-11, I1).
         let mut store = DurableStore::new();
         for s in 20..=22 {
-            assert!(store.insert(mk(other, s), t0, 3, 100, false));
+            assert!(store.insert(mk(other, s), t0 + Duration::from_secs(s), 1_000, 3, 100, false));
         }
-        assert!(!store.insert(mk(source, 23), t0, 3, 100, true));
+        assert!(store.insert(mk(source, 23), t0, 1_000, 3, 100, true), "a needed frame gets in");
+        assert!(!store.contains(&([2u8; 16], 20)), "the carried source's oldest makes room");
+        assert!(store.contains(&([2u8; 16], 21)) && store.contains(&([2u8; 16], 22)));
     }
 
     #[test]
@@ -6635,6 +7882,7 @@ mod tests {
             seq: 1,
             msg_id,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![feed],
             signature: vec![],
         };
@@ -6687,10 +7935,11 @@ mod tests {
         a.send_durable(DurableDataFrame {
             to: b_node,
             from: a.local_address(),
-            feed_id: [9u8; 16],
+            feed_id: direct_feed_id(&a.local_address(), &b_node),
             seq: 1,
             msg_id: 777,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![1, 2, 3],
             signature: vec![],
         })
@@ -6714,6 +7963,24 @@ mod tests {
         .await
         .expect("B receives the durable frame via reconciliation within 5s");
         assert_eq!((got.msg_id, got.to), (777, b_node));
+
+        // Delivered by high-water (ADR mesh-durable-delivery, decision 4): while B's app has not
+        // handled the frame, B's mark stops below it and A keeps its copy; once handled, the next
+        // reconcile tells A, and A drops it.
+        let key = (got.feed_id, got.seq);
+        b.reconcile_all_peers().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(a.durable_store.lock().get(&key).is_some(), "not handled yet: the holder keeps it");
+        b.note_durable_handled(got.feed_id, got.seq);
+        b.reconcile_all_peers().await;
+        timeout(Duration::from_secs(5), async {
+            while a.durable_store.lock().get(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("A drops the frame B's high-water covers");
+        assert!(a.durable_reconcile.lock().contains(&got.feed_id, got.seq), "A's mark stays");
 
         a.shutdown();
         b.shutdown();
@@ -6799,21 +8066,22 @@ mod tests {
         net.subscribe_group_destination(g, vec![co_member]);
 
         // Not one of our groups → flood to anyone, so 1:1 + carried S&F walk as before.
-        assert!(net.feed_relevant_to_peer(&one_to_one, Some(&bare), &[], false));
+        assert!(net.feed_relevant_to_peer(&one_to_one, Some(&bare), false));
 
         // A group frame reaches a co-member (in our member list)…
-        assert!(net.feed_relevant_to_peer(&g, Some(&co_member), &[], false));
-        // …a peer that advertised interest in the group…
-        assert!(net.feed_relevant_to_peer(&g, Some(&bare), std::slice::from_ref(&g), false));
-        // …and a forwarder that carries our traffic…
-        assert!(net.feed_relevant_to_peer(&g, Some(&bare), &[], true));
+        assert!(net.feed_relevant_to_peer(&g, Some(&co_member), false));
+        // …not to a peer that only declared interest in it: a removed member can (blind audit
+        // 2026-11-11, J5)…
+        assert!(!net.feed_relevant_to_peer(&g, Some(&bare), false));
+        // …nor to a forwarder of some route that leads to none of its members (K2)…
+        assert!(!net.feed_relevant_to_peer(&g, Some(&bare), true));
         // …but NOT a bare neighbour that is none of those.
-        assert!(!net.feed_relevant_to_peer(&g, Some(&bare), &[], false));
+        assert!(!net.feed_relevant_to_peer(&g, Some(&bare), false));
     }
 
-    /// End-to-end: a member holding a group frame reconciles it to a peer that SUBSCRIBES to the
-    /// group (advertises interest), but withholds it from a bare neighbour — the frame's inventory
-    /// never reaches a node with no stake in the group.
+    /// End-to-end: a member holding a group frame reconciles it to a co-member, but withholds it from a
+    /// bare neighbour — the frame's inventory never reaches a node with no stake in the group. Declared
+    /// interest alone is no stake (blind audit 2026-11-11, J5): the co-member is in the member list.
     #[tokio::test]
     async fn anti_entropy_delivers_group_frame_to_subscriber_not_to_bare_neighbour() {
         use crate::sim::{NatModel, SimFabric};
@@ -6838,15 +8106,16 @@ mod tests {
         a.start();
         sub.start();
         a.dial(sub.local_address()).await.expect("A dials subscriber");
-        a.subscribe_group_destination(g, vec![]); // A is a member (holds the frame), no co-members listed
-        sub.subscribe_group_destination(g, vec![]); // the peer subscribes → advertises interest in G
+        a.subscribe_group_destination(g, vec![sub.local_address()]); // A is a member; the peer is a co-member
+        sub.subscribe_group_destination(g, vec![a.local_address()]);
         a.send_durable(DurableDataFrame {
             to: g,
             from: a.local_address(),
-            feed_id: [7u8; 16],
+            feed_id: direct_feed_id(&a.local_address(), &g),
             seq: 1,
             msg_id: 777,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![1],
             signature: vec![],
         })
@@ -6878,10 +8147,11 @@ mod tests {
         a2.send_durable(DurableDataFrame {
             to: g,
             from: a2.local_address(),
-            feed_id: [8u8; 16],
+            feed_id: direct_feed_id(&a2.local_address(), &g),
             seq: 1,
             msg_id: 888,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![1],
             signature: vec![],
         })
@@ -6894,10 +8164,49 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !bare.durable_store.lock().contains(&([8u8; 16], 1)),
+            !bare.durable_store.lock().contains(&(direct_feed_id(&a2.local_address(), &g), 1)),
             "a bare neighbour must not receive a group frame it has no stake in"
         );
         assert!(bare.try_recv_durable().is_none());
+
+        // V-06: naming the frame's msg_id in a request is not a pass — A2 still keeps it.
+        let path = bare
+            .peer_paths
+            .lock()
+            .get(&a2.local_address())
+            .and_then(|set| set.lock().best())
+            .expect("bare has a path to A2");
+        let request = NetworkFrame::AntiEntropyRequest(AntiEntropyRequestFrame { msg_ids: vec![888] });
+        path.iface.send_frame(&path.neighbor, &request.encode_to_wire()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !bare.durable_store.lock().contains(&(direct_feed_id(&a2.local_address(), &g), 1)),
+            "a request from outside the group gets nothing"
+        );
+    }
+
+    /// V-06: a HAVE names our groups only as tokens blinded for the pair. A co-member resolves the
+    /// token to the group; a neighbour outside it resolves nothing; the token differs per peer, and
+    /// the group's destination never appears in the clear.
+    #[test]
+    fn anti_entropy_interests_are_blinded_per_peer() {
+        let g = crate::durable::group_destination_address("blind-gid");
+        let me = Network::new(fresh_signing(), vec![]);
+        let member = Network::new(fresh_signing(), vec![]);
+        let outsider = Network::new(fresh_signing(), vec![]);
+        me.subscribe_group_destination(g, vec![]);
+        member.subscribe_group_destination(g, vec![]);
+
+        let to_member = me.own_interests_for(&member.local_address());
+        let to_outsider = me.own_interests_for(&outsider.local_address());
+        assert!(!to_member.contains(&g) && !to_outsider.contains(&g), "never in the clear");
+        assert!(to_member.contains(&me.local_address()), "our own address stays (1:1 frames)");
+        assert_ne!(to_member, to_outsider, "tokens differ per peer");
+
+        assert_eq!(member.resolve_peer_interests(&me.local_address(), &to_member), vec![g]);
+        assert!(outsider.resolve_peer_interests(&me.local_address(), &to_outsider).is_empty());
+        // A token meant for someone else does not resolve either.
+        assert!(member.resolve_peer_interests(&me.local_address(), &to_outsider).is_empty());
     }
 
     /// linked but A and C never link directly. Periodic reconcile walks the held
@@ -6949,10 +8258,11 @@ mod tests {
         a.send_durable(DurableDataFrame {
             to: c_node,
             from: a.local_address(),
-            feed_id: [5u8; 16],
+            feed_id: direct_feed_id(&a.local_address(), &c_node),
             seq: 1,
             msg_id: 555,
             ttl_secs: 3600,
+            sent_at_unix_secs: unix_now_secs(),
             ciphertext: vec![1, 2, 3],
             signature: vec![],
         })
@@ -7421,6 +8731,10 @@ mod tests {
         fn broadcast_capable(&self) -> bool {
             false
         }
+        /// What quinn reports when not one handshake packet comes back.
+        async fn connect_endpoint(&self, _endpoint: &str) -> io::Result<NeighborId> {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "connect: timed out"))
+        }
         async fn send_frame(&self, _n: &NeighborId, _f: &[u8]) -> io::Result<()> {
             Err(io::Error::new(io::ErrorKind::ConnectionReset, "path down"))
         }
@@ -7433,6 +8747,34 @@ mod tests {
         async fn send_datagram(&self, _n: &NeighborId, _p: &[u8]) -> io::Result<()> {
             Err(io::Error::new(io::ErrorKind::ConnectionReset, "path down"))
         }
+    }
+
+    /// Stand 2026-11-08: both peers dialed each other's known address for 25 minutes, every
+    /// handshake timed out, and the log said «no reachable address … (no verified announce?)» —
+    /// pointing at a missing announce while the address was known and tried.
+    #[tokio::test]
+    async fn a_dial_whose_every_handshake_times_out_names_the_addresses_it_tried() {
+        let net = Network::new(
+            fresh_signing(),
+            vec![Arc::new(FailingInterface { id: crate::interface::InterfaceId("silent".into()) })
+                as InterfaceHandle],
+        );
+        let peer = NodeAddress::from_pubkey(&fresh_signing().verifying_key());
+        let endpoint: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+
+        let error = net
+            .dial_at_endpoints(peer, vec![endpoint])
+            .await
+            .expect_err("nothing answers");
+
+        match &error {
+            NetworkError::NoAnswer { destination, attempts } => {
+                assert_eq!(*destination, peer);
+                assert_eq!(attempts, "203.0.113.7:51820 connect: timed out");
+            }
+            other => panic!("expected NoAnswer, got {other:?}"),
+        }
+        assert!(!error.to_string().contains("announce"), "{error}");
     }
 
     #[tokio::test]
@@ -7885,6 +9227,65 @@ mod tests {
         assert_eq!(net.peer_link_quality(&peer), Some(LinkQuality::Relay { hops: 1 }));
     }
 
+    /// V-07: a PathReply is taken only for a request we sent or relayed, for the same target. An
+    /// unasked one (or one naming another target) writes no route.
+    #[tokio::test]
+    async fn an_unasked_path_reply_writes_no_route() {
+        let iface_id = crate::interface::InterfaceId("if".into());
+        let iface = Arc::new(FailingInterface { id: iface_id.clone() }) as InterfaceHandle;
+        let net = Network::new(fresh_signing(), vec![iface.clone()]);
+        let neighbor_conn = NeighborId("n-conn".into());
+        net.verified_neighbors.lock().insert(neighbor_conn.clone(), node());
+        let origin = net.local_address;
+        let (asked, other) = (node(), node());
+
+        net.handle_path_reply(PathReplyFrame { origin, target: asked, nonce: 7, cost: 1 }, &neighbor_conn, &iface)
+            .await;
+        assert!(net.path_table.lookup(&asked, Instant::now()).is_none(), "no request behind it");
+
+        net.note_pending_path_request(origin, 7, asked);
+        net.handle_path_reply(PathReplyFrame { origin, target: other, nonce: 7, cost: 1 }, &neighbor_conn, &iface)
+            .await;
+        assert!(net.path_table.lookup(&other, Instant::now()).is_none(), "another target under our nonce");
+
+        net.handle_path_reply(PathReplyFrame { origin, target: asked, nonce: 7, cost: 1 }, &neighbor_conn, &iface)
+            .await;
+        assert!(net.path_table.lookup(&asked, Instant::now()).is_some(), "the asked one is taken");
+    }
+
+    /// V-07: an announce past its own (capped) TTL is not taken; an older one does not overwrite a
+    /// newer record; a verified neighbour that is someone else cannot hand over an announce at hop 0
+    /// (that would pass for the peer's direct link).
+    #[tokio::test]
+    async fn announces_must_be_fresh_ordered_and_hop_zero_only_from_the_peer() {
+        let iface_id = crate::interface::InterfaceId("if".into());
+        let iface = Arc::new(FailingInterface { id: iface_id.clone() }) as InterfaceHandle;
+        let net = Network::new(fresh_signing(), vec![iface.clone()]);
+        let peer_key = fresh_signing();
+        let peer = NodeAddress::from_pubkey(&peer_key.verifying_key());
+        let other_conn = NeighborId("other-conn".into());
+        net.verified_neighbors.lock().insert(other_conn.clone(), node());
+        let now = current_unix_ms();
+        let a1: SocketAddr = "198.51.100.1:1".parse().unwrap();
+        let a2: SocketAddr = "198.51.100.2:1".parse().unwrap();
+
+        let stale = Announce::sign_new(&peer_key, vec![a1], now - 400_000, 300);
+        net.handle_announce(stale, &iface, &other_conn).await.unwrap();
+        assert!(net.peer_book.lock().get(&peer).is_none(), "past its TTL");
+        let long_claim = Announce::sign_new(&peer_key, vec![a1], now - 700_000, u32::MAX);
+        net.handle_announce(long_claim, &iface, &other_conn).await.unwrap();
+        assert!(net.peer_book.lock().get(&peer).is_none(), "its TTL is capped");
+
+        let newer = Announce::sign_new(&peer_key, vec![a2], now, 300);
+        net.handle_announce(newer, &iface, &other_conn).await.unwrap();
+        let older = Announce::sign_new(&peer_key, vec![a1], now - 10_000, 300);
+        net.handle_announce(older, &iface, &other_conn).await.unwrap();
+        let record = net.peer_book.lock().get(&peer).cloned().unwrap();
+        assert_eq!(record.advertised_addresses, vec![a2], "an older announce does not overwrite");
+        assert!(!record.heard_direct, "handed over by someone else");
+        assert_eq!(net.path_table.lookup(&peer, Instant::now()).unwrap().cost, 1, "not a direct route");
+    }
+
     /// Path discovery files routes in the table's own unit, "0 = direct neighbor": a reply from the
     /// target itself is cost 0; a reply from an intermediary adds that intermediary. It used to add
     /// one unconditionally, filing every neighbour-target as one relay hop away and every
@@ -7900,6 +9301,9 @@ mod tests {
         net.verified_neighbors.lock().insert(target_conn.clone(), target);
         net.verified_neighbors.lock().insert(relay_conn.clone(), relay);
         let origin = net.local_address;
+        let far = node();
+        net.note_pending_path_request(origin, 1, target);
+        net.note_pending_path_request(origin, 2, far);
 
         net.handle_path_reply(
             PathReplyFrame { origin, target, nonce: 1, cost: 0 },
@@ -7910,7 +9314,6 @@ mod tests {
         assert_eq!(net.path_table.lookup(&target, Instant::now()).unwrap().cost, 0);
 
         // Negative half: the same cost-0 reply from an intermediary is one hop further.
-        let far = node();
         net.handle_path_reply(
             PathReplyFrame { origin, target: far, nonce: 2, cost: 0 },
             &relay_conn,
@@ -7927,36 +9330,53 @@ mod tests {
         let iface_id = crate::interface::InterfaceId("if".into());
         let iface = Arc::new(FailingInterface { id: iface_id.clone() }) as InterfaceHandle;
         let net = Network::new(fresh_signing(), vec![iface.clone()]);
-        let (near, far) = (node(), node());
+        let (near_key, far_key) = (fresh_signing(), fresh_signing());
+        let near = NodeAddress::from_pubkey(&near_key.verifying_key());
+        let far = NodeAddress::from_pubkey(&far_key.verifying_key());
         let conn = NeighborId("near-conn".into());
         net.verified_neighbors.lock().insert(conn.clone(), near);
         let target = node(); // unknown to us — no reply, just the reverse route
 
-        net.handle_path_request(
-            PathRequestFrame {
-                origin: near,
-                target,
-                nonce: 1,
-                hop_limit: PATH_REQUEST_DEFAULT_HOP_LIMIT,
-            },
-            &conn,
-            &iface,
-        )
-        .await;
+        net.handle_path_request(signed_path_request(&near_key, target, 1, PATH_REQUEST_DEFAULT_HOP_LIMIT), &conn, &iface)
+            .await;
         assert_eq!(net.path_table.lookup(&near, Instant::now()).unwrap().cost, 0);
 
-        net.handle_path_request(
-            PathRequestFrame {
-                origin: far,
-                target,
-                nonce: 2,
-                hop_limit: PATH_REQUEST_DEFAULT_HOP_LIMIT - 1,
-            },
-            &conn,
-            &iface,
-        )
-        .await;
+        net.handle_path_request(signed_path_request(&far_key, target, 2, PATH_REQUEST_DEFAULT_HOP_LIMIT - 1), &conn, &iface)
+            .await;
         assert_eq!(net.path_table.lookup(&far, Instant::now()).unwrap().cost, 1);
+    }
+
+    fn signed_path_request(origin_key: &SigningKey, target: NodeAddress, nonce: u64, hop_limit: u8) -> PathRequestFrame {
+        let mut request = PathRequestFrame {
+            origin: NodeAddress::from_pubkey(&origin_key.verifying_key()),
+            target,
+            nonce,
+            hop_limit,
+            signature: Vec::new(),
+        };
+        request.sign(origin_key);
+        request
+    }
+
+    /// V-07: a verified neighbour cannot make itself the way to a node by naming it the origin of a
+    /// request that node never sent — no reverse route, no re-broadcast; nor by re-signing it.
+    #[tokio::test]
+    async fn a_path_request_its_origin_did_not_sign_leaves_no_route() {
+        let iface = Arc::new(FailingInterface { id: crate::interface::InterfaceId("if".into()) }) as InterfaceHandle;
+        let net = Network::new(fresh_signing(), vec![iface.clone()]);
+        let liar_key = fresh_signing();
+        let conn = NeighborId("liar-conn".into());
+        net.verified_neighbors.lock().insert(conn.clone(), NodeAddress::from_pubkey(&liar_key.verifying_key()));
+        let victim = node();
+        let target = node();
+
+        let unsigned = PathRequestFrame { origin: victim, target, nonce: 1, hop_limit: 2, signature: Vec::new() };
+        net.handle_path_request(unsigned, &conn, &iface).await;
+        let mut resigned = PathRequestFrame { origin: victim, target, nonce: 2, hop_limit: 2, signature: Vec::new() };
+        resigned.sign(&liar_key);
+        net.handle_path_request(resigned, &conn, &iface).await;
+        assert!(net.path_table.lookup(&victim, Instant::now()).is_none(), "no route to a node that did not ask");
+        assert!(net.pending_path_requests.lock().is_empty(), "and nothing relayed on its behalf");
     }
 
     #[tokio::test]
@@ -8779,13 +10199,14 @@ mod tests {
         let sim_iface = fabric.interface(addr, NatModel::Public);
         let net = Arc::new(Network::new(fresh_signing(), vec![sim_iface as InterfaceHandle]));
         let me = net.local_address();
-        let requester = node();
+        let requester_key = fresh_signing();
+        let requester = NodeAddress::from_pubkey(&requester_key.verifying_key());
         // The arrival neighbour must be verified or the handler drops the frame (anti-spoof gate).
         let neighbor = NeighborId("20.0.0.1:1".into());
         net.verified_neighbors.lock().insert(neighbor.clone(), requester);
 
         // A request addressed to US is delivered for the app to serve via its local omni-dht-helper.
-        let req = DhtProxyRequestFrame {
+        let mut req = DhtProxyRequestFrame {
             from: requester,
             to: me,
             req_id: 42,
@@ -8794,17 +10215,34 @@ mod tests {
             salt: b"0".to_vec(),
             value: Vec::new(),
             hop_limit: 6,
+            signature: Vec::new(),
         };
+        req.sign(&requester_key);
         net.handle_dht_proxy_request(req.clone(), &neighbor).await;
         assert_eq!(
             net.try_recv_dht_proxy_request(),
-            Some(req),
+            Some(req.clone()),
             "a DhtProxyRequest addressed to us is delivered to the app"
         );
 
+        // V-20: the gate in the app is by `from` — a request that names someone it is not (signed
+        // by the neighbour's own key, or by nobody), or that a relay altered, is never delivered.
+        let impostor = fresh_signing();
+        let mut forged = DhtProxyRequestFrame { req_id: 44, ..req.clone() };
+        forged.sign(&impostor);
+        let unsigned = DhtProxyRequestFrame { req_id: 45, signature: Vec::new(), ..req.clone() };
+        let altered = DhtProxyRequestFrame { salt: b"1".to_vec(), ..req.clone() };
+        for bad in [forged, unsigned, altered] {
+            net.handle_dht_proxy_request(bad, &neighbor).await;
+            assert!(net.try_recv_dht_proxy_request().is_none(), "an unproven `from` is not served");
+        }
+        // Each hop lowers `hop_limit`: that alone does not break the signature.
+        net.handle_dht_proxy_request(DhtProxyRequestFrame { hop_limit: 2, ..req.clone() }, &neighbor).await;
+        assert!(net.try_recv_dht_proxy_request().is_some(), "a request a few hops away is served");
+
         // A request for ANOTHER peer we have no route to is forwarded/dropped — NOT served locally.
         let other = node();
-        let req2 = DhtProxyRequestFrame {
+        let mut req2 = DhtProxyRequestFrame {
             from: requester,
             to: other,
             req_id: 43,
@@ -8813,7 +10251,9 @@ mod tests {
             salt: b"0".to_vec(),
             value: Vec::new(),
             hop_limit: 6,
+            signature: Vec::new(),
         };
+        req2.sign(&requester_key);
         net.handle_dht_proxy_request(req2, &neighbor).await;
         assert!(
             net.try_recv_dht_proxy_request().is_none(),
@@ -9509,6 +10949,7 @@ mod tests {
                 capabilities: 0,
                 door_port: 0,
                 heard_direct: false,
+                announce_timestamp: 0,
             },
         );
     }
@@ -10446,6 +11887,22 @@ mod tests {
     /// C's NAT filter and yields a direct verified Link. (Without the punch the same
     /// dial is filtered — see sim_nat_filtering_*.) Gated entirely on one machine via
     /// the net-sim. См. docs/decisions/mesh-hole-punching.md.
+    /// Blind audit 2026-11-10: a `PunchSync` was taken from any neighbour, verified or not, and had
+    /// us dial whatever endpoint it named. Only a verified relay's is taken now.
+    #[tokio::test]
+    async fn a_punch_sync_from_a_neighbour_we_did_not_verify_dials_nothing() {
+        use crate::sim::{NatModel, SimFabric};
+        let fabric = SimFabric::new();
+        let iface = fabric.interface("10.0.0.1:1".parse().unwrap(), NatModel::Public) as Arc<dyn Interface>;
+        let net = Arc::new(Network::new(fresh_signing(), vec![Arc::clone(&iface)]));
+        // Above any address: we are the side that dials, and a dial leaves its endpoint in the book.
+        let peer = NodeAddress::from_bytes([0xFF; 20]);
+        let sync = PunchSyncFrame { peer, peer_endpoint: "192.168.1.10:4433".parse().unwrap(), nonce: 1 };
+        net.handle_punch_sync(sync, &NeighborId("stranger".into()), &iface).await;
+        tokio::time::sleep(PUNCH_PROBE_GRACE + Duration::from_millis(300)).await;
+        assert!(!net.peer_book.lock().contains_key(&peer), "nothing was dialed");
+    }
+
     #[tokio::test]
     async fn punch_opens_pinholes_enabling_direct_dial_between_nats() {
         use crate::sim::{NatModel, SimFabric};
@@ -10637,6 +12094,65 @@ mod tests {
 
         a.shutdown();
         b.shutdown();
+    }
+
+    /// A blocked contact: no direct link with it, whatever else allows one. The link up goes at once,
+    /// its dial is refused before we prove ourselves, ours to it is not made; out of the set, it
+    /// connects again. Another peer is not touched.
+    #[tokio::test]
+    async fn a_refused_identity_holds_no_direct_link_with_us() {
+        use crate::sim::{NatModel, SimFabric};
+        let fabric = SimFabric::new();
+        let a_addr: SocketAddr = "20.0.1.1:1".parse().unwrap();
+        let b_addr: SocketAddr = "20.0.1.2:1".parse().unwrap();
+        let d_addr: SocketAddr = "20.0.1.4:1".parse().unwrap();
+        let (a_key, b_key, d_key) = (fresh_signing(), fresh_signing(), fresh_signing());
+        let (b_pub, d_pub) = (b_key.verifying_key(), d_key.verifying_key());
+        let a = Arc::new(Network::new(a_key, vec![fabric.interface(a_addr, NatModel::Public) as Arc<dyn Interface>]));
+        let b = Arc::new(Network::new(b_key, vec![fabric.interface(b_addr, NatModel::Public) as Arc<dyn Interface>]));
+        let d = Arc::new(Network::new(d_key, vec![fabric.interface(d_addr, NatModel::Public) as Arc<dyn Interface>]));
+        let (b_node, d_node) = (b.local_address(), d.local_address());
+        seed_peer(&a, b_pub, vec![b_addr]);
+        seed_peer(&a, d_pub, vec![d_addr]);
+        a.start();
+        b.start();
+        d.start();
+        a.dial(b_node).await.expect("A dials B directly");
+        a.dial(d_node).await.expect("A dials D directly");
+        let a_holds = |a: &Network, node: NodeAddress| a.verified_neighbors.lock().values().any(|peer| *peer == node);
+
+        let refused = std::collections::HashSet::from([b_node]);
+        a.refuse_direct_with(refused.clone()).await;
+        assert!(a.refuses_direct_with_exactly(&refused));
+        assert!(!a_holds(&a, b_node), "the link with the refused peer goes at once");
+        assert!(a_holds(&a, d_node), "another peer keeps its link");
+        assert!(a.dial(b_node).await.is_err(), "no new direct link to it");
+        // Its dial is refused before A proves itself (a fresh C stands in for it: the sim does not
+        // really close B's old connection to A).
+        let c_addr: SocketAddr = "20.0.1.3:1".parse().unwrap();
+        let c = Arc::new(Network::new(fresh_signing(), vec![fabric.interface(c_addr, NatModel::Public) as Arc<dyn Interface>]));
+        c.start();
+        let (a_node, c_node) = (a.local_address(), c.local_address());
+        a.refuse_direct_with(std::collections::HashSet::from([b_node, c_node])).await;
+        seed_peer(&c, a.identity.verifying_key(), vec![a_addr]);
+        assert!(
+            timeout(Duration::from_secs(3), c.dial(a_node)).await.map_or(true, |dial| dial.is_err()),
+            "the refused dialer is turned away"
+        );
+        assert!(!c.verified_neighbors.lock().values().any(|peer| *peer == a_node), "C never verified A");
+        c.shutdown();
+
+        // Even «direct with anyone» does not let it in.
+        a.keep_direct_only_with(None).await;
+        assert!(a.dial(b_node).await.is_err());
+
+        a.refuse_direct_with(std::collections::HashSet::new()).await;
+        a.dial(b_node).await.expect("out of the set, it connects again");
+        assert!(a_holds(&a, b_node));
+
+        a.shutdown();
+        b.shutdown();
+        d.shutdown();
     }
 
     /// RelayOnly privacy (follow-up d): with the master direct-upgrade gate OFF
@@ -10982,6 +12498,61 @@ mod tests {
         bob.shutdown();
     }
 
+    /// The dialing side of the TCP hole punch: a TCP connection already made from Alice's door port
+    /// to Bob's punch address (here his door on loopback — the NATs are what the live stand adds)
+    /// carries the whole first contact, Bob's end being his ordinary door bridge.
+    /// See docs/decisions/tcp-hole-punch.md.
+    #[tokio::test]
+    async fn a_punched_tcp_connection_carries_first_contact() {
+        let alice_key = fresh_signing();
+        let bob_key = fresh_signing();
+        let alice_pub = alice_key.verifying_key();
+        let bob_pub = bob_key.verifying_key();
+        let alice_quic = bind_quic(&alice_key);
+        let bob_quic = bind_quic(&bob_key);
+        let bob_udp = bob_quic.local_addr().unwrap();
+
+        let bob_door = omni_net_primitives::tcp_punch::bind_door_listener(0).unwrap();
+        let punch = SocketAddr::from(([127, 0, 0, 1], bob_door.local_addr().unwrap().port()));
+        let bob_door = tokio::net::TcpListener::from_std(bob_door).unwrap();
+        tokio::spawn(async move {
+            let _ = crate::tcp_transport::run_tcp_bridge_on(bob_door, bob_udp).await;
+        });
+        // Alice's own door: idle here, it only holds the port her punch leaves from.
+        let alice_door = omni_net_primitives::tcp_punch::bind_door_listener(0).unwrap();
+        let alice_port = alice_door.local_addr().unwrap().port();
+
+        let alice = Arc::new(Network::new(alice_key, vec![alice_quic as Arc<dyn Interface>]));
+        let bob = Arc::new(Network::new(bob_key, vec![bob_quic as Arc<dyn Interface>]));
+        seed_peer(&alice, bob_pub, Vec::new());
+        seed_peer(&bob, alice_pub, Vec::new());
+        alice.start();
+        bob.start();
+
+        let stream = omni_net_primitives::tcp_punch::connect_from_door_port(alice_port, punch, Duration::from_secs(5))
+            .await
+            .expect("the punch connects");
+        let link = timeout(
+            Duration::from_secs(15),
+            alice.dial_over_punched(bob.local_address(), punch, stream, alice_port),
+        )
+        .await
+        .expect("first contact over the punch completes within 15s")
+        .expect("dial_over_punched succeeds");
+        assert_eq!(link.destination(), bob.local_address());
+
+        let bob_link = timeout(Duration::from_secs(10), bob.accept()).await.expect("bob accepts").expect("accept");
+        assert!(alice.peer_through_a_door(&bob.local_address()), "the dialer rides a door");
+        assert!(bob.peer_through_a_door(&alice.local_address()), "so does the door's owner");
+        assert!(!bob.peer_on_door(&alice.local_address()), "but it owns no tunnel to migrate");
+        link.send(b"over-the-punch").await.unwrap();
+        let got = timeout(Duration::from_secs(10), bob_link.recv()).await.expect("bob receives").expect("recv ok");
+        assert_eq!(got, b"over-the-punch");
+        drop(alice_door);
+        alice.shutdown();
+        bob.shutdown();
+    }
+
     /// Only an announce heard straight from the peer gives a LAN door: one a relay forwarded may
     /// carry another network's LAN addresses. Without a door port there is no door at all.
     #[tokio::test]
@@ -11299,7 +12870,8 @@ mod tests {
                 if let Ok(NetworkFrame::ChallengeRequest(req)) =
                     NetworkFrame::decode_from_wire(&bytes)
                 {
-                    let response = respond_to_challenge(&impostor_key, &req.nonce);
+                    let binding = responder.channel_binding(&neighbor).expect("QUIC binding");
+                    let response = respond_to_challenge(&impostor_key, &req.nonce, &binding);
                     let frame = NetworkFrame::ChallengeResponse(ChallengeResponseFrame {
                         nonce: req.nonce,
                         from: NodeAddress::from_pubkey(&impostor_pub),
@@ -11315,6 +12887,51 @@ mod tests {
         assert!(
             matches!(result, Err(NetworkError::ChallengeRejected(_))),
             "responder с mismatched identity должен быть отвергнут, got {result:?}"
+        );
+
+        alice.shutdown();
+    }
+
+    /// V-03: a man in the middle relays the real peer's answer. The signature is the victim's own
+    /// and matches the address Alice dialed, but it is bound to the victim's TLS session with the
+    /// middle, not to Alice's session with it — the dial must still fail.
+    #[tokio::test]
+    async fn dial_rejects_a_relayed_answer_bound_to_another_tls_session() {
+        let alice_key = fresh_signing();
+        let victim_key = fresh_signing();
+        let middle_key = fresh_signing();
+        let victim_pub = victim_key.verifying_key();
+
+        let alice_quic = bind_quic(&alice_key);
+        let middle_quic = bind_quic(&middle_key);
+        let middle_addr = middle_quic.local_addr().unwrap();
+
+        let alice = Arc::new(Network::new(alice_key, vec![alice_quic as Arc<dyn Interface>]));
+        alice.start();
+        seed_peer(&alice, victim_pub, vec![middle_addr]);
+
+        let responder = Arc::clone(&middle_quic);
+        tokio::spawn(async move {
+            if let Ok((neighbor, bytes)) = responder.recv_frame().await {
+                if let Ok(NetworkFrame::ChallengeRequest(req)) = NetworkFrame::decode_from_wire(&bytes) {
+                    // What the victim signed on ITS session with the middle.
+                    let victims_session = [0xA5u8; crate::cert::CHANNEL_BINDING_BYTES];
+                    let response = respond_to_challenge(&victim_key, &req.nonce, &victims_session);
+                    let frame = NetworkFrame::ChallengeResponse(ChallengeResponseFrame {
+                        nonce: req.nonce,
+                        from: NodeAddress::from_pubkey(&victim_pub),
+                        to: req.from,
+                        response,
+                    });
+                    let _ = responder.send_frame(&neighbor, &frame.encode_to_wire()).await;
+                }
+            }
+        });
+
+        let result = alice.dial(NodeAddress::from_pubkey(&victim_pub)).await;
+        assert!(
+            matches!(result, Err(NetworkError::ChallengeRejected(_))),
+            "an answer bound to another TLS session must be rejected, got {result:?}"
         );
 
         alice.shutdown();

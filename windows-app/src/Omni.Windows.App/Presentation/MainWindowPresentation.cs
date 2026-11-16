@@ -5,6 +5,8 @@ namespace Omni.Windows.App.Presentation;
 internal static partial class MainWindowPresentation
 {
     internal const double TranscriptBubbleMaxWidthHardCap = 620d;
+    // What a message row takes around its bubble: the list's margins and the avatar with its gap.
+    internal const double TranscriptRowChromeWidth = 8 + 16 + 20 + 34 + 8;
     private const double TranscriptBubbleWidthFactor = 0.72d;
 
     public static string BuildIdentitySubtitle(LocalAccountSnapshot? account, LocalDeviceSnapshot? device)
